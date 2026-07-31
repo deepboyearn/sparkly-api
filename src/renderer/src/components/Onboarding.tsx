@@ -64,11 +64,10 @@ export function Onboarding({ onComplete }: OnboardingProps) {
   };
 
   const itemVariants: Variants = {
-    hidden: { opacity: 0, y: 30, filter: "blur(10px)" },
+    hidden: { opacity: 0, y: 30 },
     visible: {
       opacity: 1,
       y: 0,
-      filter: "blur(0px)",
       transition: {
         duration: 1,
         ease: [0.16, 1, 0.3, 1],
@@ -94,15 +93,15 @@ export function Onboarding({ onComplete }: OnboardingProps) {
             key="greeting"
             initial={{ opacity: 0, scale: 0.8 }}
             animate={{ opacity: 1, scale: 1 }}
-            exit={{ opacity: 0, scale: 1.2, filter: "blur(20px)" }}
+            exit={{ opacity: 0, scale: 1.2,  }}
             transition={{ duration: 0.8, ease: "easeOut" }}
             className="greeting-step"
           >
             <motion.h1
               key={greetingIndex}
-              initial={{ opacity: 0, y: 20, scale: 0.9, filter: "blur(10px)" }}
-              animate={{ opacity: 1, y: 0, scale: 1, filter: "blur(0px)" }}
-              exit={{ opacity: 0, y: -20, scale: 1.1, filter: "blur(10px)" }}
+              initial={{ opacity: 0, y: 20, scale: 0.9,  }}
+              animate={{ opacity: 1, y: 0, scale: 1,  }}
+              exit={{ opacity: 0, y: -20, scale: 1.1,  }}
               transition={{ 
                 duration: 0.5,
                 ease: [0.16, 1, 0.3, 1]
@@ -130,8 +129,8 @@ export function Onboarding({ onComplete }: OnboardingProps) {
             <motion.div
               variants={itemVariants}
               className="title-wrapper"
-              initial={{ filter: "blur(10px)", opacity: 0, y: 20 }}
-              animate={{ filter: "blur(0px)", opacity: 1, y: 0 }}
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.8, ease: "easeOut" }}
             >
               <span className="welcome-text">Welcome to</span>

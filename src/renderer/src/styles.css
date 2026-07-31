@@ -52,7 +52,7 @@
     border: 1px solid rgba(255, 255, 255, 0.05) !important;
     border-radius: 16px !important;
     padding: 0 !important;
-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+    transition: background 0.3s ease, color 0.3s ease, transform 0.3s ease !important;
     overflow: hidden;
     position: relative;
   }
@@ -163,7 +163,7 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
-    transition: all 0.2s ease;
+    transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;;
   }
 
   .overview-chart-stat:hover {
@@ -197,7 +197,7 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    transition: all 0.2s ease;
+    transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;;
   }
 
   .status-pill.success {
@@ -229,7 +229,7 @@
     background: rgba(255, 255, 255, 0.015);
     border-radius: 12px;
     border: 1px solid rgba(255, 255, 255, 0.04);
-    transition: all 0.2s ease;
+    transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;;
     margin: 8px 0;
   }
 
@@ -258,7 +258,7 @@
     border-radius: 10px !important;
     padding: 0 16px !important;
     color: white;
-    transition: all 0.2s ease;
+    transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;;
   }
 
   .inline-setting-row input:focus {
@@ -283,7 +283,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    transition: all 0.2s ease;
+    transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;;
   }
 
   .activity-item:hover {
@@ -397,7 +397,7 @@
   cursor: pointer;
   position: relative;
   z-index: 1;
-  transition: all 0.3s ease;
+  transition: background 0.3s ease, color 0.3s ease, box-shadow 0.3s ease, transform 0.3s ease;;
 }
 
 .premium-tab-btn:hover {
@@ -424,7 +424,7 @@
   padding: 24px;
   margin-bottom: 24px;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
-  transition: all 0.3s ease;
+  transition: background 0.3s ease, color 0.3s ease, box-shadow 0.3s ease, transform 0.3s ease;;
 }
 
 .activation-header {
@@ -479,7 +479,7 @@
   font-size: 14px;
   font-family: inherit;
   outline: none;
-  transition: all 0.2s ease;
+  transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;;
 }
 
 .premium-input:focus {
@@ -1775,7 +1775,7 @@ button:disabled {
   font-size: 13px;
   font-weight: 600;
   text-decoration: none;
-  transition: all 0.2s ease;
+  transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;;
   border: 1px solid transparent;
   white-space: nowrap;
 }
@@ -3055,7 +3055,7 @@ textarea {
   border: 1px solid rgba(255, 255, 255, 0.04);
   border-radius: 14px;
   padding: 16px;
-  transition: all 0.2s ease;
+  transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;;
 }
 
 .meta-card-premium:hover {
@@ -3091,7 +3091,7 @@ textarea {
   font-weight: 700;
   font-size: 14px;
   cursor: pointer;
-  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: background 0.2s cubic-bezier(0.4, 0, 0.2, 1), color 0.2s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.2s cubic-bezier(0.4, 0, 0.2, 1), transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
   border: 1px solid transparent;
   user-select: none;
   white-space: nowrap;
@@ -3360,7 +3360,7 @@ textarea {
   gap: 20px;
   position: relative;
   overflow: hidden;
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: background 0.3s cubic-bezier(0.4, 0, 0.2, 1), color 0.3s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.3s cubic-bezier(0.4, 0, 0.2, 1), transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent), var(--panel);
 }
 
@@ -3450,7 +3450,7 @@ textarea {
   border: 1px solid rgba(255, 255, 255, 0.05);
   color: var(--muted);
   cursor: pointer;
-  transition: all 0.2s;
+  transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
 }
 
 .action-btn:hover {
@@ -3598,7 +3598,7 @@ textarea {
   padding: 12px 14px;
   color: var(--text);
   font-size: 13px;
-  transition: all 0.2s;
+  transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
 }
 
 .glass-input:focus {
@@ -3739,7 +3739,7 @@ textarea {
 .sub-card-header { margin-bottom: 16px; }
 .sub-card-header span { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; }
 .inline-support-links { display: flex; gap: 10px; }
-.footer-support-btn { flex: 1; height: 40px; display: flex; align-items: center; justify-content: center; border-radius: 10px; font-size: 13px; font-weight: 700; text-decoration: none; transition: all 0.2s ease; }
+.footer-support-btn { flex: 1; height: 40px; display: flex; align-items: center; justify-content: center; border-radius: 10px; font-size: 13px; font-weight: 700; text-decoration: none; transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;; }
 .footer-support-btn.tg { background: rgba(0, 136, 204, 0.1); color: #0088cc; border: 1px solid rgba(0, 136, 204, 0.2); }
 .footer-support-btn.tg:hover { background: rgba(0, 136, 204, 0.2); transform: translateY(-2px); }
 .footer-support-btn.ds { background: rgba(88, 101, 242, 0.1); color: #5865f2; border: 1px solid rgba(88, 101, 242, 0.2); }

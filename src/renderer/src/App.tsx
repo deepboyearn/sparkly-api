@@ -931,8 +931,8 @@ export default function App() {
 
   if (loading) return (
     <motion.div
-      initial={{ opacity: 0, filter: "blur(10px)" }}
-      animate={{ opacity: 1, filter: "blur(0px)" }}
+      initial={{ opacity: 0,  }}
+      animate={{ opacity: 1,  }}
       className="screen centered"
       style={{ background: '#000', color: '#fff', fontSize: '14px', letterSpacing: '1px' }}
     >
@@ -972,9 +972,9 @@ export default function App() {
               {isOverview ? (
                 <motion.div
                   key="overview"
-                  initial={{ opacity: 0, y: 15, filter: "blur(12px)" }}
-                  animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
-                  exit={{ opacity: 0, y: -15, filter: "blur(12px)" }}
+                  initial={{ opacity: 0, y: 15,  }}
+                  animate={{ opacity: 1, y: 0,  }}
+                  exit={{ opacity: 0, y: -15,  }}
                   transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
                 >
                   <motion.section
@@ -992,7 +992,7 @@ export default function App() {
                     initial="hidden"
                     animate="show"
                   >
-                    <motion.div variants={{ hidden: { opacity: 0, y: 20, filter: "blur(8px)" }, show: { opacity: 1, y: 0, filter: "blur(0px)" } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
+                    <motion.div variants={{ hidden: { opacity: 0, y: 20,  }, show: { opacity: 1, y: 0,  } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
                       <Card className="metric-card">
                         <Card.Content className="metric-card-content">
                           <div className="metric-head">
@@ -1008,7 +1008,7 @@ export default function App() {
                       </Card>
                     </motion.div>
 
-                    <motion.div variants={{ hidden: { opacity: 0, y: 20, filter: "blur(8px)" }, show: { opacity: 1, y: 0, filter: "blur(0px)" } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
+                    <motion.div variants={{ hidden: { opacity: 0, y: 20,  }, show: { opacity: 1, y: 0,  } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
                       <Card className="metric-card">
                         <Card.Content className="metric-card-content">
                           <div className="metric-head">
@@ -1024,7 +1024,7 @@ export default function App() {
                       </Card>
                     </motion.div>
 
-                    <motion.div variants={{ hidden: { opacity: 0, y: 20, filter: "blur(8px)" }, show: { opacity: 1, y: 0, filter: "blur(0px)" } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
+                    <motion.div variants={{ hidden: { opacity: 0, y: 20,  }, show: { opacity: 1, y: 0,  } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
                       <Card className="metric-card">
                         <Card.Content className="metric-card-content">
                           <div className="metric-head">
@@ -1040,7 +1040,7 @@ export default function App() {
                       </Card>
                     </motion.div>
 
-                    <motion.div variants={{ hidden: { opacity: 0, y: 20, filter: "blur(8px)" }, show: { opacity: 1, y: 0, filter: "blur(0px)" } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
+                    <motion.div variants={{ hidden: { opacity: 0, y: 20,  }, show: { opacity: 1, y: 0,  } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
                       <Card className="metric-card">
                         <Card.Content className="metric-card-content">
                           <div className="metric-head">
@@ -1060,8 +1060,8 @@ export default function App() {
                   <section className="content-grid overview-main-grid">
                     <motion.article
                       className="admin-panel chart-panel"
-                      initial={{ opacity: 0, scale: 0.98, filter: "blur(10px)" }}
-                      animate={{ opacity: 1, scale: 1, filter: "blur(0px)" }}
+                      initial={{ opacity: 0, scale: 0.98,  }}
+                      animate={{ opacity: 1, scale: 1,  }}
                       transition={{ delay: 0.4, duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
                     >
                       <div className="section-heading">
@@ -1080,8 +1080,8 @@ export default function App() {
 
                     <motion.article
                       className="admin-panel activity-panel overview-activity-panel"
-                      initial={{ opacity: 0, x: 20, filter: "blur(10px)" }}
-                      animate={{ opacity: 1, x: 0, filter: "blur(0px)" }}
+                      initial={{ opacity: 0, x: 20,  }}
+                      animate={{ opacity: 1, x: 0,  }}
                       transition={{ delay: 0.5, duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
                     >
                       <div className="section-heading">
@@ -1123,8 +1123,8 @@ export default function App() {
 
                   <motion.section
                     className="content-grid lower-grid overview-lower-grid"
-                    initial={{ opacity: 0, y: 20, filter: "blur(10px)" }}
-                    animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                    initial={{ opacity: 0, y: 20,  }}
+                    animate={{ opacity: 1, y: 0,  }}
                     transition={{ delay: 0.6, duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
                   >
                     <article className="admin-panel settings-panel overview-settings-panel">
@@ -1160,9 +1160,9 @@ export default function App() {
               ) : isApiKeys ? (
                 <motion.div
                   key="apiKeys"
-                  initial={{ opacity: 0, y: 15, filter: "blur(12px)" }}
-                  animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
-                  exit={{ opacity: 0, y: -15, filter: "blur(12px)" }}
+                  initial={{ opacity: 0, y: 15,  }}
+                  animate={{ opacity: 1, y: 0,  }}
+                  exit={{ opacity: 0, y: -15,  }}
                   transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
                 >
                   <ApiKeysPage
@@ -1184,9 +1184,9 @@ export default function App() {
               ) : isUsage ? (
                 <motion.div
                   key="usage"
-                  initial={{ opacity: 0, y: 15, filter: "blur(12px)" }}
-                  animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
-                  exit={{ opacity: 0, y: -15, filter: "blur(12px)" }}
+                  initial={{ opacity: 0, y: 15,  }}
+                  animate={{ opacity: 1, y: 0,  }}
+                  exit={{ opacity: 0, y: -15,  }}
                   transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
                 >
                   <UsagePage
@@ -1216,9 +1216,9 @@ export default function App() {
               ) : isAccounts ? (
                 <motion.div
                   key="accounts"
-                  initial={{ opacity: 0, y: 15, filter: "blur(12px)" }}
-                  animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
-                  exit={{ opacity: 0, y: -15, filter: "blur(12px)" }}
+                  initial={{ opacity: 0, y: 15,  }}
+                  animate={{ opacity: 1, y: 0,  }}
+                  exit={{ opacity: 0, y: -15,  }}
                   transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
                 >
                   <AccountsPage
@@ -1236,9 +1236,9 @@ export default function App() {
               ) : isPlayground ? (
                 <motion.div
                   key="playground"
-                  initial={{ opacity: 0, y: 15, filter: "blur(12px)" }}
-                  animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
-                  exit={{ opacity: 0, y: -15, filter: "blur(12px)" }}
+                  initial={{ opacity: 0, y: 15,  }}
+                  animate={{ opacity: 1, y: 0,  }}
+                  exit={{ opacity: 0, y: -15,  }}
                   transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
                 >
                   <PlaygroundPage
@@ -1273,9 +1273,9 @@ export default function App() {
             {isCreateKeyOpen && (
               <div className="modal-overlay">
                 <motion.div
-                  initial={{ opacity: 0, scale: 0.9, filter: "blur(15px)" }}
-                  animate={{ opacity: 1, scale: 1, filter: "blur(0px)" }}
-                  exit={{ opacity: 0, scale: 0.9, filter: "blur(15px)" }}
+                  initial={{ opacity: 0, scale: 0.9,  }}
+                  animate={{ opacity: 1, scale: 1,  }}
+                  exit={{ opacity: 0, scale: 0.9,  }}
                   transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
                   style={{ width: '100%', maxWidth: '480px' }}
                 >
@@ -1305,9 +1305,9 @@ export default function App() {
             {isEditKeyOpen && (
               <div className="modal-overlay">
                 <motion.div
-                  initial={{ opacity: 0, scale: 0.9, filter: "blur(15px)" }}
-                  animate={{ opacity: 1, scale: 1, filter: "blur(0px)" }}
-                  exit={{ opacity: 0, scale: 0.9, filter: "blur(15px)" }}
+                  initial={{ opacity: 0, scale: 0.9,  }}
+                  animate={{ opacity: 1, scale: 1,  }}
+                  exit={{ opacity: 0, scale: 0.9,  }}
                   transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
                   style={{ width: '100%', maxWidth: '480px' }}
                 >
@@ -1336,9 +1336,9 @@ export default function App() {
             {isAccountModalOpen && (
               <div className="modal-overlay">
                 <motion.div
-                  initial={{ opacity: 0, scale: 0.9, filter: "blur(15px)" }}
-                  animate={{ opacity: 1, scale: 1, filter: "blur(0px)" }}
-                  exit={{ opacity: 0, scale: 0.9, filter: "blur(15px)" }}
+                  initial={{ opacity: 0, scale: 0.9,  }}
+                  animate={{ opacity: 1, scale: 1,  }}
+                  exit={{ opacity: 0, scale: 0.9,  }}
                   transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
                   style={{ width: '100%', maxWidth: '560px' }}
                 >
