@@ -3,7 +3,7 @@ const path = require("node:path");
 const { BridgeServer } = require("../dist-electron/main/bridgeServer.js");
 
 async function main() {
-  const configPath = path.join(process.env.APPDATA || "", "local-ai-bridge", "bridge-config.json");
+  const configPath = path.join(process.env.APPDATA || "", "sparkly-api", "bridge-config.json");
   const raw = fs.readFileSync(configPath, "utf8");
   const config = JSON.parse(raw);
   const server = new BridgeServer();

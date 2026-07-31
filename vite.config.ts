@@ -12,10 +12,21 @@ export default defineConfig({
   },
   build: {
     outDir: "dist",
+    target: "chrome130",
   },
   server: {
     port: 5173,
     host: "127.0.0.1",
     open: false,
+    hmr: {
+      host: "127.0.0.1",
+      clientPort: 5173,
+    },
+    proxy: {
+      "/api": {
+        target: "http://127.0.0.1:48232",
+        changeOrigin: true,
+      },
+    },
   },
 });

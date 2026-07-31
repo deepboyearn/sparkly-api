@@ -1,8 +1,8 @@
-import type { BridgeConfig, BridgeState, LicenseStatus, PlaygroundTestResult } from "../../shared/types";
+import type { BridgeConfig, BridgeState, PlaygroundTestResult } from "../../shared/types";
 
 export const emptyState: BridgeState = {
   config: {
-    upstreamBaseUrl: "https://api.souimagery.fun",
+    upstreamBaseUrl: "https://cn.chrouter.com:8443",
     apiKey: "",
     models: [],
     selectedModel: "gpt-5.4",
@@ -24,20 +24,6 @@ export const emptyState: BridgeState = {
   },
   logs: [],
   clientKeys: [],
-  license: {
-    status: "missing",
-    installedLicense: null,
-    requestCode: "",
-    customerName: null,
-    customerEmail: null,
-    plan: null,
-    expiresAt: null,
-    seats: 0,
-    offlineGraceDays: 0,
-    features: [],
-    message: "No license installed.",
-    lastValidatedAt: null,
-  },
 };
 
 export function normalizeBridgeState(input: Partial<BridgeState>): BridgeState {
@@ -52,21 +38,7 @@ export function normalizeBridgeState(input: Partial<BridgeState>): BridgeState {
     },
     logs: Array.isArray(input.logs) ? input.logs : [],
     clientKeys: Array.isArray(input.clientKeys) ? input.clientKeys : [],
-    license: {
-      ...emptyState.license,
-      ...(input.license ?? {}),
-    },
   };
-}
-
-export function getLicenseTone(status: LicenseStatus) {
-  if (status === "active") {
-    return "good";
-  }
-  if (status === "expired") {
-    return "warn";
-  }
-  return "bad";
 }
 
 export function parseModels(value: string) {
@@ -84,11 +56,27 @@ export function formatUptime(ms: number) {
   return `${hours}h ${minutes}m ${seconds}s`;
 }
 
-export function getRequestPoints(totalRequests: number) {
-  return Array.from({ length: 7 }, (_, index) => {
-    const value = totalRequests === 0 ? 0 : Math.max(0, Math.round((totalRequests / 7) * (index + 1) * 0.45));
-    return { label: `Apr ${8 + index}`, value };
-  });
+export function getRequestPoints(logs: BridgeState["logs"]) {
+  const points = [];
+  const now = new Date();
+  
+  for (let i = 11; i >= 0; i--) {
+    const d = new Date(now.getTime() - i * 3600000);
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    const hh = String(d.getHours()).padStart(2, "0");
+    
+    const label = `${mm}-${dd} ${hh}:00`;
+    const count = logs.filter(log => {
+      const logDate = new Date(log.timestamp);
+      return logDate.getHours() === d.getHours() && 
+             logDate.getDate() === d.getDate() &&
+             logDate.getMonth() === d.getMonth();
+    }).length;
+    
+    points.push({ label, value: count });
+  }
+  return points;
 }
 
 export function maskKey(value: string) {
@@ -109,7 +97,10 @@ export function copyModelPayload(baseUrl: string, model: string) {
 
 export function normalizeOpenAiBaseUrl(value: string) {
   const trimmed = value.trim().replace(/\/+$/, "");
-  return trimmed.endsWith("/v1") ? trimmed.slice(0, -3) : trimmed;
+  if (!trimmed) {
+    return "";
+  }
+  return trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
 }
 
 export function getPlaygroundErrorSummary(result: PlaygroundTestResult | null) {
@@ -139,18 +130,56 @@ export function ensureBridgeMethod<T extends keyof Window["bridgeApi"]>(method: 
   return candidate;
 }
 
-export function getHourlyPoints(logs: BridgeState["logs"], type: "requests" | "tokens") {
-  return Array.from({ length: 24 }, (_, hour) => {
-    const matchingLogs = logs.filter((entry) => new Date(entry.timestamp).getHours() === hour);
+export function getHourlyPoints(logs: BridgeState["logs"], type: "requests" | "tokens", count: number = 24) {
+  const points = [];
+  const now = new Date();
+  
+  for (let i = count - 1; i >= 0; i--) {
+    const d = new Date(now.getTime() - i * 3600000);
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    const hh = String(d.getHours()).padStart(2, "0");
+    
+    const label = `${mm}-${dd} ${hh}:00`;
+    const matchingLogs = logs.filter((entry) => {
+      const logDate = new Date(entry.timestamp);
+      return logDate.getHours() === d.getHours() && 
+             logDate.getDate() === d.getDate() &&
+             logDate.getMonth() === d.getMonth();
+    });
+
     const value = type === "requests"
       ? matchingLogs.length
       : matchingLogs.reduce((total, entry) => total + Math.max(60, entry.durationMs * 3), 0);
 
-    return {
-      label: `${String(hour).padStart(2, "0")}:00`,
-      value,
-    };
-  });
+    points.push({ label, value });
+  }
+  return points;
+}
+export function getDayPoints(logs: BridgeState["logs"], type: "requests" | "tokens", count: number = 14) {
+  const points = [];
+  const now = new Date();
+  
+  for (let i = count - 1; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    const label = `${mm}-${dd} 00:00`;
+
+    const matchingLogs = logs.filter((entry) => {
+      const logDate = new Date(entry.timestamp);
+      return logDate.getDate() === d.getDate() &&
+             logDate.getMonth() === d.getMonth() &&
+             logDate.getFullYear() === d.getFullYear();
+    });
+
+    const value = type === "requests"
+      ? matchingLogs.length
+      : matchingLogs.reduce((total, entry) => total + Math.max(60, entry.durationMs * 3), 0);
+
+    points.push({ label, value });
+  }
+  return points;
 }
 
 export function groupModelStats(logs: BridgeState["logs"]) {
@@ -212,11 +241,12 @@ export function getUsageRecords(logs: BridgeState["logs"], clientKeys: BridgeSta
       amountSpent: `$${amountSpent.toFixed(3)}`,
       balanceChange: `-${Math.round(amountSpent * 1000)} pts`,
       requestId: entry.id.slice(0, 8),
+      requestType: entry.requestType,
     };
   });
 }
 
-export type SectionKey = "overview" | "apiKeys" | "usage" | "accounts" | "licenses" | "playground";
+export type SectionKey = "overview" | "apiKeys" | "usage" | "accounts" | "playground";
 
 export type AppViewModel = {
   state: BridgeState;
@@ -233,6 +263,5 @@ export type AppViewModel = {
   playgroundMessage: string;
   playgroundResult: PlaygroundTestResult | null;
   playgroundLoading: boolean;
-  licenseKeyInput: string;
   saving: boolean;
 };

@@ -1,21 +1,24 @@
 {
-  "name": "local-ai-bridge",
-  "version": "1.0.0",
+  "name": "sparkly-api",
+  "version": "1.2.0",
   "private": true,
   "description": "Electron and React desktop app that exposes a local OpenAI-compatible bridge for configurable upstream providers.",
   "main": "dist-electron/main/main.js",
   "scripts": {
-    "dev": "concurrently -k \"npm:dev:renderer\" \"npm:dev:electron\"",
-    "dev:renderer": "cross-env BROWSER=none vite --strictPort --host 127.0.0.1 --open false",
+    "dev": "npm run dev:localhost",
+    "dev:localhost": "npm run build:electron && concurrently -k \"npm:dev:renderer\" \"npm:local-server\"",
+    "dev:renderer": "vite --strictPort --host 127.0.0.1",
     "dev:electron": "npm run build:electron && wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .",
+    "electron:localhost": "cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 SPARKLY_USE_LOCALHOST_BRIDGE=1 electron .",
+    "local-server": "node dist-electron/main/localHost.js",
     "build": "npm run build:renderer && npm run build:electron",
     "build:renderer": "vite build",
     "build:electron": "tsc -p tsconfig.electron.json",
-    "start": "electron .",
+    "start": "npm run build && electron .",
     "dist:win": "node ./scripts/generate-icons.cjs && npm run build && electron-builder --win nsis portable"
   },
   "build": {
-    "appId": "com.sparklyapi.localaibridge",
+    "appId": "com.sparklyapi.sparklyapi",
     "productName": "Sparkly API",
     "directories": {
       "output": "release"
@@ -52,6 +55,7 @@
     "chart.js": "^4.5.1",
     "cors": "^2.8.5",
     "express": "^4.21.2",
+    "framer-motion": "^12.38.0",
     "react": "^19.2.5",
     "react-chartjs-2": "^5.3.1",
     "react-dom": "^19.2.5",

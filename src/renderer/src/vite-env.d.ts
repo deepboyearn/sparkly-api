@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 
-import type { ActivateLicenseInput, BridgeState, ClearLicenseInput, CreateAccountInput, CreateClientKeyInput, DeleteAccountInput, DeleteClientKeyInput, GenerateRequestCodeInput, PlaygroundModelsInput, PlaygroundModelsResult, PlaygroundTestInput, PlaygroundTestResult, SaveConfigInput, SelectAccountInput, UpdateAccountInput, UpdateClientKeyInput } from "../../shared/types";
+import type { BridgeState, CreateAccountInput, CreateClientKeyInput, DeleteAccountInput, DeleteClientKeyInput, PlaygroundModelsInput, PlaygroundModelsResult, PlaygroundTestInput, PlaygroundTestResult, ResetUsageInput, SaveConfigInput, SelectAccountInput, UpdateAccountInput, UpdateClientKeyInput } from "../../shared/types";
 
 declare global {
   interface Window {
@@ -16,12 +16,12 @@ declare global {
       deleteAccount: (input: DeleteAccountInput) => Promise<BridgeState>;
       selectAccount: (input: SelectAccountInput) => Promise<BridgeState>;
       refreshActiveAccountModels: () => Promise<BridgeState>;
-      activateLicense: (input: ActivateLicenseInput) => Promise<BridgeState>;
-      clearLicense: (input: ClearLicenseInput) => Promise<BridgeState>;
-      generateRequestCode: (input: GenerateRequestCodeInput) => Promise<BridgeState>;
+      resetUsage: (input: ResetUsageInput) => Promise<BridgeState>;
       playgroundLoadModels: (input: PlaygroundModelsInput) => Promise<PlaygroundModelsResult>;
       playgroundTest: (input: PlaygroundTestInput) => Promise<PlaygroundTestResult>;
+      openElectron: () => Promise<void>;
       openExternal: (url: string) => Promise<void>;
+      openDevTools: () => Promise<void>;
     };
   }
 }

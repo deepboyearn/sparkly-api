@@ -2,7 +2,7 @@ import { memo } from "react";
 import { Button, Card, Chip } from "@heroui/react";
 import { Icon } from "@iconify/react";
 
-type SectionKey = "overview" | "apiKeys" | "usage" | "accounts" | "licenses" | "playground";
+type SectionKey = "overview" | "apiKeys" | "usage" | "accounts" | "playground" | "uiDemo";
 
 type HeroHeaderProps = {
   section: SectionKey;
@@ -12,42 +12,48 @@ type HeroHeaderProps = {
   onPrimaryAction: () => void;
 };
 
-const sectionMeta: Record<SectionKey, { chip: string; title: string; buttonText: string; icon: string }> = {
+const sectionMeta: Record<SectionKey, { chip: string; title: string; description: string; icon: string; buttonText: string }> = {
   overview: {
     chip: "Overview",
-    title: "Local AI Gateway Dashboard",
+    title: "Gateway Dashboard",
+    description: "Real-time monitoring and controls.",
     buttonText: "Save changes",
     icon: "solar:diskette-bold-duotone",
   },
   apiKeys: {
     chip: "API Keys",
-    title: "API Keys Management",
+    title: "Access Management",
+    description: "Secure client key control.",
     buttonText: "Update keys",
     icon: "solar:key-minimalistic-square-3-bold-duotone",
   },
   usage: {
     chip: "Usage",
-    title: "Usage Analytics",
+    title: "Traffic Analytics",
+    description: "Token and request statistics.",
     buttonText: "Refresh usage",
     icon: "solar:refresh-bold-duotone",
   },
   accounts: {
     chip: "Accounts",
-    title: "Gateway Accounts",
+    title: "Bridge Connections",
+    description: "Upstream provider configuration.",
     buttonText: "Add account",
     icon: "solar:user-plus-bold-duotone",
   },
-  licenses: {
-    chip: "Licenses",
-    title: "License Control",
-    buttonText: "Activate license",
-    icon: "solar:shield-check-bold-duotone",
-  },
   playground: {
     chip: "Playground",
-    title: "Playground",
+    title: "Model Tester",
+    description: "Safe local model experimentation.",
     buttonText: "Run test",
     icon: "solar:play-bold-duotone",
+  },
+  uiDemo: {
+    chip: "UI Demo",
+    title: "Component Gallery",
+    description: "HeroUI design system preview.",
+    buttonText: "Refresh",
+    icon: "solar:palet-2-bold-duotone",
   },
 };
 
@@ -60,40 +66,81 @@ function HeroHeaderComponent({
 }: HeroHeaderProps) {
   const meta = sectionMeta[section];
   const isOverview = section === "overview";
-  const description = section === "overview"
-    ? ""
-    : `Manage ${meta.chip.toLowerCase()} from a focused workspace with contextual actions and live bridge state.`;
 
   return (
-    <Card variant="tertiary" className="dashboard-hero-card shadow-2xl">
-      <Card.Content className="dashboard-hero-content">
-        <div className="dashboard-hero-copy">
-          <Chip variant="soft" color="warning" className="dashboard-hero-chip uppercase tracking-[0.24em] text-[10px]">
-            {meta.chip}
-          </Chip>
-          <div className="dashboard-hero-heading">
-            <h1 className="dashboard-hero-title text-white">
+    <Card
+      style={{
+        background: '#1f003d',
+        border: '1px solid rgba(244, 180, 0, 0.1)',
+        borderRadius: '20px',
+        marginBottom: '16px',
+        overflow: 'visible',
+        boxShadow: 'none'
+      }}
+    >
+      <Card.Content
+        style={{
+          display: 'flex',
+          flexDirection: 'row',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          width: '100%',
+          padding: '4px 2px'
+        }}
+      >
+        <div style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '20px' }}>
+
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            <h1 style={{ fontSize: '18px', fontWeight: '900', color: '#ffffff', margin: 0, letterSpacing: '-0.01em' }}>
               {meta.title}
             </h1>
-            <p className="dashboard-hero-description text-sm leading-6 text-white/65">
-              {description}
+            <p style={{ fontSize: '11px', color: 'rgba(255, 255, 255, 0.4)', margin: 0, fontWeight: '500' }}>
+              {meta.description}
             </p>
           </div>
         </div>
-        <div className="dashboard-hero-actions-wrap">
-          <div className="dashboard-hero-actions">
-            {isOverview ? <Button variant="outline" className="dashboard-hero-button dashboard-hero-button-secondary" onPress={onRestart} isDisabled={saving}>Restart</Button> : null}
+
+        <div style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '10px', marginLeft: 'auto' }}>
+          {isOverview && (
             <Button
-              variant="primary"
-              className="dashboard-hero-button dashboard-hero-button-primary"
-              onPress={onPrimaryAction}
-              isDisabled={saving || playgroundLoading}
-              isPending={saving || playgroundLoading}
+              variant="ghost"
+              size="sm"
+              style={{
+                height: '36px',
+                padding: '0 16px',
+                borderRadius: '10px',
+                border: '1px solid rgba(255, 255, 255, 0.1)',
+                color: 'rgba(255, 255, 255, 0.6)',
+                fontWeight: '700',
+                fontSize: '13px'
+              }}
+              onPress={onRestart}
+              isDisabled={saving}
             >
-              <Icon icon={meta.icon} className="heroui-action-icon" />
-              <span className="dashboard-hero-button-label">{meta.buttonText}</span>
+              Restart
             </Button>
-          </div>
+          )}
+
+          <Button
+            variant="primary"
+            size="sm"
+            style={{
+              height: '36px',
+              padding: '0 20px',
+              borderRadius: '10px',
+              background: '#f4b400',
+              color: '#140029',
+              fontWeight: '900',
+              fontSize: '13px',
+              boxShadow: 'none'
+            }}
+            onPress={onPrimaryAction}
+            isDisabled={saving || playgroundLoading}
+            isPending={saving || playgroundLoading}
+          >
+            <Icon icon={meta.icon} style={{ fontSize: '18px' }} />
+            <span>{meta.buttonText}</span>
+          </Button>
         </div>
       </Card.Content>
     </Card>

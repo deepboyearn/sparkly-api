@@ -7,6 +7,7 @@ export type RequestLogEntry = {
   model?: string;
   durationMs: number;
   error?: string;
+  requestType?: "model_probe" | "chat" | "responses";
 };
 
 export type BridgeConfig = {
@@ -24,11 +25,21 @@ export type BridgeConfig = {
 export type UpstreamAccount = {
   id: string;
   name: string;
+  provider: AccountProvider;
   baseUrl: string;
   apiKey: string;
+  usageTags: AccountUsageTag[];
   isActive: boolean;
   lastUsedAt: string | null;
 };
+
+export type AccountProvider = "openai-compatible" | "v0";
+
+export type AccountUsageTag = "coding";
+
+export const V0_BASE_URL = "https://api.v0.dev/v1";
+
+export const V0_MODELS = ["v0-auto", "v0-mini", "v0-pro", "v0-max", "v0-max-fast"] as const;
 
 export type ClientApiKey = {
   id: string;
@@ -56,42 +67,6 @@ export type BridgeState = {
   stats: BridgeStats;
   logs: RequestLogEntry[];
   clientKeys: ClientApiKey[];
-  license: LicenseState;
-};
-
-export type LicensePayload = {
-  licenseId: string;
-  customerName: string;
-  customerEmail: string;
-  plan: string;
-  seats: number;
-  issuedAt: string;
-  expiresAt: string;
-  offlineGraceDays: number;
-  features: string[];
-  requestCode?: string;
-};
-
-export type LicenseEnvelope = {
-  payload: LicensePayload;
-  signature: string;
-};
-
-export type LicenseStatus = "missing" | "active" | "expired" | "invalid";
-
-export type LicenseState = {
-  status: LicenseStatus;
-  installedLicense: LicenseEnvelope | null;
-  requestCode: string;
-  customerName: string | null;
-  customerEmail: string | null;
-  plan: string | null;
-  expiresAt: string | null;
-  seats: number;
-  offlineGraceDays: number;
-  features: string[];
-  message: string;
-  lastValidatedAt: string | null;
 };
 
 export type SaveConfigInput = BridgeConfig;
@@ -111,15 +86,19 @@ export type DeleteClientKeyInput = {
 
 export type CreateAccountInput = {
   name: string;
+  provider: AccountProvider;
   baseUrl: string;
   apiKey: string;
+  usageTags: AccountUsageTag[];
 };
 
 export type UpdateAccountInput = {
   id: string;
   name: string;
+  provider: AccountProvider;
   baseUrl: string;
   apiKey: string;
+  usageTags: AccountUsageTag[];
   isActive: boolean;
 };
 
@@ -161,14 +140,6 @@ export type PlaygroundModelsResult = {
   error?: string;
 };
 
-export type ActivateLicenseInput = {
-  licenseKey: string;
-};
-
-export type GenerateRequestCodeInput = {
-  refresh?: boolean;
-};
-
-export type ClearLicenseInput = {
+export type ResetUsageInput = {
   confirm: boolean;
 };

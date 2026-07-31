@@ -11,6 +11,7 @@ export function ModelPicker({
   query,
   onQueryChange,
   onSelect,
+  footerLeft,
 }: {
   label: string;
   value: string;
@@ -18,6 +19,7 @@ export function ModelPicker({
   query: string;
   onQueryChange: (value: string) => void;
   onSelect: (value: string) => void;
+  footerLeft?: React.ReactNode;
 }) {
   const [isExpanded, setIsExpanded] = useState(false);
   const deferredQuery = useDeferredValue(query);
@@ -47,6 +49,8 @@ export function ModelPicker({
     setIsExpanded(false);
   }, [normalizedQuery]);
 
+  const showPagination = !normalizedQuery && filteredModels.length > INITIAL_MODEL_PICKER_LIMIT;
+
   return (
     <div className="full-width model-picker-field">
       <div className="model-picker-header">
@@ -75,14 +79,23 @@ export function ModelPicker({
           </button>
         ))}
       </div>
-      {!normalizedQuery && filteredModels.length > INITIAL_MODEL_PICKER_LIMIT ? (
-        <div className="actions-row">
-          <span className="panel-tag muted-tag">
-            Showing {visibleModels.length} of {filteredModels.length} models
-          </span>
-          <Button variant="ghost" onPress={() => setIsExpanded((current) => !current)}>
-            {isExpanded ? "Show less" : "Show all"}
-          </Button>
+      {showPagination || footerLeft ? (
+        <div className="actions-row" style={{ justifyContent: footerLeft ? 'space-between' : 'flex-end', width: '100%' }}>
+          {footerLeft && (
+            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+              {footerLeft}
+            </div>
+          )}
+          {showPagination ? (
+            <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+              <span className="panel-tag muted-tag">
+                Showing {visibleModels.length} of {filteredModels.length} models
+              </span>
+              <button className="premium-button ghost sm" onClick={() => setIsExpanded((current) => !current)}>
+                {isExpanded ? "Show less" : "Show all"}
+              </button>
+            </div>
+          ) : null}
         </div>
       ) : null}
     </div>

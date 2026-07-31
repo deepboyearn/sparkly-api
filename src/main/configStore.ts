@@ -1,15 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { app } from "electron";
 import os from "node:os";
-import type { ActivateLicenseInput, BridgeConfig, ClientApiKey, LicenseEnvelope, LicenseState, UpstreamAccount } from "../shared/types";
+import { V0_BASE_URL, V0_MODELS } from "../shared/types";
+import type { AccountProvider, BridgeConfig, ClientApiKey, UpstreamAccount } from "../shared/types";
 
 const defaultAccountId = randomUUID();
 const defaultLocalPort = 48231;
 
 const defaultConfig: BridgeConfig = {
-  upstreamBaseUrl: "https://api.souimagery.fun",
+  upstreamBaseUrl: "https://api.bluesminds.com",
   apiKey: "",
   models: [
     "gpt-5",
@@ -53,7 +54,7 @@ const defaultConfig: BridgeConfig = {
     "qwen3.6-plus-image-edit",
     "qwen3.6-plus-search",
     "qwen3.6-plus-thinking",
-    "qwen3.6-plus-thinking-search"
+    "qwen3.6-plus-thinking-search",
   ],
   selectedModel: "gpt-5.4",
   localPort: defaultLocalPort,
@@ -63,8 +64,10 @@ const defaultConfig: BridgeConfig = {
     {
       id: defaultAccountId,
       name: "Primary Account",
-      baseUrl: "https://api.souimagery.fun",
+      provider: "openai-compatible",
+      baseUrl: "https://api.bluesminds.com",
       apiKey: "",
+      usageTags: ["coding"],
       isActive: true,
       lastUsedAt: null,
     },
@@ -72,8 +75,7 @@ const defaultConfig: BridgeConfig = {
   activeAccountId: defaultAccountId,
 };
 
-const LICENSE_SECRET = "local-ai-bridge-license-secret-v1";
-
+// ─── PATH HELPERS ─────────────────────────────────────────────────────────────
 function getUserDataPath() {
   if (app) {
     try {
@@ -82,8 +84,7 @@ function getUserDataPath() {
       // Fall through to the non-Electron path below.
     }
   }
-
-  return path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "local-ai-bridge");
+  return path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "sparkly-api");
 }
 
 function getConfigPath() {
@@ -94,168 +95,38 @@ function getClientKeysPath() {
   return path.join(getUserDataPath(), "client-keys.json");
 }
 
-function getLicensePath() {
-  return path.join(getUserDataPath(), "license.json");
-}
-
-function getLicenseRequestPath() {
-  return path.join(getUserDataPath(), "license-request.txt");
+function getUsageLogsPath() {
+  return path.join(getUserDataPath(), "usage-logs.json");
 }
 
 export function getResponsesDebugLogPath() {
   return path.join(getUserDataPath(), "responses-debug.jsonl");
 }
 
-function getDefaultLicenseState(message = "No license installed."): LicenseState {
-  return {
-    status: "missing",
-    installedLicense: null,
-    requestCode: loadOrCreateRequestCode(),
-    customerName: null,
-    customerEmail: null,
-    plan: null,
-    expiresAt: null,
-    seats: 0,
-    offlineGraceDays: 0,
-    features: [],
-    message,
-    lastValidatedAt: null,
-  };
-}
-
-function createLicenseSignature(payload: LicenseEnvelope["payload"]) {
-  return createHash("sha256").update(`${JSON.stringify(payload)}:${LICENSE_SECRET}`).digest("base64url");
-}
-
-function decodeLicenseKey(raw: string) {
-  const normalized = raw.trim().replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/");
-  const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
-  return Buffer.from(padded, "base64").toString("utf8");
-}
-
-function createRequestCode() {
-  return `REQ-${randomBytes(9).toString("hex").toUpperCase()}`;
-}
-
-function loadOrCreateRequestCode() {
-  const requestPath = getLicenseRequestPath();
-  if (fs.existsSync(requestPath)) {
-    const existing = fs.readFileSync(requestPath, "utf8").trim();
-    if (existing) {
-      return existing;
-    }
-  }
-
-  const code = createRequestCode();
-  fs.mkdirSync(path.dirname(requestPath), { recursive: true });
-  fs.writeFileSync(requestPath, code, "utf8");
-  return code;
-}
-
-export function regenerateRequestCode() {
-  const requestPath = getLicenseRequestPath();
-  const code = createRequestCode();
-  fs.mkdirSync(path.dirname(requestPath), { recursive: true });
-  fs.writeFileSync(requestPath, code, "utf8");
-  return code;
-}
-
-function persistLicense(license: LicenseEnvelope) {
-  fs.mkdirSync(path.dirname(getLicensePath()), { recursive: true });
-  fs.writeFileSync(getLicensePath(), JSON.stringify(license, null, 2), "utf8");
-}
-
-function readInstalledLicense() {
-  const licensePath = getLicensePath();
-  if (!fs.existsSync(licensePath)) {
-    return null;
+export function loadUsageLogs() {
+  const usagePath = getUsageLogsPath();
+  if (!fs.existsSync(usagePath)) {
+    return [];
   }
 
   try {
-    const raw = fs.readFileSync(licensePath, "utf8");
-    return JSON.parse(raw) as LicenseEnvelope;
+    const parsed = JSON.parse(fs.readFileSync(usagePath, "utf8"));
+    return Array.isArray(parsed) ? parsed : [];
   } catch {
-    return null;
+    return [];
   }
 }
 
-function verifyLicenseEnvelope(license: LicenseEnvelope | null): LicenseState {
-  if (!license?.payload || typeof license.signature !== "string" || !license.signature.trim()) {
-    return getDefaultLicenseState("License file is missing or malformed.");
-  }
-
-  const isValid = createLicenseSignature(license.payload) === license.signature;
-  if (!isValid) {
-    return {
-      ...getDefaultLicenseState("License signature validation failed."),
-      status: "invalid",
-      installedLicense: license,
-      lastValidatedAt: new Date().toISOString(),
-    };
-  }
-
-  const expiresAt = typeof license.payload.expiresAt === "string" ? license.payload.expiresAt : "";
-  const isExpired = !expiresAt || Number.isNaN(Date.parse(expiresAt)) || Date.parse(expiresAt) < Date.now();
-  const currentRequestCode = loadOrCreateRequestCode();
-  if (license.payload.requestCode !== currentRequestCode) {
-    return {
-      ...getDefaultLicenseState("This activation code was generated for another installation."),
-      status: "invalid",
-      installedLicense: license,
-      lastValidatedAt: new Date().toISOString(),
-    };
-  }
-
-  return {
-    status: isExpired ? "expired" : "active",
-    installedLicense: license,
-    requestCode: currentRequestCode,
-    customerName: license.payload.customerName,
-    customerEmail: license.payload.customerEmail,
-    plan: license.payload.plan,
-    expiresAt: license.payload.expiresAt,
-    seats: Number.isFinite(license.payload.seats) ? license.payload.seats : 0,
-    offlineGraceDays: Number.isFinite(license.payload.offlineGraceDays) ? license.payload.offlineGraceDays : 0,
-    features: Array.isArray(license.payload.features) ? license.payload.features.filter((item) => typeof item === "string") : [],
-    message: isExpired ? "Installed license has expired." : "License is active.",
-    lastValidatedAt: new Date().toISOString(),
-  };
+export function saveUsageLogs(logs: unknown[]) {
+  fs.mkdirSync(path.dirname(getUsageLogsPath()), { recursive: true });
+  fs.writeFileSync(getUsageLogsPath(), JSON.stringify(logs, null, 2), "utf8");
 }
 
-export function loadLicenseState() {
-  return verifyLicenseEnvelope(readInstalledLicense());
+export function clearUsageLogs() {
+  saveUsageLogs([]);
 }
 
-export function activateLicense(input: ActivateLicenseInput) {
-  const trimmed = input.licenseKey.trim();
-  if (!trimmed) {
-    return getDefaultLicenseState("License key is required.");
-  }
-
-  try {
-    const parsed = JSON.parse(decodeLicenseKey(trimmed)) as LicenseEnvelope;
-    const state = verifyLicenseEnvelope(parsed);
-    if (state.status === "active" || state.status === "expired") {
-      persistLicense(parsed);
-    }
-    return state;
-  } catch {
-    return {
-      ...getDefaultLicenseState("License key format is invalid."),
-      status: "invalid",
-      lastValidatedAt: new Date().toISOString(),
-    };
-  }
-}
-
-export function clearLicense() {
-  const licensePath = getLicensePath();
-  if (fs.existsSync(licensePath)) {
-    fs.unlinkSync(licensePath);
-  }
-  return getDefaultLicenseState();
-}
-
+// ─── CLIENT KEYS ─────────────────────────────────────────────────────────────
 function persistClientKeys(keys: ClientApiKey[]) {
   fs.mkdirSync(path.dirname(getClientKeysPath()), { recursive: true });
   fs.writeFileSync(getClientKeysPath(), JSON.stringify(keys, null, 2), "utf8");
@@ -321,27 +192,25 @@ export function normalizeConfig(input: BridgeConfig): BridgeConfig {
 }
 
 function normalizeAccounts(accounts: UpstreamAccount[] | undefined, fallbackBaseUrl: string, fallbackApiKey: string, activeAccountId: string) {
-  const source = Array.isArray(accounts) && accounts.length > 0
-    ? accounts
-    : [
-        {
-          id: defaultAccountId,
-          name: "Primary Account",
-          baseUrl: fallbackBaseUrl || defaultConfig.upstreamBaseUrl,
-          apiKey: fallbackApiKey || defaultConfig.apiKey,
-          isActive: true,
-          lastUsedAt: null,
-        },
-      ];
+  const source = Array.isArray(accounts) ? accounts : [];
 
-  const normalized = source.map((account, index) => ({
-    id: account.id || randomUUID(),
-    name: account.name.trim() || `Account ${index + 1}`,
-    baseUrl: account.baseUrl.trim().replace(/\/$/, "") || defaultConfig.upstreamBaseUrl,
-    apiKey: account.apiKey.trim(),
-    isActive: account.id === activeAccountId || (!activeAccountId && index === 0),
-    lastUsedAt: account.lastUsedAt ?? null,
-  }));
+  if (source.length === 0) {
+    return [];
+  }
+
+  const normalized: UpstreamAccount[] = source.map((account, index) => {
+    const provider = normalizeAccountProvider((account as Partial<UpstreamAccount>).provider);
+    return {
+      id: account.id || randomUUID(),
+      name: account.name.trim() || (provider === "v0" ? "v0" : `Account ${index + 1}`),
+      provider,
+      baseUrl: account.baseUrl.trim().replace(/\/$/, "") || (provider === "v0" ? V0_BASE_URL : defaultConfig.upstreamBaseUrl),
+      apiKey: account.apiKey.trim(),
+      usageTags: ["coding"],
+      isActive: account.id === activeAccountId || (!activeAccountId && index === 0),
+      lastUsedAt: account.lastUsedAt ?? null,
+    };
+  });
 
   if (!normalized.some((account) => account.isActive) && normalized[0]) {
     normalized[0].isActive = true;
@@ -350,18 +219,25 @@ function normalizeAccounts(accounts: UpstreamAccount[] | undefined, fallbackBase
   return normalized;
 }
 
+function normalizeAccountProvider(provider: unknown): AccountProvider {
+  return provider === "v0" ? "v0" : "openai-compatible";
+}
+
 function persistConfig(config: BridgeConfig) {
   fs.mkdirSync(path.dirname(getConfigPath()), { recursive: true });
   fs.writeFileSync(getConfigPath(), JSON.stringify(config, null, 2), "utf8");
 }
 
-export function createAccount(input: { name: string; baseUrl: string; apiKey: string }) {
+export function createAccount(input: { name: string; provider: AccountProvider; baseUrl: string; apiKey: string; usageTags: Array<"coding"> }) {
   const config = loadConfig();
+  const provider = normalizeAccountProvider(input.provider);
   const nextAccount: UpstreamAccount = {
     id: randomUUID(),
-    name: input.name.trim() || `Account ${config.accounts.length + 1}`,
-    baseUrl: input.baseUrl.trim().replace(/\/$/, "") || config.upstreamBaseUrl,
+    name: input.name.trim() || (provider === "v0" ? "v0" : `Account ${config.accounts.length + 1}`),
+    provider,
+    baseUrl: input.baseUrl.trim().replace(/\/$/, "") || (provider === "v0" ? V0_BASE_URL : config.upstreamBaseUrl),
     apiKey: input.apiKey.trim(),
+    usageTags: ["coding"],
     isActive: config.accounts.length === 0,
     lastUsedAt: null,
   };
@@ -373,9 +249,10 @@ export function createAccount(input: { name: string; baseUrl: string; apiKey: st
   });
 }
 
-export function updateAccount(input: { id: string; name: string; baseUrl: string; apiKey: string; isActive: boolean }) {
+export function updateAccount(input: { id: string; name: string; provider: AccountProvider; baseUrl: string; apiKey: string; usageTags: Array<"coding">; isActive: boolean }) {
   const config = loadConfig();
-  const accounts = config.accounts.map((account) => {
+  const provider = normalizeAccountProvider(input.provider);
+  const accounts: UpstreamAccount[] = config.accounts.map((account) => {
     if (account.id !== input.id) {
       return {
         ...account,
@@ -386,8 +263,10 @@ export function updateAccount(input: { id: string; name: string; baseUrl: string
     return {
       ...account,
       name: input.name.trim() || account.name,
-      baseUrl: input.baseUrl.trim().replace(/\/$/, "") || account.baseUrl,
+      provider,
+      baseUrl: input.baseUrl.trim().replace(/\/$/, "") || (provider === "v0" ? V0_BASE_URL : account.baseUrl),
       apiKey: input.apiKey.trim() || account.apiKey,
+      usageTags: ["coding"],
       isActive: input.isActive,
     };
   });
@@ -416,6 +295,10 @@ export function markAccountUsed(id: string) {
   const config = loadConfig();
   const accounts = config.accounts.map((account) => account.id === id ? { ...account, lastUsedAt: new Date().toISOString() } : account);
   persistConfig({ ...config, accounts });
+}
+
+export function getV0Models() {
+  return [...V0_MODELS];
 }
 
 export function loadClientKeys(): ClientApiKey[] {

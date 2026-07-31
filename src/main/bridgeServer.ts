@@ -6,8 +6,10 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
+import type { IncomingHttpHeaders } from "node:http";
 import { randomUUID } from "node:crypto";
 import { getResponsesDebugLogPath, loadConfig, markAccountUsed, selectActiveAccount } from "./configStore";
+import { V0_MODELS } from "../shared/types";
 import type { BridgeConfig, BridgeStats, RequestLogEntry, UpstreamAccount } from "../shared/types";
 
 const MAX_LOGS = 200;
@@ -78,6 +80,13 @@ export class BridgeServer {
 
   getLogs() {
     return [...this.logs];
+  }
+
+  clearLogs() {
+    this.logs = [];
+    this.totalRequests = 0;
+    this.successCount = 0;
+    this.errorCount = 0;
   }
 
   getStats(): BridgeStats {
@@ -201,6 +210,76 @@ export class BridgeServer {
 
       this.writeResponse(res, proxied, this.extractModel(chatBody));
     });
+
+    this.configureDevAppProxy();
+  }
+
+  private configureDevAppProxy() {
+    const devAppUrl = process.env.SPARKLY_DEV_APP_URL;
+    const controlUrl = process.env.SPARKLY_CONTROL_URL;
+
+    if (!devAppUrl) {
+      return;
+    }
+
+    this.app.use(async (req, res, next) => {
+      if (req.path.startsWith("/v1") || req.path === "/health" || req.path === "/stats" || req.path === "/logs") {
+        next();
+        return;
+      }
+
+      const targetBaseUrl = req.path.startsWith("/api") && controlUrl ? controlUrl : devAppUrl;
+      await this.proxyDevRequest(req, res, targetBaseUrl);
+    });
+  }
+
+  private async proxyDevRequest(req: Request, res: Response, targetBaseUrl: string) {
+    try {
+      const targetUrl = new URL(req.originalUrl, targetBaseUrl);
+      const headers = this.toProxyHeaders(req.headers);
+      headers.set("host", targetUrl.host);
+
+      const response = await fetch(targetUrl, {
+        method: req.method,
+        headers,
+        body: req.method === "GET" || req.method === "HEAD" ? undefined : JSON.stringify(req.body ?? {}),
+        redirect: "manual",
+      });
+
+      response.headers.forEach((value, key) => {
+        res.setHeader(key, value);
+      });
+      res.status(response.status);
+
+      if (req.method === "HEAD") {
+        res.end();
+        return;
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      res.send(buffer);
+    } catch (error) {
+      res.status(502).send(error instanceof Error ? error.message : "Dev app proxy failed");
+    }
+  }
+
+  private toProxyHeaders(headers: IncomingHttpHeaders) {
+    const nextHeaders = new Headers();
+
+    for (const [key, value] of Object.entries(headers)) {
+      if (value === undefined || key.toLowerCase() === "content-length") {
+        continue;
+      }
+
+      if (Array.isArray(value)) {
+        value.forEach((item) => nextHeaders.append(key, item));
+        continue;
+      }
+
+      nextHeaders.set(key, value);
+    }
+
+    return nextHeaders;
   }
 
   private hasConfiguredUpstream() {
@@ -800,7 +879,7 @@ export class BridgeServer {
     const relative = path.relative(WORKSPACE_ROOT, candidatePath);
 
     if (relative.startsWith("..") || path.isAbsolute(relative)) {
-      throw new Error("File path is outside the local-ai-bridge workspace root.");
+      throw new Error("File path is outside the sparkly-api workspace root.");
     }
 
     return candidatePath;
@@ -1173,29 +1252,20 @@ export class BridgeServer {
 
     for (const account of accountsToTry) {
       try {
-        const response = await fetch(`${account.baseUrl}${upstreamPath}`, {
-          method,
-          headers: {
-            Authorization: `Bearer ${account.apiKey}`,
-            "Content-Type": "application/json",
-          },
-          body: body ? JSON.stringify(body) : undefined,
-        });
-
-        const text = await response.text();
-        const contentType = response.headers.get("content-type") ?? "application/json";
-        const parsedBody = contentType.includes("application/json") && text ? JSON.parse(text) : text;
+        const proxied = account.provider === "v0"
+          ? await this.forwardV0Request(account, upstreamPath, method, body)
+          : await this.forwardOpenAiCompatibleRequest(account, upstreamPath, method, body);
         const durationMs = Date.now() - started;
 
         this.recordLog({
           method,
           path: upstreamPath,
-          status: response.status,
+          status: proxied.status,
           model: this.extractModel(body),
           durationMs,
         });
 
-        if (response.ok) {
+        if (proxied.status >= 200 && proxied.status < 300) {
           this.successCount += 1;
           this.totalRequests += 1;
           markAccountUsed(account.id);
@@ -1204,22 +1274,14 @@ export class BridgeServer {
             this.config = selectActiveAccount(account.id);
           }
 
-          return {
-            status: response.status,
-            contentType,
-            body: parsedBody,
-          };
+          return proxied;
         }
 
-        const shouldFailover = this.shouldFailoverAccount(response.status, parsedBody);
+        const shouldFailover = this.shouldFailoverAccount(proxied.status, proxied.body);
         if (!shouldFailover || account.id === accountsToTry[accountsToTry.length - 1]?.id) {
           this.errorCount += 1;
           this.totalRequests += 1;
-          return {
-            status: response.status,
-            contentType,
-            body: parsedBody,
-          };
+          return proxied;
         }
       } catch (error) {
         const isLastAccount = account.id === accountsToTry[accountsToTry.length - 1]?.id;
@@ -1263,6 +1325,190 @@ export class BridgeServer {
         },
       },
     };
+  }
+
+  private async forwardOpenAiCompatibleRequest(
+    account: UpstreamAccount,
+    upstreamPath: string,
+    method: "GET" | "POST",
+    body?: unknown,
+  ) {
+        const response = await fetch(`${account.baseUrl}${upstreamPath}`, {
+          method,
+          headers: {
+            Authorization: `Bearer ${account.apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: body ? JSON.stringify(body) : undefined,
+        });
+
+        const text = await response.text();
+        const contentType = response.headers.get("content-type") ?? "application/json";
+        const parsedBody = contentType.includes("application/json") && text ? JSON.parse(text) : text;
+        return {
+          status: response.status,
+          contentType,
+          body: parsedBody,
+        };
+  }
+
+  private async forwardV0Request(
+    account: UpstreamAccount,
+    upstreamPath: string,
+    method: "GET" | "POST",
+    body?: unknown,
+  ) {
+    if (method === "GET" && upstreamPath === "/v1/models") {
+      return {
+        status: 200,
+        contentType: "application/json",
+        body: {
+          object: "list",
+          data: V0_MODELS.map((id) => ({ id, object: "model", owned_by: "v0" })),
+        },
+      };
+    }
+
+    if (method !== "POST" || upstreamPath !== "/v1/chat/completions") {
+      return {
+        status: 400,
+        contentType: "application/json",
+        body: {
+          error: {
+            message: "v0 accounts currently support /v1/models and /v1/chat/completions through this bridge.",
+            type: "bridge_provider_error",
+          },
+        },
+      };
+    }
+
+    const requestBody = body && typeof body === "object" ? body as Record<string, unknown> : {};
+    const model = this.normalizeV0Model(requestBody.model);
+    const response = await fetch(`${account.baseUrl}/chats`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${account.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        message: this.extractV0Message(requestBody.messages),
+        responseMode: "sync",
+        modelConfiguration: {
+          modelId: model,
+          imageGenerations: false,
+          thinking: false,
+        },
+      }),
+    });
+
+    const text = await response.text();
+    let raw: unknown = text;
+    try {
+      raw = text ? JSON.parse(text) : null;
+    } catch {
+      raw = text;
+    }
+
+    if (!response.ok) {
+      return {
+        status: response.status,
+        contentType: response.headers.get("content-type") ?? "application/json",
+        body: raw,
+      };
+    }
+
+    return {
+      status: 200,
+      contentType: "application/json",
+      body: this.mapV0ChatToOpenAiChat(raw, model),
+    };
+  }
+
+  private normalizeV0Model(model: unknown) {
+    return typeof model === "string" && (V0_MODELS as readonly string[]).includes(model) ? model : V0_MODELS[0];
+  }
+
+  private extractV0Message(messages: unknown) {
+    if (!Array.isArray(messages)) {
+      return "";
+    }
+
+    return messages
+      .map((message) => {
+        if (!message || typeof message !== "object") {
+          return "";
+        }
+
+        const typedMessage = message as { role?: unknown; content?: unknown };
+        const role = typeof typedMessage.role === "string" ? typedMessage.role : "user";
+        const content = this.stringifyToolMessageContent(typedMessage.content);
+        return content ? `${role}: ${content}` : "";
+      })
+      .filter(Boolean)
+      .join("\n\n");
+  }
+
+  private mapV0ChatToOpenAiChat(raw: unknown, model: string) {
+    const chat = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+    const text = this.extractV0Text(chat);
+    const content = this.appendV0Metadata(text, chat);
+    const created = Math.floor(Date.now() / 1000);
+
+    return {
+      id: typeof chat.id === "string" ? `chatcmpl_${chat.id}` : `chatcmpl_${randomUUID().replace(/-/g, "")}`,
+      object: "chat.completion",
+      created,
+      model,
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content,
+          },
+          finish_reason: "stop",
+        },
+      ],
+      usage: {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+      },
+      v0: chat,
+    };
+  }
+
+  private extractV0Text(chat: Record<string, unknown>) {
+    const directText = chat.text;
+    if (typeof directText === "string" && directText.trim()) {
+      return directText.trim();
+    }
+
+    const latestVersion = chat.latestVersion && typeof chat.latestVersion === "object" ? chat.latestVersion as { text?: unknown } : null;
+    if (typeof latestVersion?.text === "string" && latestVersion.text.trim()) {
+      return latestVersion.text.trim();
+    }
+
+    return "v0 completed the request.";
+  }
+
+  private appendV0Metadata(text: string, chat: Record<string, unknown>) {
+    const lines = [text];
+    if (typeof chat.webUrl === "string" && chat.webUrl.trim()) {
+      lines.push(`\nChat URL: ${chat.webUrl.trim()}`);
+    }
+
+    const latestVersion = chat.latestVersion && typeof chat.latestVersion === "object" ? chat.latestVersion as { files?: unknown } : null;
+    if (Array.isArray(latestVersion?.files) && latestVersion.files.length > 0) {
+      const fileNames = latestVersion.files
+        .flatMap((file) => file && typeof file === "object" && typeof (file as { name?: unknown }).name === "string" ? [(file as { name: string }).name] : [])
+        .slice(0, 20);
+      if (fileNames.length > 0) {
+        lines.push(`\nGenerated files:\n${fileNames.map((name) => `- ${name}`).join("\n")}`);
+      }
+    }
+
+    return lines.join("\n");
   }
 
   private getActiveAccount(): UpstreamAccount | undefined {

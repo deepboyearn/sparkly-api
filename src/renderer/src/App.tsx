@@ -1,6 +1,7 @@
 import { startTransition, useEffect, useMemo, useState } from "react";
 import { Alert, Avatar, Button, ButtonGroup, Card, Chip, Input } from "@heroui/react";
 import { Icon } from "@iconify/react";
+import { motion, AnimatePresence } from "framer-motion";
 import {
   CategoryScale,
   Chart as ChartJS,
@@ -12,27 +13,44 @@ import {
   type ChartOptions,
 } from "chart.js";
 import { Line } from "react-chartjs-2";
-import type { BridgeConfig, BridgeState, PlaygroundModelsResult, PlaygroundTestResult } from "../../shared/types";
-import { emptyState, ensureBridgeMethod, formatUptime, getHourlyPoints, getPlaygroundErrorSummary, getRequestPoints, getUsageRecords, groupKeyStats, groupModelStats, maskKey, normalizeBridgeState, normalizeOpenAiBaseUrl } from "./appState";
-import { HeroHeader } from "./components/HeroHeader";
+import { V0_BASE_URL, V0_MODELS } from "../../shared/types";
+import type { AccountProvider, AccountUsageTag, BridgeConfig, BridgeState, PlaygroundModelsResult, PlaygroundTestResult } from "../../shared/types";
+import { emptyState, ensureBridgeMethod, formatUptime, getDayPoints, getHourlyPoints, getPlaygroundErrorSummary, getRequestPoints, getUsageRecords, groupKeyStats, groupModelStats, maskKey, normalizeBridgeState, normalizeOpenAiBaseUrl } from "./appState";
+import { Header } from "./components/Header";
+import { Sidebar } from "./components/Sidebar";
 import { ModelPicker } from "./components/ModelPicker";
+import { Onboarding } from "./components/Onboarding";
 import { AccountsPage } from "./pages/AccountsPage";
 import { ApiKeysPage } from "./pages/ApiKeysPage";
-import { LicensesPage } from "./pages/LicensesPage";
 import { PlaygroundPage } from "./pages/PlaygroundPage";
 import { UsagePage } from "./pages/UsagePage";
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, ChartTooltip, Filler);
 
-const lockedSections = new Set<string>(["overview", "apiKeys", "usage", "accounts", "playground"]);
+const accountProviderOptions: Array<{ value: AccountProvider; label: string; description: string }> = [
+  {
+    value: "openai-compatible",
+    label: "Custom / OpenAI Compatible",
+    description: "Any gateway with OpenAI style /v1 endpoints",
+  },
+  {
+    value: "v0",
+    label: "v0 Platform API",
+    description: "Use v0 chat generation through api.v0.dev",
+  },
+];
 
 export default function App() {
   const [state, setState] = useState<BridgeState>(emptyState);
   const [form, setForm] = useState<BridgeConfig>(emptyState.config);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [activeSection, setActiveSection] = useState<"overview" | "apiKeys" | "usage" | "accounts" | "licenses" | "playground">("overview");
+  const [activeSection, setActiveSection] = useState<"overview" | "apiKeys" | "usage" | "accounts" | "playground">("overview");
+  const [requestTab, setRequestTab] = useState<"By Hour" | "By Day">("By Hour");
+  const [tokenTab, setTokenTab] = useState<"By Hour" | "By Day">("By Hour");
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [isCreateKeyOpen, setIsCreateKeyOpen] = useState(false);
   const [isEditKeyOpen, setIsEditKeyOpen] = useState(false);
   const [isAccountModalOpen, setIsAccountModalOpen] = useState(false);
@@ -41,14 +59,17 @@ export default function App() {
   const [editingKeyName, setEditingKeyName] = useState("");
   const [createdKeyValue, setCreatedKeyValue] = useState<string | null>(null);
   const [accountName, setAccountName] = useState("");
-  const [accountBaseUrl, setAccountBaseUrl] = useState("https://api.souimagery.fun");
+  const [accountProvider, setAccountProvider] = useState<AccountProvider>("openai-compatible");
+  const [accountBaseUrl, setAccountBaseUrl] = useState("https://api.bluesminds.com");
   const [accountApiKey, setAccountApiKey] = useState("");
   const [editingAccountId, setEditingAccountId] = useState<string | null>(null);
+  const [accountUsageTags, setAccountUsageTags] = useState<AccountUsageTag[]>(["coding"]);
   const [apiKeyModelQuery, setApiKeyModelQuery] = useState("");
   const [usageMode, setUsageMode] = useState<"statistics" | "records">("statistics");
+  const [timeFilter, setTimeFilter] = useState<"24h" | "7d" | "30d" | "all">("24h");
   const [playgroundModelQuery, setPlaygroundModelQuery] = useState("");
   const [playgroundAvailableModels, setPlaygroundAvailableModels] = useState<string[]>([]);
-  const [playgroundBaseUrl, setPlaygroundBaseUrl] = useState("https://api.souimagery.fun");
+  const [playgroundBaseUrl, setPlaygroundBaseUrl] = useState("https://api.bluesminds.com");
   const [playgroundApiKey, setPlaygroundApiKey] = useState("");
   const [playgroundModel, setPlaygroundModel] = useState("");
   const [playgroundSystemPrompt, setPlaygroundSystemPrompt] = useState("");
@@ -57,20 +78,127 @@ export default function App() {
   const [playgroundModelsResult, setPlaygroundModelsResult] = useState<PlaygroundModelsResult | null>(null);
   const [playgroundModelsLoading, setPlaygroundModelsLoading] = useState(false);
   const [playgroundLoading, setPlaygroundLoading] = useState(false);
-  const [licenseKeyInput, setLicenseKeyInput] = useState("");
-  const hasActiveLicense = state.license.status === "active";
+  // Overview page: persistent token counter with 5-hour auto-reset
+  const OVERVIEW_RESET_MS = 5 * 60 * 60 * 1000;
+  const [overviewTokens, setOverviewTokens] = useState(0);
+  const [overviewWindowStart, setOverviewWindowStart] = useState<number>(Date.now());
+
+  // Exclude model probe requests — defined early so effects below can use it
+  const realLogs = useMemo(() => state.logs.filter(l => l.requestType !== 'model_probe'), [state.logs]);
+
+  const usageFilteredLogs = useMemo(() => {
+    if (timeFilter === 'all') return realLogs;
+    const now = Date.now();
+    let ms = 24 * 60 * 60 * 1000;
+    if (timeFilter === '7d') ms = 7 * 24 * 60 * 60 * 1000;
+    if (timeFilter === '30d') ms = 30 * 24 * 60 * 60 * 1000;
+    return realLogs.filter(log => now - new Date(log.timestamp).getTime() <= ms);
+  }, [realLogs, timeFilter]);
+
+  useEffect(() => {
+    const resetOverviewTokens = () => {
+      const fresh = { tokens: 0, lastReset: Date.now(), processedIds: [] };
+      localStorage.setItem('overview_token_usage', JSON.stringify(fresh));
+      setOverviewTokens(0);
+      setOverviewWindowStart(fresh.lastReset);
+    };
+    const loadOverviewTokens = () => {
+      const raw = localStorage.getItem('overview_token_usage');
+      if (!raw) { resetOverviewTokens(); return; }
+      try {
+        const parsed = JSON.parse(raw);
+        if (Date.now() - (parsed.lastReset || 0) > OVERVIEW_RESET_MS) {
+          resetOverviewTokens();
+        } else {
+          setOverviewTokens(parsed.tokens || 0);
+          setOverviewWindowStart(parsed.lastReset || Date.now());
+        }
+      } catch { resetOverviewTokens(); }
+    };
+    loadOverviewTokens();
+    const timer = setInterval(loadOverviewTokens, 60 * 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Sync realLogs tokens into the overview persistent counter
+  useEffect(() => {
+    if (!realLogs || realLogs.length === 0) return;
+    const raw = localStorage.getItem('overview_token_usage');
+    let currentTokens = 0;
+    let currentLastReset = Date.now();
+    let processedIds: string[] = [];
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Date.now() - (parsed.lastReset || 0) > OVERVIEW_RESET_MS) {
+          const fresh = { tokens: 0, lastReset: Date.now(), processedIds: [] };
+          localStorage.setItem('overview_token_usage', JSON.stringify(fresh));
+          setOverviewTokens(0);
+          setOverviewWindowStart(fresh.lastReset);
+          return;
+        }
+        currentTokens = parsed.tokens || 0;
+        currentLastReset = parsed.lastReset || Date.now();
+        processedIds = parsed.processedIds || [];
+      } catch { return; }
+    }
+    let newTokens = currentTokens;
+    let updated = false;
+    realLogs.forEach(log => {
+      if (!processedIds.includes(log.id)) {
+        processedIds.push(log.id);
+        newTokens += Math.max(60, (log.durationMs || 0) * 3);
+        updated = true;
+      }
+    });
+    if (updated) {
+      if (processedIds.length > 1000) processedIds.splice(0, processedIds.length - 1000);
+      localStorage.setItem('overview_token_usage', JSON.stringify({ tokens: newTokens, lastReset: currentLastReset, processedIds }));
+      setOverviewTokens(newTokens);
+      setOverviewWindowStart(currentLastReset);
+    }
+  }, [realLogs]);
+
+  const overviewFilteredLogs = useMemo(() => {
+    return realLogs.filter(log => new Date(log.timestamp).getTime() >= overviewWindowStart);
+  }, [overviewWindowStart, realLogs]);
+
+  const overviewSuccessCount = useMemo(() => (
+    overviewFilteredLogs.filter((log) => log.status < 400).length
+  ), [overviewFilteredLogs]);
+
+  const overviewFailedCount = useMemo(() => (
+    overviewFilteredLogs.filter((log) => log.status >= 400).length
+  ), [overviewFilteredLogs]);
+
+  const overviewSuccessRate = useMemo(() => (
+    overviewFilteredLogs.length === 0 ? 100 : Math.round((overviewSuccessCount / overviewFilteredLogs.length) * 100)
+  ), [overviewFilteredLogs.length, overviewSuccessCount]);
+
+  const overviewCurrentRpm = useMemo(() => {
+    const minuteAgo = Date.now() - 60_000;
+    return overviewFilteredLogs.filter((log) => new Date(log.timestamp).getTime() >= minuteAgo).length;
+  }, [overviewFilteredLogs]);
+
   const isOverview = activeSection === "overview";
   const isApiKeys = activeSection === "apiKeys";
   const isUsage = activeSection === "usage";
   const isAccounts = activeSection === "accounts";
-  const isLicenses = activeSection === "licenses";
   const isPlayground = activeSection === "playground";
+
+  // Overview analytics: Only show last 5 hours
   const requestPoints = useMemo(() => (
-    isOverview ? getRequestPoints(state.stats.totalRequests) : []
-  ), [isOverview, state.stats.totalRequests]);
-  const maxPoint = useMemo(() => (
+    isOverview ? getRequestPoints(overviewFilteredLogs) : []
+  ), [isOverview, overviewFilteredLogs]);
+  const overviewMaxPoint = useMemo(() => (
     requestPoints.length > 0 ? Math.max(...requestPoints.map((point) => point.value), 1) : 1
   ), [requestPoints]);
+  const probePoints = useMemo(() => (
+    isOverview ? getRequestPoints(state.logs.filter(l => l.requestType === 'model_probe' && new Date(l.timestamp).getTime() >= overviewWindowStart)) : []
+  ), [isOverview, overviewWindowStart, state.logs]);
+  const overviewHasTraffic = useMemo(() => (
+    requestPoints.some((point) => point.value > 0) || probePoints.some((point) => point.value > 0)
+  ), [probePoints, requestPoints]);
   const requestTrendData = useMemo(() => ({
     labels: requestPoints.map((point) => point.label),
     datasets: [
@@ -80,33 +208,73 @@ export default function App() {
         borderColor: "#f07d2f",
         backgroundColor: "rgba(240, 125, 47, 0.2)",
         fill: true,
-        tension: 0.38,
+        tension: 0.42,
         borderWidth: 3,
-        pointRadius: 4,
-        pointHoverRadius: 6,
+        pointRadius: requestPoints.map((point) => point.value > 0 ? 4 : 2),
+        pointHoverRadius: requestPoints.map((point) => point.value > 0 ? 7 : 4),
         pointBackgroundColor: "#f07d2f",
         pointBorderColor: "#141414",
         pointBorderWidth: 2,
+        pointHoverBackgroundColor: "#ffb067",
+        pointHoverBorderColor: "#22160d",
+        hitRadius: 18,
+        order: 2,
+      },
+      {
+        label: "Model Probes",
+        data: probePoints.map((point) => point.value),
+        borderColor: "#a78bfa",
+        backgroundColor: "rgba(167, 139, 250, 0.12)",
+        fill: false,
+        tension: 0.42,
+        borderWidth: 2,
+        borderDash: [6, 4],
+        pointRadius: probePoints.map((point) => point.value > 0 ? 4 : 2),
+        pointHoverRadius: probePoints.map((point) => point.value > 0 ? 6 : 4),
+        pointBackgroundColor: "#a78bfa",
+        pointBorderColor: "#a78bfa",
+        pointBorderWidth: 2,
+        pointHoverBackgroundColor: "#c4b5fd",
+        pointHoverBorderColor: "#a78bfa",
+        hitRadius: 18,
+        order: 1,
       },
     ],
-  }), [requestPoints]);
+  }), [requestPoints, probePoints]);
   const requestTrendOptions = useMemo<ChartOptions<"line">>(() => ({
     responsive: true,
     maintainAspectRatio: false,
     plugins: {
       legend: {
-        display: false,
+        display: true,
+        position: "top" as const,
+        align: "end" as const,
+        labels: {
+          color: "rgba(255,255,255,0.5)",
+          font: { family: "'Outfit', sans-serif", size: 11 },
+          boxWidth: 12,
+          boxHeight: 2,
+          padding: 16,
+          usePointStyle: true,
+          pointStyle: "line",
+        },
       },
       tooltip: {
-        displayColors: false,
-        backgroundColor: "rgba(20, 20, 20, 0.96)",
-        borderColor: "rgba(255, 255, 255, 0.08)",
+        displayColors: true,
+        boxWidth: 8,
+        boxHeight: 8,
+        backgroundColor: "rgba(10, 10, 12, 0.98)",
+        borderColor: "rgba(255, 255, 255, 0.12)",
         borderWidth: 1,
         titleColor: "#f4f4f4",
         bodyColor: "#d0d0d0",
+        titleFont: { family: "'Poppins', sans-serif", size: 11, weight: 700 },
+        bodyFont: { family: "'Poppins', sans-serif", size: 11, weight: 600 },
         padding: 12,
+        cornerRadius: 12,
         callbacks: {
-          label: (context) => `Requests: ${context.parsed.y}`,
+          title: (items) => items[0]?.label ?? "",
+          label: (context) => `${context.dataset.label}: ${context.parsed.y} requests`,
         },
       },
     },
@@ -117,6 +285,11 @@ export default function App() {
         },
         ticks: {
           color: "#9c9c9c",
+          autoSkip: true,
+          maxTicksLimit: 6,
+          maxRotation: 0,
+          minRotation: 0,
+          font: { family: "'Poppins', sans-serif", size: 10, weight: 600 },
         },
         border: {
           display: false,
@@ -124,38 +297,95 @@ export default function App() {
       },
       y: {
         beginAtZero: true,
-        suggestedMax: maxPoint + 1,
+        suggestedMax: overviewHasTraffic ? overviewMaxPoint + Math.max(1, Math.ceil(overviewMaxPoint * 0.35)) : 2,
         ticks: {
-          stepSize: 2,
+          stepSize: overviewMaxPoint <= 4 ? 1 : Math.max(1, Math.ceil(overviewMaxPoint / 4)),
           color: "#9c9c9c",
+          precision: 0,
+          font: { family: "'Poppins', sans-serif", size: 10, weight: 600 },
         },
         grid: {
-          color: "rgba(255, 255, 255, 0.06)",
+          color: "rgba(255, 255, 255, 0.05)",
+          drawTicks: false,
         },
         border: {
-          color: "rgba(255, 255, 255, 0.16)",
+          color: "rgba(255, 255, 255, 0.1)",
         },
       },
     },
     elements: {
       line: {
         cubicInterpolationMode: "monotone",
+        capBezierPoints: true,
       },
     },
-  }), [maxPoint]);
+  }), [overviewHasTraffic, overviewMaxPoint]);
   const successRate = useMemo(() => (
     isOverview || isUsage
       ? state.stats.totalRequests === 0 ? 0 : Math.round((state.stats.successCount / state.stats.totalRequests) * 100)
       : 0
   ), [isOverview, isUsage, state.stats.successCount, state.stats.totalRequests]);
   const clientBaseUrl = `${state.stats.localBaseUrl}/v1`;
+  // Auto-reset logs older than 30 days
+  useEffect(() => {
+    const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
+    const hasOldLogs = state.logs.some(log => new Date(log.timestamp).getTime() < thirtyDaysAgo);
+    
+    if (hasOldLogs) {
+      const filteredLogs = state.logs.filter(log => new Date(log.timestamp).getTime() >= thirtyDaysAgo);
+      setState(prev => ({ ...prev, logs: filteredLogs }));
+    }
+  }, [state.logs.length]); // Check when logs are added or on mount
+
   const localClientKey = state.clientKeys[0]?.key ?? "local-bridge-client";
-  const hourlyRequestPoints = useMemo(() => (
-    isUsage ? getHourlyPoints(state.logs, "requests") : []
-  ), [isUsage, state.logs]);
-  const hourlyTokenPoints = useMemo(() => (
-    isUsage ? getHourlyPoints(state.logs, "tokens") : []
-  ), [isUsage, state.logs]);
+  const hourlyRequestPoints = useMemo(() => {
+    if (!isUsage) return [];
+    let count = 24;
+    if (requestTab === "By Hour") {
+      if (timeFilter === '7d') count = 7 * 24;
+      if (timeFilter === '30d') count = 30 * 24;
+      return getHourlyPoints(realLogs, "requests", count);
+    } else {
+      count = 14;
+      if (timeFilter === '7d') count = 7;
+      if (timeFilter === '30d') count = 30;
+      if (timeFilter === 'all') count = 30;
+      return getDayPoints(realLogs, "requests", count);
+    }
+  }, [isUsage, realLogs, requestTab, timeFilter]);
+
+  const hourlyTokenPoints = useMemo(() => {
+    if (!isUsage) return [];
+    let count = 24;
+    if (tokenTab === "By Hour") {
+      if (timeFilter === '7d') count = 7 * 24;
+      if (timeFilter === '30d') count = 30 * 24;
+      return getHourlyPoints(realLogs, "tokens", count);
+    } else {
+      count = 14;
+      if (timeFilter === '7d') count = 7;
+      if (timeFilter === '30d') count = 30;
+      if (timeFilter === 'all') count = 30;
+      return getDayPoints(realLogs, "tokens", count);
+    }
+  }, [isUsage, realLogs, tokenTab, timeFilter]);
+
+  const hourlyProbePoints = useMemo(() => {
+    if (!isUsage) return [];
+    const probeLogs = state.logs.filter(l => l.requestType === 'model_probe');
+    let count = 24;
+    if (requestTab === "By Hour") {
+      if (timeFilter === '7d') count = 7 * 24;
+      if (timeFilter === '30d') count = 30 * 24;
+      return getHourlyPoints(probeLogs, "requests", count);
+    } else {
+      count = 14;
+      if (timeFilter === '7d') count = 7;
+      if (timeFilter === '30d') count = 30;
+      if (timeFilter === 'all') count = 30;
+      return getDayPoints(probeLogs, "requests", count);
+    }
+  }, [isUsage, state.logs, requestTab, timeFilter]);
   const maxHourlyRequest = useMemo(() => (
     hourlyRequestPoints.length > 0 ? Math.max(...hourlyRequestPoints.map((point) => point.value), 1) : 1
   ), [hourlyRequestPoints]);
@@ -163,7 +393,7 @@ export default function App() {
     hourlyTokenPoints.length > 0 ? Math.max(...hourlyTokenPoints.map((point) => point.value), 1) : 1
   ), [hourlyTokenPoints]);
   const usageRequestChartData = useMemo(() => ({
-    labels: hourlyRequestPoints.map((point) => point.label.replace(":00", "")),
+    labels: hourlyRequestPoints.map((point) => point.label),
     datasets: [
       {
         label: "Requests",
@@ -178,11 +408,28 @@ export default function App() {
         pointBackgroundColor: "#27c46a",
         pointBorderColor: "#111",
         pointBorderWidth: 2,
+        order: 2,
+      },
+      {
+        label: "Model Probes",
+        data: hourlyProbePoints.map((point) => point.value),
+        borderColor: "#a78bfa",
+        backgroundColor: "rgba(167, 139, 250, 0.12)",
+        fill: false,
+        tension: 0.36,
+        borderWidth: 3,
+        borderDash: [6, 4],
+        pointRadius: 5,
+        pointHoverRadius: 7,
+        pointBackgroundColor: "#a78bfa",
+        pointBorderColor: "#a78bfa",
+        pointBorderWidth: 2,
+        order: 1,
       },
     ],
-  }), [hourlyRequestPoints]);
+  }), [hourlyRequestPoints, hourlyProbePoints]);
   const usageTokenChartData = useMemo(() => ({
-    labels: hourlyTokenPoints.map((point) => point.label.replace(":00", "")),
+    labels: hourlyTokenPoints.map((point) => point.label),
     datasets: [
       {
         label: "Tokens",
@@ -197,16 +444,48 @@ export default function App() {
         pointBackgroundColor: "#f07d2f",
         pointBorderColor: "#111",
         pointBorderWidth: 2,
+        order: 2,
+      },
+      {
+        label: "Model Probes",
+        data: hourlyProbePoints.map((point) => 0), // Probes consume 0 tokens
+        borderColor: "#a78bfa",
+        backgroundColor: "rgba(167, 139, 250, 0.12)",
+        fill: false,
+        tension: 0.36,
+        borderWidth: 3,
+        borderDash: [6, 4],
+        pointRadius: 5,
+        pointHoverRadius: 7,
+        pointBackgroundColor: "#a78bfa",
+        pointBorderColor: "#a78bfa",
+        pointBorderWidth: 2,
+        order: 1,
       },
     ],
-  }), [hourlyTokenPoints]);
+  }), [hourlyTokenPoints, hourlyProbePoints]);
+
   const usageRequestChartOptions = useMemo<ChartOptions<"line">>(() => ({
     responsive: true,
     maintainAspectRatio: false,
     plugins: {
-      legend: { display: false },
+      legend: {
+        display: true,
+        position: "top" as const,
+        align: "end" as const,
+        labels: {
+          color: "rgba(255,255,255,0.5)",
+          font: { family: "'Outfit', sans-serif", size: 10 },
+          boxWidth: 10,
+          boxHeight: 2,
+          usePointStyle: true,
+          pointStyle: "line",
+        },
+      },
       tooltip: {
-        displayColors: false,
+        displayColors: true,
+        boxWidth: 8,
+        boxHeight: 8,
         backgroundColor: "rgba(20, 20, 20, 0.96)",
         borderColor: "rgba(255, 255, 255, 0.08)",
         borderWidth: 1,
@@ -214,7 +493,7 @@ export default function App() {
         bodyColor: "#d0d0d0",
         padding: 12,
         callbacks: {
-          label: (context) => `Requests: ${context.parsed.y}`,
+          label: (context) => `${context.dataset.label}: ${context.parsed.y}`,
         },
       },
     },
@@ -240,9 +519,23 @@ export default function App() {
     responsive: true,
     maintainAspectRatio: false,
     plugins: {
-      legend: { display: false },
+      legend: {
+        display: true,
+        position: "top" as const,
+        align: "end" as const,
+        labels: {
+          color: "rgba(255,255,255,0.5)",
+          font: { family: "'Outfit', sans-serif", size: 10 },
+          boxWidth: 10,
+          boxHeight: 2,
+          usePointStyle: true,
+          pointStyle: "line",
+        },
+      },
       tooltip: {
-        displayColors: false,
+        displayColors: true,
+        boxWidth: 8,
+        boxHeight: 8,
         backgroundColor: "rgba(20, 20, 20, 0.96)",
         borderColor: "rgba(255, 255, 255, 0.08)",
         borderWidth: 1,
@@ -250,7 +543,7 @@ export default function App() {
         bodyColor: "#d0d0d0",
         padding: 12,
         callbacks: {
-          label: (context) => `Tokens: ${context.parsed.y}`,
+          label: (context) => `${context.dataset.label}: ${context.parsed.y}`,
         },
       },
     },
@@ -273,30 +566,31 @@ export default function App() {
     },
   }), [maxHourlyToken]);
   const modelStats = useMemo(() => (
-    isUsage ? groupModelStats(state.logs) : []
-  ), [isUsage, state.logs]);
+    isUsage ? groupModelStats(usageFilteredLogs) : []
+  ), [isUsage, usageFilteredLogs]);
   const keyStats = useMemo(() => (
-    isUsage ? groupKeyStats(state.logs, state.clientKeys) : []
-  ), [isUsage, state.clientKeys, state.logs]);
+    isUsage ? groupKeyStats(usageFilteredLogs, state.clientKeys) : []
+  ), [isUsage, state.clientKeys, usageFilteredLogs]);
   const totalTokenEstimate = useMemo(() => (
-    isUsage ? state.logs.reduce((total, entry) => total + Math.max(60, entry.durationMs * 3), 0) : 0
-  ), [isUsage, state.logs]);
+    isUsage ? usageFilteredLogs.reduce((total, entry) => total + Math.max(60, entry.durationMs * 3), 0) : 0
+  ), [isUsage, usageFilteredLogs]);
   const totalCostEstimate = useMemo(() => (
-    isUsage ? state.logs.reduce((total, entry) => total + Math.max(0.001, entry.durationMs / 100000), 0) : 0
-  ), [isUsage, state.logs]);
+    isUsage ? usageFilteredLogs.reduce((total, entry) => total + Math.max(0.001, entry.durationMs / 100000), 0) : 0
+  ), [isUsage, usageFilteredLogs]);
   const rpm = useMemo(() => (
-    isUsage ? state.logs.filter((entry) => Date.now() - new Date(entry.timestamp).getTime() <= 60_000).length : 0
-  ), [isUsage, state.logs]);
+    isUsage ? usageFilteredLogs.filter((entry) => Date.now() - new Date(entry.timestamp).getTime() <= 60_000).length : 0
+  ), [isUsage, usageFilteredLogs]);
   const tpm = useMemo(() => (
     isUsage
-      ? state.logs
+      ? usageFilteredLogs
         .filter((entry) => Date.now() - new Date(entry.timestamp).getTime() <= 60_000)
         .reduce((total, entry) => total + Math.max(60, entry.durationMs * 3), 0)
       : 0
-  ), [isUsage, state.logs]);
+  ), [isUsage, usageFilteredLogs]);
   const usageRecords = useMemo(() => (
-    isUsage ? getUsageRecords(state.logs, state.clientKeys, state.config.apiKey) : []
-  ), [isUsage, state.clientKeys, state.config.apiKey, state.logs]);
+    isUsage ? getUsageRecords(usageFilteredLogs, state.clientKeys, state.config.apiKey) : []
+  ), [isUsage, state.clientKeys, state.config.apiKey, usageFilteredLogs]);
+
   function applyLoadedBridgeState(nextState: Partial<BridgeState>) {
     const normalized = normalizeBridgeState(nextState);
     setState(normalized);
@@ -306,29 +600,33 @@ export default function App() {
   }
 
   async function refresh() {
-    const nextState = applyLoadedBridgeState(await window.bridgeApi.getState());
-    setPlaygroundBaseUrl(nextState.config.upstreamBaseUrl);
-    setPlaygroundApiKey(nextState.config.apiKey);
-    setPlaygroundModel(nextState.config.selectedModel);
-    setLoading(false);
+    if (!window.bridgeApi) {
+      console.warn("Electron bridgeApi not found. If you are running in a browser, some features will be disabled.");
+      setLoading(false);
+      return;
+    }
+    try {
+      const nextState = applyLoadedBridgeState(await window.bridgeApi.getState());
+      setPlaygroundBaseUrl(nextState.config.upstreamBaseUrl);
+      setPlaygroundApiKey(nextState.config.apiKey);
+      setPlaygroundModel(nextState.config.selectedModel);
+      
+      if (loading) {
+        setActiveSection("overview");
+      }
+    } catch (err) {
+      console.error("Failed to fetch initial state:", err);
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function persistConfig(nextForm: BridgeConfig) {
-    const savedState = applyLoadedBridgeState(await window.bridgeApi.saveConfig({
+    const savedState = applyLoadedBridgeState(await window.bridgeApi?.saveConfig({
       ...nextForm,
       models: nextForm.models,
     }));
     return savedState;
-  }
-
-  function ensureLicensedAccess(sectionLabel: string) {
-    if (hasActiveLicense) {
-      return true;
-    }
-
-    setActiveSection("licenses");
-    setError(`${sectionLabel} is locked. Activate your license to use this feature.`);
-    return false;
   }
 
   useEffect(() => {
@@ -343,35 +641,23 @@ export default function App() {
     }
 
     const intervalId = window.setInterval(() => {
-      window.bridgeApi
-        .getState()
-        .then((nextState) => {
+      window.bridgeApi?.getState()
+        ?.then((nextState) => {
           startTransition(() => {
             setState(normalizeBridgeState(nextState));
           });
         })
-        .catch(() => undefined);
+        ?.catch(() => undefined);
     }, 8000);
 
     return () => window.clearInterval(intervalId);
   }, [isAccountModalOpen, isCreateKeyOpen, isEditKeyOpen, playgroundLoading, playgroundModelsLoading, saving]);
 
-  useEffect(() => {
-    if (!hasActiveLicense && lockedSections.has(activeSection)) {
-      setActiveSection("licenses");
-    }
-  }, [activeSection, hasActiveLicense]);
-
-  async function onSave() {
-    if (!ensureLicensedAccess("Overview")) {
-      return;
-    }
-
+  async function onSave(optionalForm?: BridgeConfig) {
     setSaving(true);
     setError(null);
-
     try {
-      await persistConfig(form);
+      await persistConfig(optionalForm || form);
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "Failed to save configuration");
     } finally {
@@ -380,14 +666,10 @@ export default function App() {
   }
 
   async function onRestart() {
-    if (!ensureLicensedAccess("Overview")) {
-      return;
-    }
-
     setSaving(true);
     setError(null);
-
     try {
+      if (!window.bridgeApi) return;
       applyLoadedBridgeState(await window.bridgeApi.restartServer());
     } catch (restartError) {
       setError(restartError instanceof Error ? restartError.message : "Failed to restart local server");
@@ -397,18 +679,14 @@ export default function App() {
   }
 
   async function onCreateKey() {
-    if (!ensureLicensedAccess("API Keys")) {
-      return;
-    }
-
     setSaving(true);
     setError(null);
-
     try {
+      if (!window.bridgeApi) return;
       const nextState = normalizeBridgeState(await window.bridgeApi.createClientKey({ name: newKeyName }));
       setState(nextState);
-      setCreatedKeyValue(nextState.clientKeys[0]?.key ?? null);
       setNewKeyName("");
+      setIsCreateKeyOpen(false);
     } catch (createError) {
       setError(createError instanceof Error ? createError.message : "Failed to create client key");
     } finally {
@@ -417,18 +695,11 @@ export default function App() {
   }
 
   async function onUpdateKey() {
-    if (!editingKeyId) {
-      return;
-    }
-
-    if (!ensureLicensedAccess("API Keys")) {
-      return;
-    }
-
+    if (!editingKeyId) return;
     setSaving(true);
     setError(null);
-
     try {
+      if (!window.bridgeApi) return;
       const nextState = normalizeBridgeState(await window.bridgeApi.updateClientKey({
         id: editingKeyId,
         name: editingKeyName,
@@ -445,14 +716,10 @@ export default function App() {
   }
 
   async function onDeleteKey(id: string) {
-    if (!ensureLicensedAccess("API Keys")) {
-      return;
-    }
-
     setSaving(true);
     setError(null);
-
     try {
+      if (!window.bridgeApi) return;
       const nextState = normalizeBridgeState(await window.bridgeApi.deleteClientKey({ id }));
       setState(nextState);
       if (editingKeyId === id) {
@@ -468,44 +735,41 @@ export default function App() {
   }
 
   function openEditKeyModal(id: string, name: string) {
-    if (!ensureLicensedAccess("API Keys")) {
-      return;
-    }
-
     setEditingKeyId(id);
     setEditingKeyName(name);
     setIsEditKeyOpen(true);
   }
 
   async function onSaveAccount() {
-    if (!ensureLicensedAccess("Accounts")) {
-      return;
-    }
-
     setSaving(true);
     setError(null);
-
     try {
-      const nextState = editingAccountId
+      const result = editingAccountId
         ? await ensureBridgeMethod("updateAccount")({
           id: editingAccountId,
           name: accountName,
+          provider: accountProvider,
           baseUrl: accountBaseUrl,
           apiKey: accountApiKey,
+          usageTags: accountUsageTags,
           isActive: true,
         })
         : await ensureBridgeMethod("createAccount")({
           name: accountName,
+          provider: accountProvider,
           baseUrl: accountBaseUrl,
           apiKey: accountApiKey,
+          usageTags: accountUsageTags,
         });
 
-      const normalized = applyLoadedBridgeState(nextState);
+      applyLoadedBridgeState(result);
       setIsAccountModalOpen(false);
       setEditingAccountId(null);
       setAccountName("");
-      setAccountBaseUrl("https://api.souimagery.fun");
+      setAccountProvider("openai-compatible");
+      setAccountBaseUrl("https://api.bluesminds.com");
       setAccountApiKey("");
+      setAccountUsageTags(["coding"]);
     } catch (accountError) {
       setError(accountError instanceof Error ? accountError.message : "Failed to save account");
     } finally {
@@ -514,13 +778,8 @@ export default function App() {
   }
 
   async function onDeleteAccount(id: string) {
-    if (!ensureLicensedAccess("Accounts")) {
-      return;
-    }
-
     setSaving(true);
     setError(null);
-
     try {
       applyLoadedBridgeState(await ensureBridgeMethod("deleteAccount")({ id }));
     } catch (accountError) {
@@ -531,13 +790,8 @@ export default function App() {
   }
 
   async function onSelectAccount(id: string) {
-    if (!ensureLicensedAccess("Accounts")) {
-      return;
-    }
-
     setSaving(true);
     setError(null);
-
     try {
       applyLoadedBridgeState(await ensureBridgeMethod("selectAccount")({ id }));
     } catch (accountError) {
@@ -548,37 +802,45 @@ export default function App() {
   }
 
   function openCreateAccountModal() {
-    if (!ensureLicensedAccess("Accounts")) {
-      return;
-    }
-
     setEditingAccountId(null);
     setAccountName("");
-    setAccountBaseUrl("https://api.souimagery.fun");
+    setAccountProvider("openai-compatible");
+    setAccountBaseUrl("https://api.bluesminds.com");
     setAccountApiKey("");
+    setAccountUsageTags(["coding"]);
     setIsAccountModalOpen(true);
   }
 
   function openEditAccountModal(account: BridgeState["config"]["accounts"][number]) {
-    if (!ensureLicensedAccess("Accounts")) {
-      return;
-    }
-
     setEditingAccountId(account.id);
     setAccountName(account.name);
+    setAccountProvider(account.provider ?? "openai-compatible");
     setAccountBaseUrl(account.baseUrl);
     setAccountApiKey(account.apiKey);
+    setAccountUsageTags(account.usageTags);
     setIsAccountModalOpen(true);
   }
 
-  async function onRefreshActiveAccountModels() {
-    if (!ensureLicensedAccess("Accounts")) {
+  function onSelectAccountProvider(provider: AccountProvider) {
+    setAccountProvider(provider);
+    if (provider === "v0") {
+      setAccountName((current) => current.trim() ? current : "v0");
+      setAccountBaseUrl(V0_BASE_URL);
+      setAccountUsageTags(["coding"]);
+      setForm((current) => ({
+        ...current,
+        models: Array.from(new Set([...current.models, ...V0_MODELS])),
+        selectedModel: (V0_MODELS as readonly string[]).includes(current.selectedModel) ? current.selectedModel : V0_MODELS[0],
+      }));
       return;
     }
 
+    setAccountBaseUrl((current) => current === V0_BASE_URL ? "https://api.bluesminds.com" : current);
+  }
+
+  async function onRefreshActiveAccountModels() {
     setSaving(true);
     setError(null);
-
     try {
       applyLoadedBridgeState(await ensureBridgeMethod("refreshActiveAccountModels")());
     } catch (accountError) {
@@ -589,13 +851,8 @@ export default function App() {
   }
 
   async function onRunPlayground() {
-    if (!ensureLicensedAccess("Playground")) {
-      return;
-    }
-
     setPlaygroundLoading(true);
     setError(null);
-
     try {
       const result = await ensureBridgeMethod("playgroundTest")({
         baseUrl: normalizeOpenAiBaseUrl(playgroundBaseUrl),
@@ -613,22 +870,17 @@ export default function App() {
   }
 
   async function onLoadPlaygroundModels() {
-    if (!ensureLicensedAccess("Playground")) {
-      return;
-    }
-
     setPlaygroundModelsLoading(true);
     setError(null);
-
     try {
       const result = await ensureBridgeMethod("playgroundLoadModels")({
         baseUrl: normalizeOpenAiBaseUrl(playgroundBaseUrl),
         apiKey: playgroundApiKey,
       });
       setPlaygroundModelsResult(result);
-
       if (result.ok) {
         setPlaygroundAvailableModels(result.models);
+        localStorage.setItem("playground_cached_models", JSON.stringify(result.models));
         if (!playgroundModel && result.models[0]) {
           setPlaygroundModel(result.models[0]);
           setPlaygroundModelQuery(result.models[0]);
@@ -641,421 +893,514 @@ export default function App() {
     }
   }
 
-  async function onActivateLicense() {
-    setSaving(true);
-    setError(null);
-
-    try {
-      const nextState = normalizeBridgeState(await window.bridgeApi.activateLicense({ licenseKey: licenseKeyInput }));
-      setState(nextState);
-      if (nextState.license.status === "active" || nextState.license.status === "expired") {
-        setLicenseKeyInput("");
+  useEffect(() => {
+    const cached = localStorage.getItem("playground_cached_models");
+    if (cached) {
+      try {
+        setPlaygroundAvailableModels(JSON.parse(cached));
+      } catch (e) {
+        console.error("Failed to parse cached models", e);
       }
-    } catch (licenseError) {
-      setError(licenseError instanceof Error ? licenseError.message : "Failed to activate license");
+    }
+  }, []);
+
+  async function onResetUsage() {
+    if (!confirm("Are you sure you want to reset all usage data? This cannot be undone.")) return;
+    setSaving(true);
+    try {
+      if (!window.bridgeApi) return;
+      applyLoadedBridgeState(await window.bridgeApi.resetUsage({ confirm: true }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to reset usage data");
     } finally {
       setSaving(false);
     }
   }
 
-  async function onClearLicense() {
+  async function onOpenElectron() {
     setSaving(true);
     setError(null);
-
     try {
-      const nextState = normalizeBridgeState(await window.bridgeApi.clearLicense({ confirm: true }));
-      setState(nextState);
-    } catch (licenseError) {
-      setError(licenseError instanceof Error ? licenseError.message : "Failed to clear license");
+      await ensureBridgeMethod("openElectron")();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to open desktop window");
     } finally {
       setSaving(false);
     }
   }
 
-  async function onRefreshRequestCode() {
-    try {
-      const nextState = normalizeBridgeState(
-        await window.bridgeApi.generateRequestCode({})
-      );
-      setState(nextState);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to refresh request code");
-    }
-  }
-
-  if (loading) {
-    return <div className="screen centered">Loading bridge...</div>;
-  }
+  if (loading) return (
+    <motion.div
+      initial={{ opacity: 0, filter: "blur(10px)" }}
+      animate={{ opacity: 1, filter: "blur(0px)" }}
+      className="screen centered"
+      style={{ background: '#000', color: '#fff', fontSize: '14px', letterSpacing: '1px' }}
+    >
+      <Icon icon="solar:spinner-bold-duotone" className="animate-spin mr-3" width={24} />
+      Loading bridge system...
+    </motion.div>
+  );
+  if (showOnboarding) return <Onboarding onComplete={() => setShowOnboarding(false)} />;
 
   return (
-    <div className="screen dashboard-shell heroui-dashboard-shell">
-      <aside className="sidebar heroui-sidebar-shell">
-        <Card className="heroui-sidebar-card">
-          <Card.Content className="heroui-sidebar-content">
-            <div className="heroui-sidebar-section-label">Navigation</div>
-            <ButtonGroup orientation="vertical" variant="ghost" className="heroui-sidebar-nav-group">
-              {[
-                { key: "overview", label: "Overview", icon: "solar:widget-5-bold-duotone" },
-                { key: "apiKeys", label: "API Keys", icon: "solar:key-minimalistic-square-3-bold-duotone" },
-                { key: "usage", label: "Usage", icon: "solar:chart-2-bold-duotone" },
-                { key: "accounts", label: "Accounts", icon: "solar:users-group-rounded-bold-duotone" },
-                { key: "licenses", label: "Licenses", icon: "solar:shield-keyhole-bold-duotone" },
-                { key: "playground", label: "Playground", icon: "solar:code-square-bold-duotone" },
-              ].map((item) => {
-                const isActive = activeSection === item.key;
-                const isLocked = lockedSections.has(item.key as "overview" | "apiKeys" | "usage" | "accounts" | "playground") && !hasActiveLicense;
+    <>
+      <div className="screen dashboard-shell heroui-dashboard-shell" style={{ display: 'grid', gridTemplateColumns: isSidebarCollapsed ? '88px 1fr' : '280px 1fr', transition: 'grid-template-columns 0.3s ease', height: '100vh', overflow: 'hidden' }}>
+        <Sidebar
+          activeSection={activeSection}
+          setActiveSection={setActiveSection}
+          serverRunning={state.stats.serverRunning}
+          setError={setError}
+          isCollapsed={isSidebarCollapsed}
+          onToggleCollapse={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
+        />
 
-                return (
-                  <Button
-                    key={item.key}
-                    variant={isActive ? "primary" : "ghost"}
-                    className={`heroui-sidebar-nav-button ${isActive ? "is-active" : ""}`}
-                    onPress={() => {
-                      if (isLocked) {
-                        setActiveSection("licenses");
-                        setError(`${item.label} is locked. Activate your license to use this feature.`);
-                        return;
-                      }
-
-                      setActiveSection(item.key as typeof activeSection);
-                    }}
-                  >
-                    <span className="heroui-nav-icon-wrap">
-                      <Icon icon={item.icon} className="heroui-nav-icon" />
-                    </span>
-                    <span className="heroui-nav-label">{item.label}</span>
-                    {isLocked ? <Icon icon="solar:lock-keyhole-bold" className="heroui-nav-lock" /> : null}
-                  </Button>
-                );
-              })}
-            </ButtonGroup>
-          </Card.Content>
-          <Card.Footer className="heroui-sidebar-footer">
-            <div className="heroui-sidebar-runtime-card">
-              <div className="heroui-sidebar-runtime-main">
-                <Avatar size="sm" color="accent" variant="soft" className="heroui-sidebar-runtime-avatar">
-                  <Avatar.Image
-                    src="/src/logo/logp.png"
-                  />
-                  <Avatar.Fallback>SA</Avatar.Fallback>
-                </Avatar>
-                <div className="heroui-sidebar-runtime-copy">
-                  <p className="heroui-sidebar-runtime-title">Sparkly API</p>
-                  <p className="heroui-sidebar-runtime-status">{state.stats.serverRunning ? "Running on localhost" : "Server paused"}</p>
-                </div>
-              </div>
-              <div className="heroui-sidebar-runtime-indicator-wrap">
-                <span
-                  className={`heroui-sidebar-runtime-indicator ${state.stats.serverRunning ? "is-online" : "is-offline"}`}
-                  aria-hidden="true"
-                />
-              </div>
-            </div>
-          </Card.Footer>
-        </Card>
-      </aside>
-
-      <main className="workspace-panel dark-workspace heroui-main-shell">
-        <section className="hero-header-section">
-          <HeroHeader
+        <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
+          <Header
             section={activeSection}
             saving={saving}
             playgroundLoading={playgroundLoading}
             onRestart={onRestart}
-            onPrimaryAction={isUsage ? refresh : isAccounts ? openCreateAccountModal : isLicenses ? onActivateLicense : isPlayground ? onRunPlayground : onSave}
+            onReset={activeSection === "usage" ? onResetUsage : undefined}
+            onOpenElectron={activeSection === "overview" ? onOpenElectron : undefined}
+            onPrimaryAction={isUsage ? refresh : isAccounts ? openCreateAccountModal : isPlayground ? onRunPlayground : onSave}
           />
-        </section>
 
-        {error ? <Alert color="danger" title={error ?? undefined} className="border border-red-500/20 bg-red-500/10 text-white" /> : null}
+          <main className="" style={{ flex: 1, overflowY: 'auto', padding: '10px 20px' }}>
+            {error ? <Alert status="danger" title={error} className="mb-4 border border-red-500/20 bg-red-500/10 text-white" /> : null}
 
-        {isOverview ? <section className="stats-grid admin-stats-grid overview-stats-grid">
-          <Card className="metric-card border border-white/10 bg-white/5"><Card.Content><div className="metric-head"><span>Today's requests</span><Chip color="success" variant="soft">Traffic</Chip></div><strong>{state.stats.totalRequests}</strong><p>Success: {state.stats.successCount} Failed: {state.stats.errorCount}</p><div className="metric-bar"><i style={{ width: `${Math.min(100, state.stats.totalRequests * 8)}%` }} /></div></Card.Content></Card>
-          <Card className="metric-card border border-white/10 bg-white/5"><Card.Content><div className="metric-head"><span>Today's tokens</span><Chip color="warning" variant="soft">Tokens</Chip></div><strong>{state.stats.totalRequests * 128}</strong><p>Cached: 0 Reasoning: {state.stats.totalRequests * 12}</p><div className="metric-bar"><i style={{ width: `${Math.min(100, state.stats.totalRequests * 6)}%` }} /></div></Card.Content></Card>
-          <Card className="metric-card border border-white/10 bg-white/5"><Card.Content><div className="metric-head"><span>Active models</span><Chip color="accent" variant="soft">Models</Chip></div><strong>{state.config.models.length}</strong><p>Selected: {state.config.selectedModel || "None"}</p><div className="metric-bar"><i style={{ width: `${Math.min(100, state.config.models.length * 20)}%` }} /></div></Card.Content></Card>
-          <Card className="metric-card border border-white/10 bg-white/5"><Card.Content><div className="metric-head"><span>Today's cost</span><Chip color="default" variant="soft">Spend</Chip></div><strong>$0.00</strong><p>Uptime: {formatUptime(state.stats.uptimeMs)}</p><div className="metric-bar"><i style={{ width: `${Math.min(100, successRate)}%` }} /></div></Card.Content></Card>
-        </section> : null}
+            <AnimatePresence mode="wait">
+              {isOverview ? (
+                <motion.div
+                  key="overview"
+                  initial={{ opacity: 0, y: 15, filter: "blur(12px)" }}
+                  animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                  exit={{ opacity: 0, y: -15, filter: "blur(12px)" }}
+                  transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                >
+                  <motion.section
+                    className="stats-grid"
+                    variants={{
+                      hidden: { opacity: 0 },
+                      show: {
+                        opacity: 1,
+                        transition: {
+                          staggerChildren: 0.08,
+                          delayChildren: 0.1
+                        }
+                      }
+                    }}
+                    initial="hidden"
+                    animate="show"
+                  >
+                    <motion.div variants={{ hidden: { opacity: 0, y: 20, filter: "blur(8px)" }, show: { opacity: 1, y: 0, filter: "blur(0px)" } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
+                      <Card className="metric-card">
+                        <Card.Content className="metric-card-content">
+                          <div className="metric-head">
+                            <span className="metric-title">Today's requests</span>
+                            <div className="metric-icon-circle green">
+                              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"><path fill="currentColor" fillRule="evenodd" d="M3.464 3.464C2 4.93 2 7.286 2 12s0 7.071 1.464 8.535C4.93 22 7.286 22 12 22s7.071 0 8.535-1.465C22 19.072 22 16.714 22 12s0-7.071-1.465-8.536C19.072 2 16.714 2 12 2S4.929 2 3.464 3.464M13.75 10c0 .414.336.75.75.75h.69l-2.013 2.013a.25.25 0 0 1-.354 0l-1.586-1.586a1.75 1.75 0 0 0-2.474 0L6.47 13.47a.75.75 0 1 0 1.06 1.06l2.293-2.293a.25.25 0 0 1 .354 0l1.586 1.586a1.75 1.75 0 0 0 2.474 0l2.013-2.012v.689a.75.75 0 0 0 1.5 0V10a.75.75 0 0 0-.75-.75h-2.5a.75.75 0 0 0-.75.75" clipRule="evenodd" strokeWidth="0.5" stroke="currentColor" /></svg>
+                            </div>
+                          </div>
+                          <strong>{overviewFilteredLogs.length}</strong>
+                          <p>Success: {overviewSuccessCount} / Failed: {overviewFailedCount}</p>
 
-        {isLicenses ? <LicensesPage
-          state={state}
-          licenseKeyInput={licenseKeyInput}
-          setLicenseKeyInput={setLicenseKeyInput}
-          onRefreshRequestCode={onRefreshRequestCode}
-          onClearLicense={onClearLicense}
-          saving={saving}
-        /> : null}
+                        </Card.Content>
+                      </Card>
+                    </motion.div>
 
-        {isOverview ? <>
-          <section className="content-grid overview-main-grid">
-            <article className="admin-panel chart-panel">
-              <div className="section-heading">
-                <h3>Request trends (Last 7 Days)</h3>
-                <span className="panel-tag">Live</span>
-              </div>
-              <div className="overview-chart-stats">
-                <div className="overview-chart-stat">
-                  <span>Total requests</span>
-                  <strong>{state.stats.totalRequests}</strong>
-                </div>
-                <div className="overview-chart-stat">
-                  <span>Success rate</span>
-                  <strong>{successRate}%</strong>
-                </div>
-                <div className="overview-chart-stat">
-                  <span>Selected model</span>
-                  <strong>{state.config.selectedModel || "None"}</strong>
-                </div>
-              </div>
-              <div className="chartjs-shell">
-                <Line data={requestTrendData} options={requestTrendOptions} />
-              </div>
-            </article>
+                    <motion.div variants={{ hidden: { opacity: 0, y: 20, filter: "blur(8px)" }, show: { opacity: 1, y: 0, filter: "blur(0px)" } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
+                      <Card className="metric-card">
+                        <Card.Content className="metric-card-content">
+                          <div className="metric-head">
+                            <span className="metric-title">Today's tokens</span>
+                            <div className="metric-icon-circle orange">
+                              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 512 512"><path fill="currentColor" d="M256 117c-65.2 0-124.2 11.6-166.13 29.7c-20.95 9.1-37.57 19.8-48.57 31.1S25 200.4 25 212s5.3 22.9 16.3 34.2s27.62 22 48.57 31.1C131.8 295.4 190.8 307 256 307s124.2-11.6 166.1-29.7c21-9.1 37.6-19.8 48.6-31.1S487 223.6 487 212s-5.3-22.9-16.3-34.2s-27.6-22-48.6-31.1C380.2 128.6 321.2 117 256 117M25 255.1v50.2c0 6.3 5.3 17.6 16.3 28.9s27.62 22 48.57 31.1C131.8 383.4 190.8 395 256 395s124.2-11.6 166.1-29.7c21-9.1 37.6-19.8 48.6-31.1s16.3-22.6 16.3-28.9v-50.2c-1.1 1.3-2.2 2.5-3.4 3.7c-13.3 13.6-31.8 25.3-54.3 35c-45 19.5-106 31.2-173.3 31.2s-128.3-11.7-173.28-31.2c-22.49-9.7-41.01-21.4-54.3-35c-1.19-1.2-2.32-2.5-3.42-3.7" strokeWidth="13" stroke="currentColor" /></svg>
+                            </div>
+                          </div>
+                          <strong>{overviewTokens}</strong>
+                          <p>Cached: 0 Reasoning: {Math.round(overviewTokens * 0.094)}</p>
 
-            <article className="admin-panel activity-panel overview-activity-panel">
-              <div className="section-heading">
-                <h3>Recent activity</h3>
-                <button className="ghost-button" onClick={() => refresh()}>Refresh</button>
-              </div>
-              {state.logs.length === 0 ? <div className="empty-logs dark-empty">No activity yet.</div> : null}
-              <div className="activity-list">
-                {state.logs.slice(0, 6).map((entry) => (
-                  <div className="activity-item" key={entry.id}>
-                    <div>
-                      <strong>{entry.path}</strong>
-                      <p>{entry.model ?? "No model"}</p>
-                    </div>
-                    <div className="activity-meta">
-                      <span className={entry.status >= 400 ? "status-bad" : "status-good"}>{entry.status}</span>
-                      <small>{new Date(entry.timestamp).toLocaleTimeString()}</small>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </article>
-          </section>
+                        </Card.Content>
+                      </Card>
+                    </motion.div>
 
-          <section className="content-grid lower-grid overview-lower-grid">
-            <article className="admin-panel settings-panel overview-settings-panel">
-              <div className="section-heading">
-                <h3>Gateway settings</h3>
-                <span className="panel-tag muted-tag">Saved locally</span>
-              </div>
-              <div className="form-grid dark-form-grid">
-                <label>
-                  <span>Local port</span>
-                  <input
-                    type="number"
-                    value={form.localPort}
-                    onChange={(event) => setForm({ ...form, localPort: Number(event.target.value) })}
-                    placeholder="48231"
+                    <motion.div variants={{ hidden: { opacity: 0, y: 20, filter: "blur(8px)" }, show: { opacity: 1, y: 0, filter: "blur(0px)" } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
+                      <Card className="metric-card">
+                        <Card.Content className="metric-card-content">
+                          <div className="metric-head">
+                            <span className="metric-title">Rate Limit</span>
+                            <div className="metric-icon-circle green">
+                              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"><path fill="currentColor" d="M17 3.34a10 10 0 1 1-14.995 8.984L2 12l.005-.324A10 10 0 0 1 17 3.34M12 6a1 1 0 0 0-.993.883L11 7v5l.009.131a1 1 0 0 0 .197.477l.087.1l3 3l.094.082a1 1 0 0 0 1.226 0l.094-.083l.083-.094a1 1 0 0 0 0-1.226l-.083-.094L13 11.585V7l-.007-.117A1 1 0 0 0 12 6" strokeWidth="0.5" stroke="currentColor" /></svg>
+                            </div>
+                          </div>
+                          <strong>10 RPM</strong>
+                          <p>{overviewCurrentRpm.toFixed(1)} RPM current</p>
+
+                        </Card.Content>
+                      </Card>
+                    </motion.div>
+
+                    <motion.div variants={{ hidden: { opacity: 0, y: 20, filter: "blur(8px)" }, show: { opacity: 1, y: 0, filter: "blur(0px)" } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
+                      <Card className="metric-card">
+                        <Card.Content className="metric-card-content">
+                          <div className="metric-head">
+                            <span className="metric-title">Active Keys</span>
+                            <div className="metric-icon-circle blue">
+                              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 512 512"><path fill="currentColor" d="M218.1 167.2c0 13 0 25.6 4.1 37.4c-43.1 50.6-167.5 194.5-167.5 194.5l2.9 36.3s34.8 33 40 28c15.4-15 24.8-25.2 24.8-25.2l7.24-43.35l47.11-3.47l3.78-46.8l49.63-.95l.49-50.09l52.69 2.1l9-18.84c15.5 6.7 29.6 9.4 47.7 9.4c68.5 0 124-53.4 124-119.2S408.5 48 340 48s-121.9 53.4-121.9 119.2M406.85 144A38.85 38.85 0 1 1 368 105.15A38.81 38.81 0 0 1 406.85 144" strokeWidth="13" stroke="currentColor" /></svg>
+                            </div>
+                          </div>
+                          <strong>{state.clientKeys.length}</strong>
+                          <p>Max 10</p>
+
+                        </Card.Content>
+                      </Card>
+                    </motion.div>
+                  </motion.section>
+
+                  <section className="content-grid overview-main-grid">
+                    <motion.article
+                      className="admin-panel chart-panel"
+                      initial={{ opacity: 0, scale: 0.98, filter: "blur(10px)" }}
+                      animate={{ opacity: 1, scale: 1, filter: "blur(0px)" }}
+                      transition={{ delay: 0.4, duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
+                    >
+                      <div className="section-heading">
+                        <h3>Request trends (Reset every 5 Hours)</h3>
+                        <span className="status-pill success">LIVE</span>
+                      </div>
+                      <div className="overview-chart-stats">
+                        <div className="overview-chart-stat"><span>Total requests</span><strong>{overviewFilteredLogs.length}</strong></div>
+                        <div className="overview-chart-stat"><span>Success rate</span><strong>{overviewSuccessRate}%</strong></div>
+                        <div className="overview-chart-stat"><span>Selected model</span><strong>{state.config.selectedModel || "None"}</strong></div>
+                      </div>
+                      <div className="chartjs-shell overview-chart-shell" style={{ background: 'linear-gradient(180deg, rgba(255,255,255,0.02) 0%, rgba(255,255,255,0.008) 100%)', borderRadius: '20px', padding: '18px 18px 12px', border: '1px solid rgba(255,255,255,0.05)' }}>
+                        <Line data={requestTrendData} options={requestTrendOptions} />
+                      </div>
+                    </motion.article>
+
+                    <motion.article
+                      className="admin-panel activity-panel overview-activity-panel"
+                      initial={{ opacity: 0, x: 20, filter: "blur(10px)" }}
+                      animate={{ opacity: 1, x: 0, filter: "blur(0px)" }}
+                      transition={{ delay: 0.5, duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
+                    >
+                      <div className="section-heading">
+                        <h3>Recent activity</h3>
+                        <button className="premium-button ghost sm" onClick={() => refresh()}>
+                          <Icon icon="solar:refresh-bold" className="btn-icon" />
+                          Refresh
+                        </button>
+                      </div>
+                      {overviewFilteredLogs.length === 0 ? <div className="empty-logs dark-empty" style={{ background: 'rgba(255,255,255,0.01)', border: '1px dashed rgba(255,255,255,0.05)', borderRadius: '14px', padding: '32px' }}>No activity yet.</div> : null}
+                      <div className="activity-list">
+                        {overviewFilteredLogs.slice(0, 6).map((entry) => (
+                          <div className="activity-item" key={entry.id}>
+                            <div className="activity-info">
+                              <strong style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                {entry.path}
+                                {entry.requestType === 'model_probe' && (
+                                  <span style={{
+                                    fontSize: '9px', fontWeight: 800, padding: '1px 5px',
+                                    background: 'rgba(99, 102, 241, 0.15)', color: '#818cf8',
+                                    border: '1px solid rgba(99, 102, 241, 0.3)', borderRadius: '3px',
+                                    textTransform: 'uppercase', letterSpacing: '0.05em'
+                                  }}>Model Probe</span>
+                                )}
+                              </strong>
+                              <p>{entry.requestType === 'model_probe' ? 'Auto-triggered by client model switch' : (entry.model ?? "No model")}</p>
+                            </div>
+                            <div className="activity-meta">
+                              <span className={`status-badge ${entry.status >= 400 ? "status-bad" : "status-good"}`}>
+                                {entry.status} {entry.status >= 400 ? 'Error' : 'Success'}
+                              </span>
+                              <span className="activity-time">{new Date(entry.timestamp).toLocaleTimeString()}</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </motion.article>
+                  </section>
+
+                  <motion.section
+                    className="content-grid lower-grid overview-lower-grid"
+                    initial={{ opacity: 0, y: 20, filter: "blur(10px)" }}
+                    animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                    transition={{ delay: 0.6, duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
+                  >
+                    <article className="admin-panel settings-panel overview-settings-panel">
+                      <div className="settings-content-wrap split-layout" style={{ gap: '24px' }}>
+                        <div className="settings-column" style={{ flex: 1 }}>
+                          <div className="section-heading" style={{ marginBottom: '12px' }}>
+                            <h3 style={{ fontSize: '14px', opacity: 0.8 }}>Local Port settings</h3>
+                          </div>
+                          <div className="settings-sub-card">
+                            <label className="inline-setting-row no-bg" style={{ margin: 0, border: 'none', background: 'transparent' }}>
+                              <span>Local port change</span>
+                              <input type="number" value={form.localPort} onChange={(e) => setForm({ ...form, localPort: Number(e.target.value) })} />
+                            </label>
+                          </div>
+                        </div>
+
+                        <div className="settings-column" style={{ flex: 1 }}>
+                          <div className="section-heading" style={{ marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <h3 style={{ fontSize: '14px', opacity: 0.8 }}>Community & Support</h3>
+                            <span style={{ fontSize: '10px', color: 'var(--muted)', fontWeight: 600, letterSpacing: '0.05em' }}>(Sparkly Official)</span>
+                          </div>
+                          <div className="settings-sub-card support-sub-card" style={{ margin: 0, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.05)' }}>
+                            <div className="inline-support-links">
+                              <a href="https://t.me/sparklydeep" target="_blank" rel="noreferrer" className="footer-support-btn tg">Telegram</a>
+                              <a href="https://discord.gg/dH2GJX8X7" target="_blank" rel="noreferrer" className="footer-support-btn ds">Discord</a>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </article>
+                  </motion.section>
+                </motion.div>
+              ) : isApiKeys ? (
+                <motion.div
+                  key="apiKeys"
+                  initial={{ opacity: 0, y: 15, filter: "blur(12px)" }}
+                  animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                  exit={{ opacity: 0, y: -15, filter: "blur(12px)" }}
+                  transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                >
+                  <ApiKeysPage
+                    state={state}
+                    form={form}
+                    setForm={setForm}
+                    apiKeyModelQuery={apiKeyModelQuery}
+                    setApiKeyModelQuery={setApiKeyModelQuery}
+                    clientBaseUrl={clientBaseUrl}
+                    localClientKey={localClientKey}
+                    saving={saving}
+                    onRefreshActiveAccountModels={onRefreshActiveAccountModels}
+                    openEditKeyModal={openEditKeyModal}
+                    onDeleteKey={onDeleteKey}
+                    onOpenCreateKey={() => { setCreatedKeyValue(null); setNewKeyName(""); setIsCreateKeyOpen(true); }}
+                    onSave={onSave}
                   />
-                </label>
-                <div className="detail-list full-width">
-                  <div><span>Active account</span><strong>{state.config.accounts.find((account) => account.id === state.config.activeAccountId)?.name ?? "No active account"}</strong></div>
-                  <div><span>Base URL</span><strong>{state.config.upstreamBaseUrl || "Not configured"}</strong></div>
-                  <div><span>Selected model</span><strong>{form.selectedModel || "No model selected"}</strong></div>
-                </div>
-                <label className="full-width">
-                  <span>System prompt override</span>
-                  <textarea
-                    rows={4}
-                    value={form.systemPrompt}
-                    onChange={(event) => setForm({ ...form, systemPrompt: event.target.value })}
-                    placeholder="Optional system prompt injected if missing"
+                </motion.div>
+              ) : isUsage ? (
+                <motion.div
+                  key="usage"
+                  initial={{ opacity: 0, y: 15, filter: "blur(12px)" }}
+                  animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                  exit={{ opacity: 0, y: -15, filter: "blur(12px)" }}
+                  transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                >
+                  <UsagePage
+                    usageMode={usageMode}
+                    setUsageMode={setUsageMode}
+                    state={state}
+                    realLogs={realLogs}
+                    totalTokenEstimate={totalTokenEstimate}
+                    rpm={rpm}
+                    tpm={tpm}
+                    totalCostEstimate={totalCostEstimate}
+                    usageRequestChartData={usageRequestChartData}
+                    usageRequestChartOptions={usageRequestChartOptions}
+                    usageTokenChartData={usageTokenChartData}
+                    usageTokenChartOptions={usageTokenChartOptions}
+                    modelStats={modelStats}
+                    keyStats={keyStats}
+                    usageRecords={usageRecords}
+                    requestTab={requestTab}
+                    setRequestTab={setRequestTab}
+                    tokenTab={tokenTab}
+                    setTokenTab={setTokenTab}
+                    timeFilter={timeFilter}
+                    setTimeFilter={setTimeFilter}
                   />
-                </label>
-                <label className="checkbox-row full-width dark-checkbox-row">
-                  <input
-                    type="checkbox"
-                    checked={form.enableCors}
-                    onChange={(event) => setForm({ ...form, enableCors: event.target.checked })}
+                </motion.div>
+              ) : isAccounts ? (
+                <motion.div
+                  key="accounts"
+                  initial={{ opacity: 0, y: 15, filter: "blur(12px)" }}
+                  animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                  exit={{ opacity: 0, y: -15, filter: "blur(12px)" }}
+                  transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                >
+                  <AccountsPage
+                    state={state}
+                    form={form}
+                    clientBaseUrl={clientBaseUrl}
+                    saving={saving}
+                    onRefreshActiveAccountModels={onRefreshActiveAccountModels}
+                    openCreateAccountModal={openCreateAccountModal}
+                    openEditAccountModal={openEditAccountModal}
+                    onSelectAccount={onSelectAccount}
+                    onDeleteAccount={onDeleteAccount}
                   />
-                  <span>Enable CORS for browser-based tools</span>
-                </label>
+                </motion.div>
+              ) : isPlayground ? (
+                <motion.div
+                  key="playground"
+                  initial={{ opacity: 0, y: 15, filter: "blur(12px)" }}
+                  animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                  exit={{ opacity: 0, y: -15, filter: "blur(12px)" }}
+                  transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                >
+                  <PlaygroundPage
+                    models={playgroundAvailableModels}
+                    playgroundModelQuery={playgroundModelQuery}
+                    setPlaygroundModelQuery={setPlaygroundModelQuery}
+                    playgroundBaseUrl={playgroundBaseUrl}
+                    setPlaygroundBaseUrl={setPlaygroundBaseUrl}
+                    playgroundApiKey={playgroundApiKey}
+                    setPlaygroundApiKey={setPlaygroundApiKey}
+                    playgroundModel={playgroundModel}
+                    setPlaygroundModel={setPlaygroundModel}
+                    playgroundSystemPrompt={playgroundSystemPrompt}
+                    setPlaygroundSystemPrompt={setPlaygroundSystemPrompt}
+                    playgroundMessage={playgroundMessage}
+                    setPlaygroundMessage={setPlaygroundMessage}
+                    playgroundModelsResult={playgroundModelsResult}
+                    playgroundModelsLoading={playgroundModelsLoading}
+                    playgroundResult={playgroundResult}
+                    setPlaygroundResult={setPlaygroundResult}
+                    setPlaygroundModelsResult={setPlaygroundModelsResult}
+                    playgroundLoading={playgroundLoading}
+                    onLoadPlaygroundModels={onLoadPlaygroundModels}
+                    onRunPlayground={onRunPlayground}
+                  />
+                </motion.div>
+              ) : null}
+            </AnimatePresence>
+          </main>
+
+          <AnimatePresence>
+            {isCreateKeyOpen && (
+              <div className="modal-overlay">
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.9, filter: "blur(15px)" }}
+                  animate={{ opacity: 1, scale: 1, filter: "blur(0px)" }}
+                  exit={{ opacity: 0, scale: 0.9, filter: "blur(15px)" }}
+                  transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+                  style={{ width: '100%', maxWidth: '480px' }}
+                >
+                  <Card className="modal-card heroui-modal-card" onClick={(e) => e.stopPropagation()}>
+                    <Card.Content className="heroui-modal-content">
+                      <div className="section-heading heroui-section-heading">
+                        <h3>Create key</h3>
+                        <button className="premium-button ghost sm" onClick={() => setIsCreateKeyOpen(false)}>
+                          <Icon icon="solar:close-circle-bold-duotone" className="btn-icon" />Close
+                        </button>
+                      </div>
+                      <label><span>Name</span><Input value={newKeyName} onChange={(e) => setNewKeyName(e.target.value)} /></label>
+                      <div className="actions-row modal-actions heroui-modal-actions">
+                        <button className="premium-button primary" onClick={onCreateKey} disabled={saving}>
+                          <Icon icon="solar:key-bold-duotone" className="btn-icon" />
+                          {saving ? "Creating..." : "Generate Key"}
+                        </button>
+                      </div>
+                    </Card.Content>
+                  </Card>
+                </motion.div>
               </div>
-            </article>
+            )}
+          </AnimatePresence>
 
-            <article className="stack-column overview-side-stack">
-              <div className="admin-panel compact-panel">
-                <div className="section-heading">
-                  <h3>Active key</h3>
-                  <span className="panel-tag">Secure</span>
-                </div>
-                <div className="detail-list">
-                  <div><span>Masked key</span><strong>{maskKey(state.config.apiKey)}</strong></div>
-                  <div><span>Local base URL</span><strong>{state.stats.localBaseUrl}/v1</strong></div>
-                  <div><span>Health endpoint</span><strong>{state.stats.localBaseUrl}/health</strong></div>
-                </div>
+          <AnimatePresence>
+            {isEditKeyOpen && (
+              <div className="modal-overlay">
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.9, filter: "blur(15px)" }}
+                  animate={{ opacity: 1, scale: 1, filter: "blur(0px)" }}
+                  exit={{ opacity: 0, scale: 0.9, filter: "blur(15px)" }}
+                  transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+                  style={{ width: '100%', maxWidth: '480px' }}
+                >
+                  <Card className="modal-card heroui-modal-card" onClick={(e) => e.stopPropagation()}>
+                    <Card.Content className="heroui-modal-content">
+                      <div className="section-heading heroui-section-heading">
+                        <h3>Edit key</h3>
+                        <button className="premium-button ghost sm" onClick={() => setIsEditKeyOpen(false)}>
+                          <Icon icon="solar:close-circle-bold-duotone" className="btn-icon" />Close
+                        </button>
+                      </div>
+                      <label><span>Name</span><Input value={editingKeyName} onChange={(e) => setEditingKeyName(e.target.value)} /></label>
+                      <div className="actions-row modal-actions heroui-modal-actions">
+                        <button className="premium-button primary" onClick={onUpdateKey} disabled={saving}>
+                          <Icon icon="solar:pen-new-square-bold-duotone" className="btn-icon" />Update Key
+                        </button>
+                      </div>
+                    </Card.Content>
+                  </Card>
+                </motion.div>
               </div>
+            )}
+          </AnimatePresence>
 
-              <div className="admin-panel compact-panel accent-panel">
-                <div className="section-heading">
-                  <h3>Quick client setup</h3>
-                  <button className="ghost-button" onClick={() => navigator.clipboard.writeText(`${state.stats.localBaseUrl}/v1`)}>
-                    Copy URL
-                  </button>
-                </div>
-                <div className="detail-list">
-                  <div><span>Client base URL</span><strong>{state.stats.localBaseUrl}/v1</strong></div>
-                  <div><span>Client API key</span><strong>{localClientKey}</strong></div>
-                  <div><span>Docs</span><button className="link-button" onClick={() => window.bridgeApi.openExternal("https://docs.openwebui.com/")}>Open Open WebUI docs</button></div>
-                </div>
-                <pre className="curl-block">{`curl ${state.stats.localBaseUrl}/v1/chat/completions \\
-  -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer local-test" \\
-  -d '{
-    "model": "${form.selectedModel || "gpt-4.1"}",
-    "messages": [{"role": "user", "content": "hello"}]
-  }'`}</pre>
+          <AnimatePresence>
+            {isAccountModalOpen && (
+              <div className="modal-overlay">
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.9, filter: "blur(15px)" }}
+                  animate={{ opacity: 1, scale: 1, filter: "blur(0px)" }}
+                  exit={{ opacity: 0, scale: 0.9, filter: "blur(15px)" }}
+                  transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+                  style={{ width: '100%', maxWidth: '560px' }}
+                >
+                  <Card className="modal-card heroui-modal-card account-modal-card" onClick={(e) => e.stopPropagation()}>
+                    <Card.Content className="heroui-modal-content account-modal-content">
+                      <div className="account-modal-header">
+                        <div className="account-modal-title-row">
+                          <div className="account-modal-icon">
+                            <Icon icon={editingAccountId ? "solar:pen-new-square-bold-duotone" : "solar:user-plus-bold-duotone"} />
+                          </div>
+                          <div>
+                            <h3>{editingAccountId ? "Edit account" : "Add account"}</h3>
+                            <p>Provider, API key aur usage type configure karein.</p>
+                          </div>
+                        </div>
+                        <button className="premium-button ghost sm" onClick={() => setIsAccountModalOpen(false)}>
+                          <Icon icon="solar:close-circle-bold-duotone" className="btn-icon" />Close
+                        </button>
+                      </div>
+                      <label className="account-modal-field">
+                        <span>Name</span>
+                        <Input value={accountName} onChange={(e) => setAccountName(e.target.value)} placeholder="Example: v0 primary" />
+                      </label>
+                      <label className="account-modal-field">
+                        <span>Provider</span>
+                        <select
+                          className="provider-dropdown account-provider-select"
+                          value={accountProvider}
+                          onChange={(event) => onSelectAccountProvider(event.target.value as AccountProvider)}
+                        >
+                          {accountProviderOptions.map((provider) => (
+                            <option key={provider.value} value={provider.value}>{provider.label}</option>
+                          ))}
+                        </select>
+                        <div className="account-provider-hint">
+                          <Icon icon={accountProvider === "v0" ? "solar:stars-bold-duotone" : "solar:server-square-cloud-bold-duotone"} />
+                          <span>{accountProviderOptions.find((provider) => provider.value === accountProvider)?.description}</span>
+                        </div>
+                      </label>
+                      <label className="account-modal-field">
+                        <span>Base URL</span>
+                        <Input value={accountBaseUrl} onChange={(e) => setAccountBaseUrl(e.target.value)} placeholder="https://api.example.com/v1" />
+                      </label>
+                      <label className="account-modal-field">
+                        <span>API Key</span>
+                        <Input type="password" value={accountApiKey} onChange={(e) => setAccountApiKey(e.target.value)} placeholder="Paste provider API key" />
+                      </label>
+                      <div className="account-modal-footer">
+                        <span>Account will be used for coding requests</span>
+                        <button className="premium-button primary" onClick={onSaveAccount} disabled={saving || accountUsageTags.length === 0}>
+                          <Icon icon="solar:diskette-bold-duotone" className="btn-icon" />
+                          {saving ? "Saving..." : "Save Account"}
+                        </button>
+                      </div>
+                    </Card.Content>
+                  </Card>
+                </motion.div>
               </div>
-            </article>
-          </section>
-        </> : null}
-
-        {isApiKeys ? <ApiKeysPage
-          state={state}
-          form={form}
-          setForm={setForm}
-          apiKeyModelQuery={apiKeyModelQuery}
-          setApiKeyModelQuery={setApiKeyModelQuery}
-          clientBaseUrl={clientBaseUrl}
-          localClientKey={localClientKey}
-          saving={saving}
-          onRefreshActiveAccountModels={onRefreshActiveAccountModels}
-          openEditKeyModal={openEditKeyModal}
-          onDeleteKey={onDeleteKey}
-          onOpenCreateKey={() => {
-            setCreatedKeyValue(null);
-            setNewKeyName("");
-            setIsCreateKeyOpen(true);
-          }}
-        /> : null}
-
-        {isUsage ? <UsagePage
-          usageMode={usageMode}
-          setUsageMode={setUsageMode}
-          state={{ stats: state.stats }}
-          totalTokenEstimate={totalTokenEstimate}
-          rpm={rpm}
-          tpm={tpm}
-          totalCostEstimate={totalCostEstimate}
-          usageRequestChartData={usageRequestChartData}
-          usageRequestChartOptions={usageRequestChartOptions}
-          usageTokenChartData={usageTokenChartData}
-          usageTokenChartOptions={usageTokenChartOptions}
-          modelStats={modelStats}
-          keyStats={keyStats}
-          usageRecords={usageRecords}
-        /> : null}
-
-        {isAccounts ? <AccountsPage
-          state={state}
-          form={form}
-          clientBaseUrl={clientBaseUrl}
-          saving={saving}
-          onRefreshActiveAccountModels={onRefreshActiveAccountModels}
-          openCreateAccountModal={openCreateAccountModal}
-          openEditAccountModal={openEditAccountModal}
-          onSelectAccount={onSelectAccount}
-          onDeleteAccount={onDeleteAccount}
-        /> : null}
-
-        {isPlayground ? <PlaygroundPage
-          models={playgroundAvailableModels}
-          playgroundModelQuery={playgroundModelQuery}
-          setPlaygroundModelQuery={setPlaygroundModelQuery}
-          playgroundBaseUrl={playgroundBaseUrl}
-          setPlaygroundBaseUrl={setPlaygroundBaseUrl}
-          playgroundApiKey={playgroundApiKey}
-          setPlaygroundApiKey={setPlaygroundApiKey}
-          playgroundModel={playgroundModel}
-          setPlaygroundModel={setPlaygroundModel}
-          playgroundSystemPrompt={playgroundSystemPrompt}
-          setPlaygroundSystemPrompt={setPlaygroundSystemPrompt}
-          playgroundMessage={playgroundMessage}
-          setPlaygroundMessage={setPlaygroundMessage}
-          playgroundModelsResult={playgroundModelsResult}
-          playgroundModelsLoading={playgroundModelsLoading}
-          playgroundResult={playgroundResult}
-          setPlaygroundResult={setPlaygroundResult}
-          setPlaygroundModelsResult={setPlaygroundModelsResult}
-          playgroundLoading={playgroundLoading}
-          onLoadPlaygroundModels={onLoadPlaygroundModels}
-          onRunPlayground={onRunPlayground}
-        /> : null}
-
-        {isCreateKeyOpen ? <div className="modal-overlay" onClick={() => setIsCreateKeyOpen(false)}>
-          <Card className="modal-card heroui-modal-card" onClick={(event) => event.stopPropagation()}>
-            <Card.Content className="heroui-modal-content">
-              <div className="section-heading heroui-section-heading">
-                <h3>Create client key</h3>
-                <Button variant="ghost" onPress={() => setIsCreateKeyOpen(false)}>Close</Button>
-              </div>
-              <p className="muted-copy">Yeh local bridge key Open WebUI ya kisi bhi OpenAI-compatible client ke liye use hogi.</p>
-              <label>
-                <span>Key name</span>
-                <Input value={newKeyName} onChange={(event) => setNewKeyName(event.target.value)} placeholder="Production key" />
-              </label>
-              {createdKeyValue ? <div className="created-key-box heroui-created-key-box">
-                <span>New key</span>
-                <strong>{createdKeyValue}</strong>
-                <p className="muted-copy">Is value ko abhi copy kar lijiye. App list me masked version dikhayega.</p>
-              </div> : null}
-              <div className="actions-row modal-actions heroui-modal-actions">
-                {createdKeyValue ? <Button variant="outline" onPress={() => navigator.clipboard.writeText(createdKeyValue)}>Copy key</Button> : null}
-                <Button variant="primary" onPress={onCreateKey} isDisabled={saving} isPending={saving}>{saving ? "Creating..." : "Generate key"}</Button>
-              </div>
-            </Card.Content>
-          </Card>
-        </div> : null}
-
-        {isEditKeyOpen ? <div className="modal-overlay" onClick={() => setIsEditKeyOpen(false)}>
-          <Card className="modal-card heroui-modal-card" onClick={(event) => event.stopPropagation()}>
-            <Card.Content className="heroui-modal-content">
-              <div className="section-heading heroui-section-heading">
-                <h3>Edit client key</h3>
-                <Button variant="ghost" onPress={() => setIsEditKeyOpen(false)}>Close</Button>
-              </div>
-              <p className="muted-copy">Key value same rahegi, sirf name update hoga.</p>
-              <label>
-                <span>Key name</span>
-                <Input value={editingKeyName} onChange={(event) => setEditingKeyName(event.target.value)} placeholder="Production key" />
-              </label>
-              <div className="actions-row modal-actions heroui-modal-actions">
-                {editingKeyId ? <Button variant="ghost" className="danger-action-button" onPress={() => onDeleteKey(editingKeyId)} isDisabled={saving}>Delete key</Button> : null}
-                <Button variant="primary" onPress={onUpdateKey} isDisabled={saving} isPending={saving}>{saving ? "Updating..." : "Save name"}</Button>
-              </div>
-            </Card.Content>
-          </Card>
-        </div> : null}
-
-        {isAccountModalOpen ? <div className="modal-overlay" onClick={() => setIsAccountModalOpen(false)}>
-          <Card className="modal-card heroui-modal-card" onClick={(event) => event.stopPropagation()}>
-            <Card.Content className="heroui-modal-content">
-              <div className="section-heading heroui-section-heading">
-                <h3>{editingAccountId ? "Edit gateway account" : "Add gateway account"}</h3>
-                <Button variant="ghost" onPress={() => setIsAccountModalOpen(false)}>Close</Button>
-              </div>
-              <p className="muted-copy">Agar active account ka quota ya limit khatam ho jata hai, bridge automatic next configured active account par switch karega.</p>
-              <label>
-                <span>Account name</span>
-                <Input value={accountName} onChange={(event) => setAccountName(event.target.value)} placeholder="Account 2" />
-              </label>
-              <label>
-                <span>Base URL</span>
-                <Input value={accountBaseUrl} onChange={(event) => setAccountBaseUrl(event.target.value)} placeholder="https://api.openai.com" />
-              </label>
-              <label>
-                <span>API key</span>
-                <Input type="password" value={accountApiKey} onChange={(event) => setAccountApiKey(event.target.value)} placeholder="sk-..." />
-              </label>
-              <div className="actions-row modal-actions heroui-modal-actions">
-                <Button variant="primary" onPress={onSaveAccount} isDisabled={saving} isPending={saving}>{saving ? "Saving..." : editingAccountId ? "Update account" : "Add account"}</Button>
-              </div>
-            </Card.Content>
-          </Card>
-        </div> : null}
-
-      </main>
-    </div>
+            )}
+          </AnimatePresence>
+        </div>
+      </div>
+    </>
   );
 }

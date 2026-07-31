@@ -1,15 +1,20 @@
 import path from "node:path";
 import { app, BrowserWindow, Menu, ipcMain, shell } from "electron";
 import { BridgeServer } from "./bridgeServer";
-import { activateLicense, clearLicense, createAccount, createClientKey, deleteAccount, deleteClientKey, loadClientKeys, loadConfig, loadLicenseState, regenerateRequestCode, saveConfig, selectActiveAccount, updateAccount, updateClientKey } from "./configStore";
-import type { ActivateLicenseInput, BridgeConfig, BridgeState, ClearLicenseInput, CreateAccountInput, CreateClientKeyInput, DeleteAccountInput, DeleteClientKeyInput, GenerateRequestCodeInput, PlaygroundModelsInput, PlaygroundModelsResult, PlaygroundTestInput, PlaygroundTestResult, SaveConfigInput, SelectAccountInput, UpdateAccountInput, UpdateClientKeyInput } from "../shared/types";
+import { clearUsageLogs, createAccount, createClientKey, deleteAccount, deleteClientKey, loadClientKeys, loadConfig, saveConfig, selectActiveAccount, updateAccount, updateClientKey } from "./configStore";
+import { V0_MODELS } from "../shared/types";
+import type { BridgeConfig, BridgeState, CreateAccountInput, CreateClientKeyInput, DeleteAccountInput, DeleteClientKeyInput, PlaygroundModelsInput, PlaygroundModelsResult, PlaygroundTestInput, PlaygroundTestResult, ResetUsageInput, SaveConfigInput, SelectAccountInput, UpdateAccountInput, UpdateClientKeyInput } from "../shared/types";
 
 const bridgeServer = new BridgeServer();
 const logoPath = path.join(app.getAppPath(), "src", "logo", "logp.ico");
+const useLocalhostBridge = process.env.SPARKLY_USE_LOCALHOST_BRIDGE === "1";
 
 function normalizeOpenAiBaseUrl(value: string) {
   const trimmed = value.trim().replace(/\/+$/, "");
-  return trimmed.endsWith("/v1") ? trimmed.slice(0, -3) : trimmed;
+  if (!trimmed) {
+    return "";
+  }
+  return trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
 }
 
 function extractHtmlTitle(html: string) {
@@ -55,6 +60,7 @@ async function loadModelsFromProvider(input: PlaygroundModelsInput): Promise<Pla
       headers: {
         Authorization: `Bearer ${input.apiKey}`,
       },
+      signal: AbortSignal.timeout(8_000),
     });
 
     const text = await response.text();
@@ -90,6 +96,15 @@ async function syncActiveAccountModels(config: BridgeConfig) {
     return config;
   }
 
+  if (activeAccount.provider === "v0") {
+    const models = [...V0_MODELS];
+    return saveConfig({
+      ...config,
+      models,
+      selectedModel: models.includes(config.selectedModel as typeof V0_MODELS[number]) ? config.selectedModel : models[0],
+    });
+  }
+
   const result = await loadModelsFromProvider({
     baseUrl: activeAccount.baseUrl,
     apiKey: activeAccount.apiKey,
@@ -114,7 +129,6 @@ function getBridgeState(): BridgeState {
     stats: bridgeServer.getStats(),
     logs: bridgeServer.getLogs(),
     clientKeys: loadClientKeys(),
-    license: loadLicenseState(),
   };
 }
 
@@ -131,9 +145,10 @@ async function createWindow() {
     icon: logoPath,
     backgroundColor: "#f2efe8",
     webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
+      preload: useLocalhostBridge ? undefined : path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      webSecurity: false,
     },
     autoHideMenuBar: true,
   });
@@ -150,7 +165,10 @@ async function createWindow() {
 }
 
 app.whenReady().then(async () => {
-  await bridgeServer.start(loadConfig());
+  if (!useLocalhostBridge) {
+    await bridgeServer.start(loadConfig());
+  }
+
   await createWindow();
 
   app.on("activate", async () => {
@@ -203,25 +221,25 @@ ipcMain.handle("bridge:delete-client-key", async (_event, input: DeleteClientKey
 });
 
 ipcMain.handle("bridge:create-account", async (_event, input: CreateAccountInput) => {
-  const saved = await syncActiveAccountModels(createAccount(input));
+  const saved = createAccount(input);
   await bridgeServer.start(saved);
   return getBridgeState();
 });
 
 ipcMain.handle("bridge:update-account", async (_event, input: UpdateAccountInput) => {
-  const saved = await syncActiveAccountModels(updateAccount(input));
+  const saved = updateAccount(input);
   await bridgeServer.start(saved);
   return getBridgeState();
 });
 
 ipcMain.handle("bridge:delete-account", async (_event, input: DeleteAccountInput) => {
-  const saved = await syncActiveAccountModels(deleteAccount(input.id));
+  const saved = deleteAccount(input.id);
   await bridgeServer.start(saved);
   return getBridgeState();
 });
 
 ipcMain.handle("bridge:select-account", async (_event, input: SelectAccountInput) => {
-  const saved = await syncActiveAccountModels(selectActiveAccount(input.id));
+  const saved = selectActiveAccount(input.id);
   await bridgeServer.start(saved);
   return getBridgeState();
 });
@@ -236,21 +254,19 @@ ipcMain.handle("bridge:open-external", async (_event, url: string) => {
   await shell.openExternal(url);
 });
 
-ipcMain.handle("bridge:activate-license", async (_event, input: ActivateLicenseInput) => {
-  activateLicense(input);
-  return getBridgeState();
-});
-
-ipcMain.handle("bridge:clear-license", async (_event, input: ClearLicenseInput) => {
-  if (input.confirm) {
-    clearLicense();
+ipcMain.handle("bridge:open-devtools", async () => {
+  const window = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
+  if (!window) {
+    return;
   }
-  return getBridgeState();
+
+  window.webContents.openDevTools({ mode: "detach", activate: true });
 });
 
-ipcMain.handle("bridge:generate-request-code", async (_event, input: GenerateRequestCodeInput) => {
-  if (input.refresh) {
-    regenerateRequestCode();
+ipcMain.handle("bridge:reset-usage", async (_event, input: ResetUsageInput) => {
+  if (input.confirm) {
+    bridgeServer.clearLogs();
+    clearUsageLogs();
   }
   return getBridgeState();
 });
@@ -314,3 +330,4 @@ ipcMain.handle("bridge:playground-test", async (_event, input: PlaygroundTestInp
     };
   }
 });
+
