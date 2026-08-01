@@ -152,14 +152,3 @@ const cellStyle: React.CSSProperties = {
   verticalAlign: 'middle'
 };
 
-const probeBadgeStyle: React.CSSProperties = {
-  fontSize: '9px',
-  fontWeight: 800,
-  padding: '2px 6px',
-  background: 'rgba(99, 102, 241, 0.1)',
-  color: '#818cf8',
-  border: '1px solid rgba(99, 102, 241, 0.2)',
-  borderRadius: '4px',
-  textTransform: 'uppercase',
-  letterSpacing: '0.05em'
-};

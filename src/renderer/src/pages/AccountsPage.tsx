@@ -6,20 +6,16 @@ import { maskKey } from "../appState";
 function AccountsPageComponent({
   state,
   form,
-  clientBaseUrl,
   saving,
   onRefreshActiveAccountModels,
-  openCreateAccountModal,
   openEditAccountModal,
   onSelectAccount,
   onDeleteAccount,
 }: {
   state: BridgeState;
   form: BridgeConfig;
-  clientBaseUrl: string;
   saving: boolean;
   onRefreshActiveAccountModels: () => void;
-  openCreateAccountModal: () => void;
   openEditAccountModal: (account: UpstreamAccount) => void;
   onSelectAccount: (id: string) => void;
   onDeleteAccount: (id: string) => void;
@@ -170,6 +166,5 @@ function AccountsPageComponent({
 export const AccountsPage = memo(AccountsPageComponent, (prev, next) => {
   return prev.state === next.state
     && prev.form === next.form
-    && prev.clientBaseUrl === next.clientBaseUrl
     && prev.saving === next.saving;
 });

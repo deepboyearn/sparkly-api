@@ -1,5 +1,5 @@
 import { useDeferredValue, useEffect, useMemo, useState } from "react";
-import { Button, Chip, Input } from "@heroui/react";
+import { Chip, Input } from "@heroui/react";
 import { Icon } from "@iconify/react";
 
 const INITIAL_MODEL_PICKER_LIMIT = 40;

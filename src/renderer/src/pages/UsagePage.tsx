@@ -90,7 +90,6 @@ function UsagePageComponent({
   state,
   totalTokenEstimate,
   rpm,
-  tpm,
   totalCostEstimate,
   usageRequestChartData,
   usageRequestChartOptions,
@@ -120,7 +119,6 @@ function UsagePageComponent({
   setTimeFilter: (val: "24h" | "7d" | "30d" | "all") => void;
   totalTokenEstimate: number;
   rpm: number;
-  tpm: number;
   totalCostEstimate: number;
   usageRequestChartData: any;
   usageRequestChartOptions: any;
@@ -348,7 +346,6 @@ export const UsagePage = memo(UsagePageComponent, (prev, next) => {
     && prev.realLogs === next.realLogs
     && prev.totalTokenEstimate === next.totalTokenEstimate
     && prev.rpm === next.rpm
-    && prev.tpm === next.tpm
     && prev.totalCostEstimate === next.totalCostEstimate
     && prev.usageRequestChartData === next.usageRequestChartData
     && prev.usageRequestChartOptions === next.usageRequestChartOptions

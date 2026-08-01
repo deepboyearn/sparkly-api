@@ -8,6 +8,9 @@
     "dev": "tauri dev",
     "build:renderer": "vite build",
     "build": "vite build",
+    "lint": "oxlint",
+    "lint:fix": "oxlint --fix",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"
@@ -30,6 +33,7 @@
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^4.3.4",
+    "oxlint": "^1.76.0",
     "typescript": "^5.7.3",
     "vite": "^6.2.1"
   }

@@ -30,11 +30,11 @@ export function normalizeBridgeState(input: Partial<BridgeState>): BridgeState {
   return {
     config: {
       ...emptyState.config,
-      ...(input.config ?? {}),
+      ...input.config,
     },
     stats: {
       ...emptyState.stats,
-      ...(input.stats ?? {}),
+      ...input.stats,
     },
     logs: Array.isArray(input.logs) ? input.logs : [],
     clientKeys: Array.isArray(input.clientKeys) ? input.clientKeys : [],

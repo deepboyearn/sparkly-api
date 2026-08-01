@@ -1,5 +1,5 @@
 import { startTransition, useEffect, useMemo, useState } from "react";
-import { Alert, Avatar, Button, ButtonGroup, Card, Chip, Input } from "@heroui/react";
+import { Alert, Card, Input } from "@heroui/react";
 import { Icon } from "@iconify/react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -15,10 +15,9 @@ import {
 import { Line } from "react-chartjs-2";
 import { V0_BASE_URL, V0_MODELS } from "../../shared/types";
 import type { AccountProvider, AccountUsageTag, BridgeConfig, BridgeState, PlaygroundModelsResult, PlaygroundTestResult } from "../../shared/types";
-import { emptyState, ensureBridgeMethod, formatUptime, getDayPoints, getHourlyPoints, getPlaygroundErrorSummary, getRequestPoints, getUsageRecords, groupKeyStats, groupModelStats, maskKey, normalizeBridgeState, normalizeOpenAiBaseUrl } from "./appState";
+import { emptyState, ensureBridgeMethod, getDayPoints, getHourlyPoints, getRequestPoints, getUsageRecords, groupKeyStats, groupModelStats, normalizeBridgeState, normalizeOpenAiBaseUrl } from "./appState";
 import { Header } from "./components/Header";
 import { Sidebar } from "./components/Sidebar";
-import { ModelPicker } from "./components/ModelPicker";
 import { Onboarding } from "./components/Onboarding";
 import { AccountsPage } from "./pages/AccountsPage";
 import { ApiKeysPage } from "./pages/ApiKeysPage";
@@ -57,7 +56,6 @@ export default function App() {
   const [newKeyName, setNewKeyName] = useState("");
   const [editingKeyId, setEditingKeyId] = useState<string | null>(null);
   const [editingKeyName, setEditingKeyName] = useState("");
-  const [createdKeyValue, setCreatedKeyValue] = useState<string | null>(null);
   const [accountName, setAccountName] = useState("");
   const [accountProvider, setAccountProvider] = useState<AccountProvider>("openai-compatible");
   const [accountBaseUrl, setAccountBaseUrl] = useState("https://api.bluesminds.com");
@@ -320,11 +318,6 @@ export default function App() {
       },
     },
   }), [overviewHasTraffic, overviewMaxPoint]);
-  const successRate = useMemo(() => (
-    isOverview || isUsage
-      ? state.stats.totalRequests === 0 ? 0 : Math.round((state.stats.successCount / state.stats.totalRequests) * 100)
-      : 0
-  ), [isOverview, isUsage, state.stats.successCount, state.stats.totalRequests]);
   const clientBaseUrl = `${state.stats.localBaseUrl}/v1`;
   // Auto-reset logs older than 30 days
   useEffect(() => {
@@ -446,24 +439,8 @@ export default function App() {
         pointBorderWidth: 2,
         order: 2,
       },
-      {
-        label: "Model Probes",
-        data: hourlyProbePoints.map((point) => 0), // Probes consume 0 tokens
-        borderColor: "#a78bfa",
-        backgroundColor: "rgba(167, 139, 250, 0.12)",
-        fill: false,
-        tension: 0.36,
-        borderWidth: 3,
-        borderDash: [6, 4],
-        pointRadius: 5,
-        pointHoverRadius: 7,
-        pointBackgroundColor: "#a78bfa",
-        pointBorderColor: "#a78bfa",
-        pointBorderWidth: 2,
-        order: 1,
-      },
     ],
-  }), [hourlyTokenPoints, hourlyProbePoints]);
+  }), [hourlyTokenPoints]);
 
   const usageRequestChartOptions = useMemo<ChartOptions<"line">>(() => ({
     responsive: true,
@@ -579,13 +556,6 @@ export default function App() {
   ), [isUsage, usageFilteredLogs]);
   const rpm = useMemo(() => (
     isUsage ? usageFilteredLogs.filter((entry) => Date.now() - new Date(entry.timestamp).getTime() <= 60_000).length : 0
-  ), [isUsage, usageFilteredLogs]);
-  const tpm = useMemo(() => (
-    isUsage
-      ? usageFilteredLogs
-        .filter((entry) => Date.now() - new Date(entry.timestamp).getTime() <= 60_000)
-        .reduce((total, entry) => total + Math.max(60, entry.durationMs * 3), 0)
-      : 0
   ), [isUsage, usageFilteredLogs]);
   const usageRecords = useMemo(() => (
     isUsage ? getUsageRecords(usageFilteredLogs, state.clientKeys, state.config.apiKey) : []
@@ -1177,7 +1147,7 @@ export default function App() {
                     onRefreshActiveAccountModels={onRefreshActiveAccountModels}
                     openEditKeyModal={openEditKeyModal}
                     onDeleteKey={onDeleteKey}
-                    onOpenCreateKey={() => { setCreatedKeyValue(null); setNewKeyName(""); setIsCreateKeyOpen(true); }}
+                    onOpenCreateKey={() => { setNewKeyName(""); setIsCreateKeyOpen(true); }}
                     onSave={onSave}
                   />
                 </motion.div>
@@ -1196,7 +1166,6 @@ export default function App() {
                     realLogs={realLogs}
                     totalTokenEstimate={totalTokenEstimate}
                     rpm={rpm}
-                    tpm={tpm}
                     totalCostEstimate={totalCostEstimate}
                     usageRequestChartData={usageRequestChartData}
                     usageRequestChartOptions={usageRequestChartOptions}
@@ -1224,10 +1193,8 @@ export default function App() {
                   <AccountsPage
                     state={state}
                     form={form}
-                    clientBaseUrl={clientBaseUrl}
                     saving={saving}
                     onRefreshActiveAccountModels={onRefreshActiveAccountModels}
-                    openCreateAccountModal={openCreateAccountModal}
                     openEditAccountModal={openEditAccountModal}
                     onSelectAccount={onSelectAccount}
                     onDeleteAccount={onDeleteAccount}
@@ -1259,7 +1226,6 @@ export default function App() {
                     playgroundModelsLoading={playgroundModelsLoading}
                     playgroundResult={playgroundResult}
                     setPlaygroundResult={setPlaygroundResult}
-                    setPlaygroundModelsResult={setPlaygroundModelsResult}
                     playgroundLoading={playgroundLoading}
                     onLoadPlaygroundModels={onLoadPlaygroundModels}
                     onRunPlayground={onRunPlayground}
