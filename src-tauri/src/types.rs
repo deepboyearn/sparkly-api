@@ -3,10 +3,12 @@
 // All agents implement against these types.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 // ─── Request/Response Logging ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RequestLogEntry {
     pub id: String,
     pub timestamp: String,
@@ -29,6 +31,7 @@ pub struct BridgeConfig {
     pub api_key: String,
     pub models: Vec<String>,
     pub selected_model: String,
+    #[serde(default = "default_local_port", deserialize_with = "deserialize_local_port")]
     pub local_port: u16,
     #[serde(default = "default_true")]
     pub enable_cors: bool,
@@ -41,6 +44,29 @@ pub struct BridgeConfig {
 }
 
 fn default_true() -> bool { true }
+
+/// Accepted range for the local listener port; mirrors the clamp in
+/// `normalizeConfig` (src/main/configStore.ts:186).
+pub const MIN_LOCAL_PORT: u16 = 10_000;
+pub const MAX_LOCAL_PORT: u16 = 65_535;
+
+fn default_local_port() -> u16 { DEFAULT_LOCAL_PORT }
+
+/// The settings UI posts whatever `Number(input.value)` produced, so a stored
+/// `localPort` can be out of `u16` range, negative, or `null`. JS clamps such
+/// values; a plain `u16` field would instead fail deserialization and take the
+/// entire config down to defaults, so clamp here and let `normalize_config`
+/// agree with the result.
+fn deserialize_local_port<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<f64>::deserialize(deserializer)? {
+        Some(value) if value.is_finite() => Ok((value as i64)
+            .clamp(MIN_LOCAL_PORT as i64, MAX_LOCAL_PORT as i64) as u16),
+        _ => Ok(DEFAULT_LOCAL_PORT),
+    }
+}
 
 // ─── Upstream Accounts ───────────────────────────────────────────────────────
 
@@ -221,23 +247,83 @@ pub struct ResetUsageInput { pub confirm: bool }
 
 // ─── Default config ──────────────────────────────────────────────────────────
 
+/// Default upstream for `openai-compatible` accounts.
+pub const DEFAULT_UPSTREAM_BASE_URL: &str = "https://api.bluesminds.com";
+pub const DEFAULT_LOCAL_PORT: u16 = 48231;
+pub const DEFAULT_SELECTED_MODEL: &str = "gpt-5.4";
+
+/// Model catalog seeded into every config; mirrors `defaultConfig.models`
+/// in src/main/configStore.ts.
+pub const DEFAULT_MODELS: &[&str] = &[
+    "gpt-5",
+    "gpt-5.1",
+    "gpt-5.2",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "claude-haiku-4-5-20251001",
+    "claude-haiku-4-5-20251001-thinking",
+    "claude-opus-4-5",
+    "claude-opus-4-6",
+    "claude-sonnet-4-5-20250929",
+    "claude-sonnet-4-5-20250929-thinking",
+    "claude-sonnet-4-6",
+    "deepseek-chat",
+    "deepseek-chat-search",
+    "deepseek-expert-chat",
+    "deepseek-expert-chat-search",
+    "deepseek-expert-reasoner",
+    "deepseek-expert-reasoner-search",
+    "deepseek-reasoner",
+    "deepseek-reasoner-search",
+    "glm-4.7",
+    "glm-5",
+    "grok-4.20-0309",
+    "grok-4.20-0309-non-reasoning",
+    "grok-4.20-0309-reasoning",
+    "grok-imagine-image-lite",
+    "MiniMax-M2.5",
+    "moonshotai/kimi-k2.5",
+    "qwen/qwen3.6-plus",
+    "qwen3.5-omni-plus",
+    "qwen3.5-omni-plus-search",
+    "qwen3.5-omni-plus-thinking",
+    "qwen3.5-omni-plus-thinking-search",
+    "qwen3.5-plus",
+    "qwen3.5-plus-search",
+    "qwen3.5-plus-thinking",
+    "qwen3.5-plus-thinking-search",
+    "qwen3.6-plus",
+    "qwen3.6-plus-image-edit",
+    "qwen3.6-plus-search",
+    "qwen3.6-plus-thinking",
+    "qwen3.6-plus-thinking-search",
+];
+
 impl Default for BridgeConfig {
     fn default() -> Self {
-        Self {
-            upstream_base_url: "https://api.bluesminds.com".into(),
+        // One placeholder account, exactly like `defaultConfig` in configStore.ts:
+        // without it `has_configured_upstream` fails and the UI has no row to edit.
+        let account = UpstreamAccount {
+            id: Uuid::new_v4().to_string(),
+            name: "Primary Account".into(),
+            provider: AccountProvider::OpenaiCompatible,
+            base_url: DEFAULT_UPSTREAM_BASE_URL.into(),
             api_key: String::new(),
-            models: vec![
-                "gpt-5.4".into(), "gpt-4.1".into(), "gpt-4.1-mini".into(),
-                "claude-sonnet-4-5".into(), "deepseek-reasoner".into(),
-                "deepseek-v3".into(), "qwen3.6-plus".into(),
-                "gemini-2.5-pro".into(), "o4-mini".into(), "o3".into(),
-            ],
-            selected_model: "gpt-5.4".into(),
-            local_port: 48231,
+            usage_tags: vec!["coding".into()],
+            is_active: true,
+            last_used_at: None,
+        };
+
+        Self {
+            upstream_base_url: DEFAULT_UPSTREAM_BASE_URL.into(),
+            api_key: String::new(),
+            models: DEFAULT_MODELS.iter().map(|m| (*m).to_string()).collect(),
+            selected_model: DEFAULT_SELECTED_MODEL.into(),
+            local_port: DEFAULT_LOCAL_PORT,
             enable_cors: true,
             system_prompt: String::new(),
-            accounts: vec![],
-            active_account_id: String::new(),
+            active_account_id: account.id.clone(),
+            accounts: vec![account],
         }
     }
 }

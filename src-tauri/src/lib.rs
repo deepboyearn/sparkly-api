@@ -12,12 +12,18 @@ use tauri::Manager;
 use tokio::sync::RwLock;
 use types::*;
 
+/// Shared application state.
+///
+/// `data_dir` is the single source of truth for on-disk paths. It is resolved
+/// once from Tauri's `app_data_dir()` at startup and threaded through every
+/// command, so reads and writes can never disagree about where config lives.
 pub struct AppState {
     pub config: RwLock<BridgeConfig>,
     pub client_keys: RwLock<Vec<ClientApiKey>>,
     pub logs: RwLock<Vec<RequestLogEntry>>,
     pub stats: RwLock<BridgeStats>,
     pub started_at: std::time::Instant,
+    pub data_dir: std::path::PathBuf,
 }
 
 pub fn run() {
@@ -60,17 +66,15 @@ pub fn run() {
                     server_running: false,
                 }),
                 started_at: std::time::Instant::now(),
+                data_dir: data_dir.clone(),
             };
 
             let state_arc = Arc::new(state);
 
-            // Start bridge HTTP server in background
-            let bridge_state = state_arc.clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(error) = bridge::start_bridge_server(bridge_state).await {
-                    tracing::error!("Bridge server stopped: {error}");
-                }
-            });
+            // Supervise the bridge listener: `bridge::spawn_supervisor` keeps it
+            // alive across restarts, so a config change re-binds instead of
+            // killing the server for the rest of the session.
+            bridge::spawn_supervisor(state_arc.clone());
 
             app.manage(state_arc);
             Ok(())
@@ -107,11 +111,13 @@ async fn save_config(
     config: BridgeConfig,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<BridgeState, String> {
-    let data_dir = config_store_path();
-    let mut cfg = state.config.write().await;
-    *cfg = config::normalize_config(config);
-    config::persist_config(&cfg, &data_dir).map_err(|e| e.to_string())?;
-    drop(cfg);
+    {
+        let mut cfg = state.config.write().await;
+        *cfg = config;
+        config::save_config(&mut cfg, &state.data_dir).map_err(|e| e.to_string())?;
+    }
+    // localPort / enableCors may have changed — re-bind the listener.
+    bridge::request_rebind().await;
     Ok(bridge::build_bridge_state(&state).await)
 }
 
@@ -119,13 +125,12 @@ async fn save_config(
 async fn restart_server(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<BridgeState, String> {
-    let data_dir = config_store_path();
-    let conf = config::load_config(&data_dir);
-    let mut cfg = state.config.write().await;
-    *cfg = conf;
-    drop(cfg);
-    // Server restart is handled by the bridge module
-    bridge::restart().await.map_err(|e| e.to_string())?;
+    {
+        let conf = config::load_config(&state.data_dir);
+        let mut cfg = state.config.write().await;
+        *cfg = conf;
+    }
+    bridge::request_rebind().await;
     Ok(bridge::build_bridge_state(&state).await)
 }
 
@@ -134,12 +139,11 @@ async fn create_client_key(
     input: CreateClientKeyInput,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<BridgeState, String> {
-    let data_dir = config_store_path();
-    let mut keys = state.client_keys.write().await;
-    let new_key = config::create_client_key(&mut keys, &input.name);
-    let _ = new_key; // already pushed into keys
-    config::persist_client_keys(&keys, &data_dir).map_err(|e| e.to_string())?;
-    drop(keys);
+    {
+        let mut keys = state.client_keys.write().await;
+        config::create_client_key(&mut keys, &input.name);
+        config::persist_client_keys(&keys, &state.data_dir).map_err(|e| e.to_string())?;
+    }
     Ok(bridge::build_bridge_state(&state).await)
 }
 
@@ -148,11 +152,11 @@ async fn update_client_key(
     input: UpdateClientKeyInput,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<BridgeState, String> {
-    let data_dir = config_store_path();
-    let mut keys = state.client_keys.write().await;
-    config::update_client_key(&mut keys, &input.id, &input.name);
-    config::persist_client_keys(&keys, &data_dir).map_err(|e| e.to_string())?;
-    drop(keys);
+    {
+        let mut keys = state.client_keys.write().await;
+        config::update_client_key(&mut keys, &input.id, &input.name);
+        config::persist_client_keys(&keys, &state.data_dir).map_err(|e| e.to_string())?;
+    }
     Ok(bridge::build_bridge_state(&state).await)
 }
 
@@ -161,11 +165,11 @@ async fn delete_client_key(
     input: DeleteClientKeyInput,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<BridgeState, String> {
-    let data_dir = config_store_path();
-    let mut keys = state.client_keys.write().await;
-    config::delete_client_key(&mut keys, &input.id);
-    config::persist_client_keys(&keys, &data_dir).map_err(|e| e.to_string())?;
-    drop(keys);
+    {
+        let mut keys = state.client_keys.write().await;
+        config::delete_client_key(&mut keys, &input.id);
+        config::persist_client_keys(&keys, &state.data_dir).map_err(|e| e.to_string())?;
+    }
     Ok(bridge::build_bridge_state(&state).await)
 }
 
@@ -174,11 +178,12 @@ async fn create_account(
     input: CreateAccountInput,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<BridgeState, String> {
-    let data_dir = config_store_path();
-    let mut cfg = state.config.write().await;
-    config::create_account(&mut cfg, &input);
-    config::persist_config(&cfg, &data_dir).map_err(|e| e.to_string())?;
-    drop(cfg);
+    {
+        let mut cfg = state.config.write().await;
+        config::create_account(&mut cfg, &input);
+        config::save_config(&mut cfg, &state.data_dir).map_err(|e| e.to_string())?;
+    }
+    bridge::request_rebind().await;
     Ok(bridge::build_bridge_state(&state).await)
 }
 
@@ -187,11 +192,12 @@ async fn update_account(
     input: UpdateAccountInput,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<BridgeState, String> {
-    let data_dir = config_store_path();
-    let mut cfg = state.config.write().await;
-    config::update_account(&mut cfg, &input);
-    config::persist_config(&cfg, &data_dir).map_err(|e| e.to_string())?;
-    drop(cfg);
+    {
+        let mut cfg = state.config.write().await;
+        config::update_account(&mut cfg, &input);
+        config::save_config(&mut cfg, &state.data_dir).map_err(|e| e.to_string())?;
+    }
+    bridge::request_rebind().await;
     Ok(bridge::build_bridge_state(&state).await)
 }
 
@@ -200,11 +206,12 @@ async fn delete_account(
     input: DeleteAccountInput,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<BridgeState, String> {
-    let data_dir = config_store_path();
-    let mut cfg = state.config.write().await;
-    config::delete_account(&mut cfg, &input.id);
-    config::persist_config(&cfg, &data_dir).map_err(|e| e.to_string())?;
-    drop(cfg);
+    {
+        let mut cfg = state.config.write().await;
+        config::delete_account(&mut cfg, &input.id);
+        config::save_config(&mut cfg, &state.data_dir).map_err(|e| e.to_string())?;
+    }
+    bridge::request_rebind().await;
     Ok(bridge::build_bridge_state(&state).await)
 }
 
@@ -213,11 +220,12 @@ async fn select_account(
     input: SelectAccountInput,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<BridgeState, String> {
-    let data_dir = config_store_path();
-    let mut cfg = state.config.write().await;
-    config::select_account(&mut cfg, &input.id);
-    config::persist_config(&cfg, &data_dir).map_err(|e| e.to_string())?;
-    drop(cfg);
+    {
+        let mut cfg = state.config.write().await;
+        config::select_account(&mut cfg, &input.id);
+        config::save_config(&mut cfg, &state.data_dir).map_err(|e| e.to_string())?;
+    }
+    bridge::request_rebind().await;
     Ok(bridge::build_bridge_state(&state).await)
 }
 
@@ -225,21 +233,33 @@ async fn select_account(
 async fn refresh_active_account_models(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<BridgeState, String> {
-    let data_dir = config_store_path();
-    let cfg = state.config.read().await;
-    let account = config::get_active_account(&cfg);
-    let (base_url, api_key) = match account {
-        Some(a) => (a.base_url.clone(), a.api_key.clone()),
-        None => return Err("No active account".into()),
+    // Mirrors `syncActiveAccountModels` (src/main/main.ts:93-122): v0 has a
+    // fixed catalog, everything else is fetched from the provider.
+    let (provider, base_url, api_key) = {
+        let cfg = state.config.read().await;
+        match config::get_active_account(&cfg) {
+            Some(a) => (a.provider.clone(), a.base_url.clone(), a.api_key.clone()),
+            None => return Err("No active account is configured.".into()),
+        }
     };
-    drop(cfg);
 
-    let models = bridge::fetch_models_from_provider(&base_url, &api_key).await?;
+    if base_url.is_empty() || api_key.is_empty() {
+        return Err("The active account needs a base URL and an API key.".into());
+    }
 
-    let mut cfg = state.config.write().await;
-    cfg.models = models;
-    config::persist_config(&cfg, &data_dir).map_err(|e| e.to_string())?;
-    drop(cfg);
+    let models = if provider == AccountProvider::V0 {
+        V0_MODELS.iter().map(|m| (*m).to_string()).collect()
+    } else {
+        bridge::fetch_models_from_provider(&base_url, &api_key).await?
+    };
+
+    {
+        let mut cfg = state.config.write().await;
+        cfg.models = models;
+        // save_config re-normalizes, so selectedModel stays valid against the
+        // new list.
+        config::save_config(&mut cfg, &state.data_dir).map_err(|e| e.to_string())?;
+    }
     Ok(bridge::build_bridge_state(&state).await)
 }
 
@@ -251,14 +271,14 @@ async fn reset_usage(
     if !input.confirm {
         return Err("Reset not confirmed".into());
     }
-    let mut logs = state.logs.write().await;
-    logs.clear();
-    drop(logs);
-    let mut stats = state.stats.write().await;
-    stats.total_requests = 0;
-    stats.success_count = 0;
-    stats.error_count = 0;
-    stats.last_request_at = None;
+    state.logs.write().await.clear();
+    {
+        let mut stats = state.stats.write().await;
+        stats.total_requests = 0;
+        stats.success_count = 0;
+        stats.error_count = 0;
+        stats.last_request_at = None;
+    }
     Ok(bridge::build_bridge_state(&state).await)
 }
 
@@ -274,20 +294,4 @@ async fn playground_test(
     input: PlaygroundTestInput,
 ) -> Result<PlaygroundTestResult, String> {
     bridge::playground_test(input).await
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-fn config_store_path() -> std::path::PathBuf {
-    // In Tauri, data lives in the app data dir.
-    // During development, fallback to current dir + "sparkly-data".
-    std::env::var("APPDATA")
-        .map(|p| std::path::PathBuf::from(p).join("sparkly-api"))
-        .unwrap_or_else(|_| {
-            dirs().unwrap_or_else(|| std::path::PathBuf::from(".")).join("sparkly-api")
-        })
-}
-
-fn dirs() -> Option<std::path::PathBuf> {
-    home::home_dir().map(|h| h.join("sparkly-api"))
 }

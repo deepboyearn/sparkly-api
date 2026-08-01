@@ -2,10 +2,11 @@
 // Axum HTTP bridge server — forwards OpenAI-compatible requests to upstream accounts.
 // Port of bridgeServer.ts with failover, agent loop, and Responses API translation.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::sync::{Arc, OnceLock};
+use std::collections::{HashMap, VecDeque};
+use parking_lot::Mutex;
+use std::sync::{Arc, LazyLock};
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, State as AxumState};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -31,13 +32,93 @@ const PLAYGROUND_TIMEOUT_SECS: u64 = 30;
 const MODEL_FETCH_TIMEOUT_SECS: u64 = 8;
 const RESPONSES_SESSION_LIMIT: usize = 50;
 
-// ─── Module-level singleton ─────────────────────────────────────────────────
+// ─── Module-level singletons ────────────────────────────────────────────────
 
 static SHUTDOWN_TX: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
-static RESPONSES_SESSIONS: OnceLock<RwLock<HashMap<String, Vec<Value>>>> = OnceLock::new();
 
-fn get_or_init_sessions() -> &'static RwLock<HashMap<String, Vec<Value>>> {
-    RESPONSES_SESSIONS.get_or_init(|| RwLock::new(HashMap::new()))
+/// Conversation items for `/v1/responses`, keyed by response id.
+static SESSIONS: LazyLock<RwLock<ResponsesSessions>> =
+    LazyLock::new(|| RwLock::new(ResponsesSessions::default()));
+
+/// Shared client for every upstream call.
+///
+/// Building a `Client` per request throws away the connection pool and repeats
+/// TLS setup on each proxied call, which is the hot path of this whole process.
+/// Redirects follow reqwest's default policy to match the JS `fetch`, which
+/// followed them; reqwest strips `Authorization` on a cross-host hop.
+static UPSTREAM_CLIENT: LazyLock<Client> = LazyLock::new(|| {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(UPSTREAM_TIMEOUT_SECS))
+        .build()
+        .expect("building the shared upstream HTTP client")
+});
+
+/// Insertion-ordered store of `/v1/responses` conversation items.
+///
+/// A bare `HashMap` cannot express the eviction rule the JS relies on —
+/// `sessions.keys().next()` drops the *oldest* entry of an insertion-ordered
+/// `Map` (bridgeServer.ts:988-993), whereas `HashMap` iteration order is
+/// randomised and could evict the newest conversation instead.
+#[derive(Default)]
+struct ResponsesSessions {
+    items: HashMap<String, Vec<Value>>,
+    order: VecDeque<String>,
+}
+
+impl ResponsesSessions {
+    fn get(&self, id: &str) -> Option<&Vec<Value>> {
+        self.items.get(id)
+    }
+
+    fn insert(&mut self, id: String, items: Vec<Value>) {
+        if self.items.insert(id.clone(), items).is_none() {
+            self.order.push_back(id);
+        }
+        while self.order.len() > RESPONSES_SESSION_LIMIT {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.items.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+
+/// Flatten a chat/Responses `content` value to plain text.
+///
+/// Port of `stringifyToolMessageContent` (bridgeServer.ts:1159-1194): strings
+/// pass through, arrays contribute their `text`/`content` parts joined by
+/// newlines, anything else falls back to its JSON encoding.
+fn stringify_content(content: &Value) -> String {
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+
+    if let Some(arr) = content.as_array() {
+        let text = arr
+            .iter()
+            .filter_map(|part| {
+                let obj = part.as_object()?;
+                obj.get("text")
+                    .or_else(|| obj.get("content"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if !text.is_empty() {
+            return text;
+        }
+    }
+
+    if content.is_null() {
+        return String::new();
+    }
+
+    content.to_string()
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -101,25 +182,43 @@ fn has_configured_upstream(config: &BridgeConfig) -> bool {
 }
 
 /// Determine whether we should failover to the next account for this status/body.
+///
+/// Mirrors `shouldFailoverAccount` (bridgeServer.ts:1518-1546): hard auth/quota
+/// and 5xx statuses always failover; a 400 only does when the error payload
+/// smells like a billing problem. `code`/`type` are only matched against
+/// quota/insufficient — the wider vocabulary applies to `message` alone.
 fn should_failover(status: u16, body: &Value) -> bool {
-    matches!(status, 401 | 402 | 403 | 429 | 500 | 502 | 503 | 504)
-        || (status == 400 && failover_from_400_body(body))
-}
-
-fn failover_from_400_body(body: &Value) -> bool {
-    if let Some(err) = body.get("error") {
-        let code = err.get("code").and_then(|v| v.as_str()).unwrap_or("");
-        let typ = err.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let msg = err.get("message").and_then(|v| v.as_str()).unwrap_or("");
-        let combined = format!("{code} {typ} {msg}").to_lowercase();
-        return combined.contains("quota")
-            || combined.contains("insufficient")
-            || combined.contains("credit")
-            || combined.contains("balance")
-            || combined.contains("billing")
-            || combined.contains("rate limit");
+    if matches!(status, 401 | 402 | 403 | 429 | 500 | 502 | 503 | 504) {
+        return true;
     }
-    false
+
+    if status != 400 {
+        return false;
+    }
+
+    let Some(err) = body.get("error") else {
+        return false;
+    };
+    let field = |key: &str| {
+        err.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase()
+    };
+    let code = field("code");
+    let typ = field("type");
+    let message = field("message");
+
+    code.contains("quota")
+        || code.contains("insufficient")
+        || typ.contains("quota")
+        || typ.contains("insufficient")
+        || message.contains("quota")
+        || message.contains("insufficient")
+        || message.contains("credit")
+        || message.contains("balance")
+        || message.contains("billing")
+        || message.contains("rate limit")
 }
 
 /// Construct a standard JSON error response.
@@ -136,16 +235,49 @@ fn json_error(status: StatusCode, message: &str, error_type: &str) -> Response {
         .into_response()
 }
 
-/// Get the active upstream account from config (active_account_id or first).
-fn get_active_account(config: &BridgeConfig) -> Option<&UpstreamAccount> {
-    if !config.active_account_id.is_empty() {
-        config
-            .accounts
-            .iter()
-            .find(|a| a.id == config.active_account_id)
-    } else {
-        config.accounts.first()
+/// Extract a JSON request body, mirroring `express.json()`'s tolerance while
+/// still failing in the OpenAI error shape.
+///
+/// - absent body / no `Content-Type` → `{}` (express leaves `req.body`
+///   undefined and the JS handlers fall back to `{}`)
+/// - malformed JSON → `Err` carrying a `{error:{message,type}}` response
+///
+/// axum's own rejection is `text/plain`, which an OpenAI-compatible client
+/// cannot parse.
+fn json_body_or_error(
+    body: Result<Json<Value>, JsonRejection>,
+) -> Result<Value, Response> {
+    match body {
+        Ok(Json(value)) => Ok(value),
+        Err(JsonRejection::MissingJsonContentType(_)) => Ok(json!({})),
+        Err(JsonRejection::JsonSyntaxError(e)) => Err(json_error(
+            StatusCode::BAD_REQUEST,
+            &format!("Invalid JSON in request body: {e}"),
+            "bridge_request_error",
+        )),
+        Err(JsonRejection::JsonDataError(e)) => Err(json_error(
+            StatusCode::BAD_REQUEST,
+            &format!("Invalid request body: {e}"),
+            "bridge_request_error",
+        )),
+        Err(rejection) => Err(json_error(
+            StatusCode::BAD_REQUEST,
+            &format!("Could not read request body: {rejection}"),
+            "bridge_request_error",
+        )),
     }
+}
+
+/// Get the active upstream account from config (active_account_id or first).
+///
+/// Falls back to the first account when `activeAccountId` is empty *or* dangling,
+/// matching `getActiveAccount` (bridgeServer.ts:1514-1516).
+fn get_active_account(config: &BridgeConfig) -> Option<&UpstreamAccount> {
+    config
+        .accounts
+        .iter()
+        .find(|a| a.id == config.active_account_id)
+        .or_else(|| config.accounts.first())
 }
 
 /// Extract the model name from a JSON request body.
@@ -155,84 +287,139 @@ fn extract_model(body: &Value) -> Option<String> {
         .map(String::from)
 }
 
-/// Apply model defaults: inject selected_model if missing, prepend system prompt.
-fn apply_model_defaults(body: &mut Value, config: &BridgeConfig) {
-    if !body.get("model").is_some() || body.get("model").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
-        body["model"] = Value::String(config.selected_model.clone());
-    }
-
-    if !config.system_prompt.is_empty() {
-        if let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
-            let has_system = messages.iter().any(|m| {
-                m.get("role")
-                    .and_then(|v| v.as_str())
-                    .map(|r| r == "system")
-                    .unwrap_or(false)
-            });
-            if !has_system {
-                let sys = json!({"role": "system", "content": config.system_prompt});
-                messages.insert(0, sys);
-            }
-        }
+/// JavaScript `Boolean(value)` for a JSON value: everything except `undefined`,
+/// `null`, `false`, `0`, and `""` is truthy.
+fn is_truthy(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(_) => true,
     }
 }
 
-/// Record a request in the logs (module-level, called via AppState).
-async fn record_request(
+/// Apply model defaults: inject selected_model if missing, prepend system prompt.
+///
+/// Port of `applyModelDefaults` (bridgeServer.ts:289-310).
+fn apply_model_defaults(body: &mut Value, config: &BridgeConfig) {
+    let has_model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|m| !m.is_empty())
+        .unwrap_or(false);
+    if !has_model {
+        body["model"] = Value::String(config.selected_model.clone());
+    }
+
+    if config.system_prompt.is_empty() {
+        return;
+    }
+
+    // A missing or non-array `messages` becomes a fresh array holding just the
+    // system prompt — the JS builds `[]` and then unshifts into it.
+    let messages = match body.get_mut("messages").and_then(|v| v.as_array_mut()) {
+        Some(existing) => existing,
+        None => {
+            body["messages"] = json!([{"role": "system", "content": config.system_prompt}]);
+            return;
+        }
+    };
+
+    let has_system = messages
+        .iter()
+        .any(|m| m.get("role").and_then(|v| v.as_str()) == Some("system"));
+    if !has_system {
+        messages.insert(0, json!({"role": "system", "content": config.system_prompt}));
+    }
+}
+
+/// Push a request log entry (newest first, capped at [`MAX_LOGS`]).
+///
+/// The JS unshifts into `logs` (bridgeServer.ts:1570-1577) and derives
+/// `lastRequestAt` from `logs[0].timestamp`, so `BridgeStats.last_request_at`
+/// is computed by the readers rather than cached here.
+async fn record_log(
     logs: &RwLock<Vec<RequestLogEntry>>,
-    stats: &RwLock<BridgeStats>,
     method: &str,
     path: &str,
     status: u16,
     model: Option<String>,
     duration_ms: u64,
     error: Option<String>,
-    success: bool,
 ) {
-    {
-        let mut l = logs.write().await;
-        l.insert(
-            0,
-            RequestLogEntry {
-                id: Uuid::new_v4().to_string(),
-                timestamp: Utc::now().to_rfc3339(),
-                method: method.to_string(),
-                path: path.to_string(),
-                status,
-                model,
-                duration_ms,
-                error,
-            },
-        );
-        l.truncate(MAX_LOGS);
-    }
+    let mut l = logs.write().await;
+    l.insert(
+        0,
+        RequestLogEntry {
+            id: Uuid::new_v4().to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+            method: method.to_string(),
+            path: path.to_string(),
+            status,
+            model,
+            duration_ms,
+            error,
+        },
+    );
+    l.truncate(MAX_LOGS);
+}
 
-    {
-        let mut s = stats.write().await;
-        s.total_requests += 1;
-        if success {
-            s.success_count += 1;
-        } else {
-            s.error_count += 1;
-        }
-        s.last_request_at = Some(Utc::now().to_rfc3339());
+/// Count one *completed* request. Failover retries are logged but not counted,
+/// matching the JS totals which only move on the returned outcome
+/// (bridgeServer.ts:1268-1303).
+async fn count_request(stats: &RwLock<BridgeStats>, success: bool) {
+    let mut s = stats.write().await;
+    s.total_requests += 1;
+    if success {
+        s.success_count += 1;
+    } else {
+        s.error_count += 1;
     }
 }
 
-/// Mark an account as used and potentially select it as active.
+/// Mark an account as used, promote it to active, and persist both changes.
+///
+/// The JS original rewrote the entire config file inline on every successful
+/// request (`markAccountUsed`, configStore.ts:294-297), putting a synchronous
+/// disk write on the hot path. Here the in-memory state is updated under the
+/// lock and the file write is handed to a blocking task, so `lastUsedAt` still
+/// survives a restart without delaying the proxied response.
 async fn mark_account_used(state: &AppState, account_id: &str) {
-    let mut cfg = state.config.write().await;
-    let now = Utc::now().to_rfc3339();
-    for acct in &mut cfg.accounts {
-        if acct.id == account_id {
-            acct.last_used_at = Some(now.clone());
-            break;
+    let snapshot = {
+        let mut cfg = state.config.write().await;
+        let mut changed = false;
+
+        if let Some(account) = cfg.accounts.iter_mut().find(|a| a.id == account_id) {
+            account.last_used_at = Some(Utc::now().to_rfc3339());
+            changed = true;
         }
-    }
-    // Select as active if not already
-    if cfg.active_account_id != account_id {
-        cfg.active_account_id = account_id.to_string();
-    }
+
+        if cfg.active_account_id != account_id {
+            // `selectActiveAccount` moves the isActive flag with the id.
+            for account in &mut cfg.accounts {
+                account.is_active = account.id == account_id;
+            }
+            cfg.active_account_id = account_id.to_string();
+            changed = true;
+        }
+
+        if changed {
+            Some(cfg.clone())
+        } else {
+            None
+        }
+    };
+
+    let Some(config) = snapshot else {
+        return;
+    };
+    let data_dir = state.data_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = crate::config::persist_config(&config, &data_dir) {
+            tracing::warn!("Failed to persist account usage: {error}");
+        }
+    });
 }
 
 // ─── Tool helpers for agent loop ────────────────────────────────────────────
@@ -299,7 +486,7 @@ async fn execute_tool_call(tool_name: &str, raw_arguments: &str) -> (Value, bool
 // ─── Responses ↔ Chat mapping ──────────────────────────────────────────────
 
 /// Merge conversation input with previous response session items.
-fn merge_conversation_input(body: &Value, sessions: &HashMap<String, Vec<Value>>) -> Value {
+fn merge_conversation_input(body: &Value, sessions: &ResponsesSessions) -> Value {
     let prev_id = body
         .get("previous_response_id")
         .and_then(|v| v.as_str())
@@ -388,10 +575,6 @@ fn normalize_responses_input(input: &Value) -> Vec<Value> {
                     .get("name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("tool");
-                let args = obj
-                    .get("arguments")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("{}");
                 messages.push(json!({
                     "role": "assistant",
                     "content": "",
@@ -400,7 +583,7 @@ fn normalize_responses_input(input: &Value) -> Vec<Value> {
                         "type": "function",
                         "function": {
                             "name": name,
-                            "arguments": args,
+                            "arguments": tool_arguments(obj.get("arguments")),
                         }
                     }],
                 }));
@@ -408,11 +591,13 @@ fn normalize_responses_input(input: &Value) -> Vec<Value> {
             continue;
         }
 
-        // Standard role message (user/assistant/system)
-        let content = map_responses_content_to_chat(
-            obj.get("content").unwrap_or(&Value::Null),
-        );
-        messages.push(json!({"role": role, "content": content}));
+        // Standard role message (user/assistant/system). Content that is
+        // neither a string nor an array carries nothing usable, and the JS
+        // drops such items rather than sending an empty message
+        // (bridgeServer.ts:399-405).
+        if let Some(content) = map_responses_content_to_chat(obj.get("content")) {
+            messages.push(json!({"role": role, "content": content}));
+        }
     }
 
     if messages.is_empty() {
@@ -423,15 +608,17 @@ fn normalize_responses_input(input: &Value) -> Vec<Value> {
 }
 
 /// Map a Responses content value to a chat-compatible content value.
-fn map_responses_content_to_chat(content: &Value) -> Value {
+///
+/// `None` means "no usable content" and the enclosing item is dropped, matching
+/// the `undefined` return of `mapResponsesContentToChatContent`.
+fn map_responses_content_to_chat(content: Option<&Value>) -> Option<Value> {
+    let content = content?;
+
     if let Some(s) = content.as_str() {
-        return Value::String(s.to_string());
+        return Some(Value::String(s.to_string()));
     }
 
-    let arr = match content.as_array() {
-        Some(a) => a,
-        None => return Value::String(String::new()),
-    };
+    let arr = content.as_array()?;
 
     let mut parts = Vec::new();
 
@@ -470,7 +657,11 @@ fn map_responses_content_to_chat(content: &Value) -> Value {
                 continue;
             }
 
-            let detail = obj.get("detail").and_then(|v| v.as_str());
+            // `detail` may sit on the part or inside the `image_url` object.
+            let detail = obj
+                .get("detail")
+                .or_else(|| obj.get("image_url").and_then(|img| img.get("detail")))
+                .and_then(|v| v.as_str());
             if let Some(d) = detail {
                 parts.push(json!({
                     "type": "image_url",
@@ -505,27 +696,37 @@ fn map_responses_content_to_chat(content: &Value) -> Value {
     }
 
     if parts.is_empty() {
-        return Value::String(String::new());
+        return Some(Value::String(String::new()));
     }
 
     // If all parts are plain text, flatten to a string
-    let has_structured = parts.iter().any(|p| {
-        p.get("type")
-            .and_then(|v| v.as_str())
-            .map(|t| t != "text")
-            .unwrap_or(false)
-    });
+    let has_structured = parts
+        .iter()
+        .any(|p| p.get("type").and_then(|v| v.as_str()) != Some("text"));
 
-    if !has_structured {
-        let combined: String = parts
-            .iter()
-            .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        Value::String(combined)
-    } else {
-        Value::Array(parts)
+    if has_structured {
+        return Some(Value::Array(parts));
+    }
+
+    let combined = parts
+        .iter()
+        .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(Value::String(combined))
+}
+
+/// Normalize a tool-call `arguments` value to the JSON string chat expects.
+///
+/// A client may send the arguments as an object rather than an encoded string;
+/// the JS stringified those (bridgeServer.ts:1222-1225) instead of discarding
+/// them.
+fn tool_arguments(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) if !other.is_null() => other.to_string(),
+        _ => "{}".to_string(),
     }
 }
 
@@ -539,27 +740,23 @@ fn map_responses_tools_to_chat(tools: &Value) -> Vec<Value> {
     arr.iter()
         .filter_map(|tool| {
             let obj = tool.as_object()?;
-            let typ = obj.get("type").and_then(|v| v.as_str())?;
-            if typ != "function" {
+            if obj.get("type").and_then(|v| v.as_str()) != Some("function") {
                 return None;
             }
             let name = obj.get("name").and_then(|v| v.as_str())?;
-            let description = obj
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
             let parameters = obj
                 .get("parameters")
                 .cloned()
                 .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-            Some(json!({
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": description,
-                    "parameters": parameters,
-                }
-            }))
+
+            let mut function = json!({"name": name, "parameters": parameters});
+            // A missing description is omitted, not sent as "" — some upstreams
+            // reject an empty description, and `JSON.stringify` dropped the key.
+            if let Some(description) = obj.get("description").and_then(|v| v.as_str()) {
+                function["description"] = Value::String(description.to_string());
+            }
+
+            Some(json!({"type": "function", "function": function}))
         })
         .collect()
 }
@@ -591,7 +788,11 @@ fn map_responses_tool_choice(tool_choice: &Value, has_tools: bool) -> Value {
 }
 
 /// Map a full Responses request to a chat completions request body.
-fn map_responses_request_to_chat(body: &Value, config: &BridgeConfig, sessions: &HashMap<String, Vec<Value>>) -> Value {
+fn map_responses_request_to_chat(
+    body: &Value,
+    config: &BridgeConfig,
+    sessions: &ResponsesSessions,
+) -> Value {
     let merged_input = merge_conversation_input(body, sessions);
     let messages = normalize_responses_input(&merged_input);
     let chat_tools = map_responses_tools_to_chat(body.get("tools").unwrap_or(&Value::Null));
@@ -616,17 +817,17 @@ fn map_responses_request_to_chat(body: &Value, config: &BridgeConfig, sessions: 
         chat_body["tool_choice"] = tool_choice;
     }
 
-    if let Some(ptc) = body.get("parallel_tool_calls") {
+    // Only forward these when they carry the type the JS checked for; anything
+    // else was `undefined` and therefore absent from the upstream body.
+    if let Some(ptc) = body.get("parallel_tool_calls").filter(|v| v.is_boolean()) {
         chat_body["parallel_tool_calls"] = ptc.clone();
     }
 
-    if let Some(max) = body.get("max_output_tokens") {
-        if let Some(n) = max.as_u64() {
-            chat_body["max_tokens"] = Value::Number(n.into());
-        }
+    if let Some(max) = body.get("max_output_tokens").filter(|v| v.is_number()) {
+        chat_body["max_tokens"] = max.clone();
     }
 
-    if let Some(temp) = body.get("temperature") {
+    if let Some(temp) = body.get("temperature").filter(|v| v.is_number()) {
         chat_body["temperature"] = temp.clone();
     }
 
@@ -655,19 +856,14 @@ fn map_chat_response_to_responses(body: &Value, request_body: &Value, fallback_m
         .or(fallback_model)
         .unwrap_or("");
 
+    // `resp_${chat.id.replace(/^resp_/, "")}` — an id that already carries the
+    // prefix is not doubled up. A blank id falls through to a fresh uuid.
     let response_id = chat
         .get("id")
         .and_then(|v| v.as_str())
-        .map(|id| {
-            if id.starts_with("resp_") {
-                format!("resp_{}", &id[5..])
-            } else {
-                format!("resp_{id}")
-            }
-        })
-        .unwrap_or_else(|| {
-            format!("resp_{}", Uuid::new_v4().as_simple())
-        });
+        .filter(|id| !id.is_empty())
+        .map(|id| format!("resp_{}", id.strip_prefix("resp_").unwrap_or(id)))
+        .unwrap_or_else(|| format!("resp_{}", Uuid::new_v4().as_simple()));
 
     let created_at = chat
         .get("created")
@@ -687,34 +883,23 @@ fn map_chat_response_to_responses(body: &Value, request_body: &Value, fallback_m
         .and_then(|v| v.as_u64())
         .unwrap_or(input_tokens + output_tokens);
 
-    // Collect tool call outputs
-    let tool_call_outputs: Vec<Value> = assistant_message
+    // Tool calls the upstream asked for, surfaced as Responses output items.
+    let tool_call_outputs = assistant_message
         .and_then(|m| m.get("tool_calls"))
         .and_then(|tc| tc.as_array())
         .map(|arr| {
-            arr.iter()
-                .filter_map(|tc| {
-                    let id = tc.get("id").and_then(|v| v.as_str())?;
-                    let name = tc
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|n| n.as_str())?;
-                    let args = tc
-                        .get("function")
-                        .and_then(|f| f.get("arguments"))
-                        .and_then(|a| a.as_str())
-                        .unwrap_or("{}");
-                    Some(json!({
-                        "id": id,
-                        "type": "function_call",
-                        "call_id": id,
-                        "name": name,
-                        "arguments": args,
-                    }))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+            arr.iter().filter_map(|tc| {
+                let id = tc.get("id").and_then(|v| v.as_str())?;
+                let name = tc.pointer("/function/name").and_then(|n| n.as_str())?;
+                Some(json!({
+                    "id": id,
+                    "type": "function_call",
+                    "call_id": id,
+                    "name": name,
+                    "arguments": tool_arguments(tc.pointer("/function/arguments")),
+                }))
+            })
+        });
 
     let mut output = vec![json!({
         "id": format!("msg_{}", Uuid::new_v4().as_simple()),
@@ -727,7 +912,9 @@ fn map_chat_response_to_responses(body: &Value, request_body: &Value, fallback_m
             "annotations": [],
         }],
     })];
-    output.extend(tool_call_outputs);
+    if let Some(items) = tool_call_outputs {
+        output.extend(items);
+    }
 
     let mut response = json!({
         "id": response_id,
@@ -744,14 +931,12 @@ fn map_chat_response_to_responses(body: &Value, request_body: &Value, fallback_m
         },
     });
 
-    if let Some(temp) = request_body.get("temperature") {
+    if let Some(temp) = request_body.get("temperature").filter(|v| v.is_number()) {
         response["temperature"] = temp.clone();
     }
 
     response
 }
-
-
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
@@ -761,16 +946,12 @@ pub async fn build_bridge_state(state: &AppState) -> BridgeState {
     let logs = state.logs.read().await.clone();
     let client_keys = state.client_keys.read().await.clone();
     let mut stats = state.stats.read().await.clone();
+    // `uptimeMs` and `activeModelCount` are derived, never stored; the rest of
+    // the snapshot is already current.
     stats.uptime_ms = state.started_at.elapsed().as_millis() as u64;
     stats.active_model_count = config.models.len();
-    stats.local_base_url = {
-        let s = state.stats.read().await;
-        s.local_base_url.clone()
-    };
-    stats.server_running = {
-        let s = state.stats.read().await;
-        s.server_running
-    };
+    stats.last_request_at = logs.first().map(|entry| entry.timestamp.clone());
+
     BridgeState {
         config,
         stats,
@@ -962,29 +1143,27 @@ async fn forward_request(
     let config = state.config.read().await.clone();
     let started = std::time::Instant::now();
 
-    // Build ordered account list: active first, then the rest
-    let accounts = {
-        let mut list: Vec<UpstreamAccount> = Vec::new();
-        if let Some(active) = get_active_account(&config) {
-            list.push(active.clone());
-            for acct in &config.accounts {
-                if acct.id != active.id {
-                    list.push(acct.clone());
-                }
-            }
-        } else {
-            list = config.accounts.clone();
+    // Ordered candidate list: active account first, then the rest. Accounts
+    // without credentials can never succeed, so they are dropped up front —
+    // that also keeps `is_last` honest, otherwise a genuine failure on the
+    // second-to-last account would fall through to the generic "no accounts"
+    // error and the real upstream status would be lost.
+    let accounts: Vec<&UpstreamAccount> = {
+        let usable = |a: &&UpstreamAccount| !a.api_key.is_empty() && !a.base_url.is_empty();
+        match get_active_account(&config) {
+            Some(active) => std::iter::once(active)
+                .chain(config.accounts.iter().filter(|a| a.id != active.id))
+                .filter(usable)
+                .collect(),
+            None => config.accounts.iter().filter(usable).collect(),
         }
-        list
     };
 
     let model = body.and_then(extract_model);
+    let last_index = accounts.len().saturating_sub(1);
 
-    for account in &accounts {
-        // Skip accounts without credentials
-        if account.api_key.is_empty() || account.base_url.is_empty() {
-            continue;
-        }
+    for (index, account) in accounts.iter().enumerate() {
+        let is_last = index == last_index;
 
         let result = if account.provider == AccountProvider::V0 {
             forward_v0_request(account, upstream_path, method, body).await
@@ -995,57 +1174,54 @@ async fn forward_request(
         match result {
             Ok((status, ct, resp_body)) => {
                 let duration = started.elapsed().as_millis() as u64;
-                let is_success = status >= 200 && status < 300;
+                let is_success = (200..300).contains(&status);
 
-                record_request(
+                record_log(
                     &state.logs,
-                    &state.stats,
                     method,
                     upstream_path,
                     status,
                     model.clone(),
                     duration,
                     None,
-                    is_success,
                 )
                 .await;
 
                 if is_success {
+                    count_request(&state.stats, true).await;
                     mark_account_used(state, &account.id).await;
                     return (status, ct, resp_body);
                 }
 
-                let should_failover = should_failover(status, &resp_body);
-                let is_last = account.id == accounts.last().map(|a| a.id.as_str()).unwrap_or("");
-
-                if !should_failover || is_last {
+                if !should_failover(status, &resp_body) || is_last {
+                    count_request(&state.stats, false).await;
                     return (status, ct, resp_body);
                 }
-                // Continue to next account
+                // Otherwise fall through and try the next account.
             }
             Err(e) => {
-                let is_last = account.id == accounts.last().map(|a| a.id.as_str()).unwrap_or("");
-                if is_last {
-                    let duration = started.elapsed().as_millis() as u64;
-                    record_request(
-                        &state.logs,
-                        &state.stats,
-                        method,
-                        upstream_path,
-                        502,
-                        model.clone(),
-                        duration,
-                        Some(e.clone()),
-                        false,
-                    )
-                    .await;
-                    return (
-                        502,
-                        "application/json".into(),
-                        json!({"error": {"message": e, "type": "bridge_upstream_error"}}),
-                    );
+                if !is_last {
+                    continue;
                 }
-                // Try next account
+
+                let duration = started.elapsed().as_millis() as u64;
+                record_log(
+                    &state.logs,
+                    method,
+                    upstream_path,
+                    502,
+                    model.clone(),
+                    duration,
+                    Some(e.clone()),
+                )
+                .await;
+                count_request(&state.stats, false).await;
+
+                return (
+                    502,
+                    "application/json".into(),
+                    json!({"error": {"message": e, "type": "bridge_upstream_error"}}),
+                );
             }
         }
     }
@@ -1065,15 +1241,9 @@ async fn forward_openai_compatible_request(
     body: Option<&Value>,
 ) -> Result<(u16, String, Value), String> {
     let url = format!("{}{upstream_path}", account.base_url);
-
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(UPSTREAM_TIMEOUT_SECS))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| format!("Failed to build client: {e}"))?;
+    let client = &*UPSTREAM_CLIENT;
 
     let mut req = match method {
-        "GET" => client.get(&url),
         "POST" => client.post(&url),
         "DELETE" => client.delete(&url),
         _ => client.get(&url),
@@ -1098,17 +1268,10 @@ async fn forward_openai_compatible_request(
 
     let text = resp.text().await.map_err(|e| format!("Failed to read response: {e}"))?;
 
-    // Handle redirects manually — don't follow, return as-is
-    if status >= 300 && status < 400 {
-        return Ok((
-            status,
-            content_type,
-            json!({"error": {"message": "Redirect received", "type": "bridge_redirect", "location": text}}),
-        ));
-    }
-
+    // Non-JSON (or empty) upstream payloads stay raw text, exactly as the JS
+    // kept `text` when the content-type wasn't JSON.
     let parsed: Value = if content_type.contains("application/json") && !text.is_empty() {
-        serde_json::from_str(&text).unwrap_or(Value::String(text.clone()))
+        serde_json::from_str(&text).unwrap_or(Value::String(text))
     } else {
         Value::String(text)
     };
@@ -1154,27 +1317,17 @@ async fn forward_v0_request(
         .filter(|m| V0_MODELS.contains(m))
         .unwrap_or(V0_MODELS[0]);
 
-    // Extract message text from chat messages
+    // Flatten the chat transcript into v0's single `message` field, matching
+    // `extractV0Message` (bridgeServer.ts:1431-1449) — structured content parts
+    // are reduced to their text, not dumped as raw JSON.
     let message = request_body
         .get("messages")
         .and_then(|m| m.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|msg| {
-                    let role = msg
-                        .get("role")
-                        .and_then(|r| r.as_str())
-                        .unwrap_or("user");
-                    let content = msg
-                        .get("content")
-                        .map(|c| {
-                            if let Some(s) = c.as_str() {
-                                s.to_string()
-                            } else {
-                                c.to_string()
-                            }
-                        })
-                        .unwrap_or_default();
+                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                    let content = stringify_content(msg.get("content").unwrap_or(&Value::Null));
                     if content.is_empty() {
                         None
                     } else {
@@ -1197,10 +1350,7 @@ async fn forward_v0_request(
         },
     });
 
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(UPSTREAM_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("Failed to build client: {e}"))?;
+    let client = &*UPSTREAM_CLIENT;
 
     let resp = client
         .post(&url)
@@ -1227,14 +1377,18 @@ async fn forward_v0_request(
         return Ok((status_code, ct, raw));
     }
 
-    // Map v0 response to OpenAI chat format
+    // Map v0 response to OpenAI chat format. `extractV0Text` trims and only
+    // accepts non-blank text before falling through to the placeholder.
     let chat_text = raw
         .get("text")
         .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
         .or_else(|| {
-            raw.get("latestVersion")
-                .and_then(|lv| lv.get("text"))
+            raw.pointer("/latestVersion/text")
                 .and_then(|t| t.as_str())
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
         })
         .unwrap_or("v0 completed the request.");
 
@@ -1245,20 +1399,24 @@ async fn forward_v0_request(
         }
     }
     if let Some(files) = raw.pointer("/latestVersion/files").and_then(|f| f.as_array()) {
-        let names: Vec<String> = files
+        let names: Vec<&str> = files
             .iter()
-            .filter_map(|f| f.get("name").and_then(|n| n.as_str()).map(String::from))
+            .filter_map(|f| f.get("name").and_then(|n| n.as_str()))
             .take(20)
             .collect();
         if !names.is_empty() {
-            lines.push(format!(
-                "\nGenerated files:\n{}",
-                names.iter().map(|n| format!("- {n}")).collect::<Vec<_>>().join("\n")
-            ));
+            let list = names
+                .iter()
+                .map(|n| format!("- {n}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            lines.push(format!("\nGenerated files:\n{list}"));
         }
     }
 
-    let content = lines.join("");
+    // The JS joins these sections with "\n"; each appended section already
+    // carries its own leading newline.
+    let content = lines.join("\n");
     let created = Utc::now().timestamp() as u64;
     let id = raw
         .get("id")
@@ -1291,32 +1449,37 @@ async fn forward_v0_request(
 
 // ─── Agent loop for Responses API ───────────────────────────────────────────
 
+/// A locally executed tool call plus its output, as Responses output items.
+struct StreamToolItem {
+    call: Value,
+    output: Value,
+}
+
 /// Run the agent loop: forward to chat, execute local tools, repeat.
+///
+/// Returns the final upstream triple plus the tool call/output items produced
+/// along the way, which the streaming writer replays as output events
+/// (`pendingStreamToolItems`, bridgeServer.ts:650-666).
 async fn run_responses_agent_loop(
     state: &AppState,
     initial_chat_body: Value,
     request_body: &Value,
-    sessions: &RwLock<HashMap<String, Vec<Value>>>,
-) -> (u16, String, Value) {
-    let mut chat_body = initial_chat_body.clone();
-    let mut accumulated_items: Vec<Value> = merge_conversation_input(request_body, &*sessions.read().await)
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+) -> (u16, String, Value, Vec<StreamToolItem>) {
+    let mut chat_body = initial_chat_body;
+    let mut stream_tool_items: Vec<StreamToolItem> = Vec::new();
 
     for _turn in 0..MAX_AGENT_TURNS {
-        let proxied = forward_request(state, "/v1/chat/completions", "POST", Some(&chat_body)).await;
+        let (status, ct, resp_body) =
+            forward_request(state, "/v1/chat/completions", "POST", Some(&chat_body)).await;
 
-        let is_json = proxied.1.contains("application/json");
-        let is_success = proxied.0 >= 200 && proxied.0 < 300;
+        let is_json = ct.contains("application/json");
+        let is_success = (200..300).contains(&status);
 
         if !is_json || !is_success {
-            return proxied;
+            return (status, ct, resp_body, stream_tool_items);
         }
 
-        // Check for tool calls
-        let response_message = proxied
-            .2
+        let response_message = resp_body
             .get("choices")
             .and_then(|c| c.as_array())
             .and_then(|a| a.first())
@@ -1329,121 +1492,103 @@ async fn run_responses_agent_loop(
             .unwrap_or_default();
 
         if tool_calls.is_empty() {
-            return proxied;
+            return (status, ct, resp_body, stream_tool_items);
         }
 
-        // Check if any local tool names are supported
-        let available_tools = request_body
+        // Only intercept tool calls the *client* declared as functions we can
+        // run locally. Responses-format tools carry `name` at the top level;
+        // chat-format tools nest it under `function` — accept both so a client
+        // posting either shape is handled (bridgeServer.ts:580-600).
+        let declares_local_tool = request_body
             .get("tools")
             .and_then(|t| t.as_array())
-            .cloned()
-            .unwrap_or_default();
+            .map(|tools| {
+                tools.iter().any(|tool| {
+                    let name = tool
+                        .get("name")
+                        .or_else(|| tool.pointer("/function/name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("");
+                    is_shell_tool_name(name) || is_file_tool_name(name)
+                })
+            })
+            .unwrap_or(false);
 
-        let supports_local = available_tools.iter().any(|tool| {
-            let name = tool
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap_or("");
-            is_shell_tool_name(name) || is_file_tool_name(name)
-        });
-
-        if !supports_local {
-            return proxied;
+        if !declares_local_tool {
+            return (status, ct, resp_body, stream_tool_items);
         }
 
-        // Execute each tool call locally
-        let mut tool_outputs: Vec<Value> = Vec::new();
-        let mut tool_output_items: Vec<Value> = Vec::new();
+        let mut tool_messages: Vec<Value> = Vec::new();
         let mut fatal_tool_error = false;
 
         for tc in &tool_calls {
             let tool_name = tc
-                .get("function")
-                .and_then(|f| f.get("name"))
+                .pointer("/function/name")
                 .and_then(|n| n.as_str())
                 .unwrap_or("");
-            let tc_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            let Some(tc_id) = tc.get("id").and_then(|i| i.as_str()).filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
             let args = tc
-                .get("function")
-                .and_then(|f| f.get("arguments"))
+                .pointer("/function/arguments")
                 .and_then(|a| a.as_str())
                 .unwrap_or("{}");
 
-            if tc_id.is_empty() {
+            if !is_shell_tool_name(tool_name) && !is_file_tool_name(tool_name) {
                 continue;
             }
 
-            if is_shell_tool_name(tool_name) || is_file_tool_name(tool_name) {
-                let (result, fatal) = execute_tool_call(tool_name, args).await;
-                if fatal {
-                    fatal_tool_error = true;
-                }
-                tool_outputs.push(json!({
-                    "role": "tool",
-                    "tool_call_id": tc_id,
-                    "content": serde_json::to_string(&result).unwrap_or_default(),
-                }));
-                tool_output_items.push(json!({
+            let (result, fatal) = execute_tool_call(tool_name, args).await;
+            fatal_tool_error |= fatal;
+
+            let output = serde_json::to_string(&result).unwrap_or_default();
+            tool_messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "content": output,
+            }));
+            stream_tool_items.push(StreamToolItem {
+                call: json!({
+                    "id": tc_id,
+                    "type": "function_call",
+                    "call_id": tc_id,
+                    "name": tool_name,
+                    "arguments": args,
+                    "status": "completed",
+                }),
+                output: json!({
+                    "id": format!("fco_{}", sanitize_item_id(tc_id)),
                     "type": "function_call_output",
                     "call_id": tc_id,
-                    "output": serde_json::to_string(&result).unwrap_or_default(),
-                }));
-            }
+                    "output": output,
+                    "status": "completed",
+                }),
+            });
         }
 
-        if tool_outputs.is_empty() || fatal_tool_error {
-            return proxied;
+        // Nothing ran, or a tool failed unrecoverably: hand the model's own
+        // response back rather than looping on a dead end.
+        if tool_messages.is_empty() || fatal_tool_error {
+            return (status, ct, resp_body, stream_tool_items);
         }
 
-        // Append accumulated items
-        let assistant_tool_items: Vec<Value> = tool_calls
-            .iter()
-            .map(|tc| {
-                json!({
-                    "type": "function_call",
-                    "id": tc.get("id").and_then(|i| i.as_str()).unwrap_or(""),
-                    "call_id": tc.get("id").and_then(|i| i.as_str()).unwrap_or(""),
-                    "name": tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("tool"),
-                    "arguments": tc.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()).unwrap_or("{}"),
-                })
-            })
-            .collect();
-
-        accumulated_items.extend(assistant_tool_items);
-        accumulated_items.extend(tool_output_items.clone());
-
-        // Build next chat body with appended messages
         let assistant_message = json!({
             "role": "assistant",
-            "content": response_message.and_then(|m| m.get("content")).and_then(|c| c.as_str()).unwrap_or(""),
+            "content": response_message
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or(""),
             "tool_calls": tool_calls,
         });
 
-        // Convert tool_output_items to chat format
-        let tool_chat_messages: Vec<Value> = tool_output_items
-            .iter()
-            .map(|item| {
-                json!({
-                    "role": "tool",
-                    "tool_call_id": item.get("call_id").and_then(|v| v.as_str()).unwrap_or(""),
-                    "content": item.get("output").and_then(|v| v.as_str()).unwrap_or(""),
-                })
-            })
-            .collect();
-
-        let mut messages = chat_body
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let Some(messages) = chat_body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+            return (status, ct, resp_body, stream_tool_items);
+        };
         messages.push(assistant_message);
-        messages.extend(tool_chat_messages);
-
-        chat_body["messages"] = Value::Array(messages);
+        messages.append(&mut tool_messages);
     }
 
-    // Exceeded max turns
     (
         400,
         "application/json".into(),
@@ -1451,7 +1596,16 @@ async fn run_responses_agent_loop(
             "message": "Agent loop exceeded maximum shell tool turns.",
             "type": "bridge_agent_loop_error",
         }}),
+        stream_tool_items,
     )
+}
+
+/// Strip characters the Responses item-id grammar rejects, mirroring the JS
+/// `replace(/[^a-zA-Z0-9_-]/g, "")`.
+fn sanitize_item_id(id: &str) -> String {
+    id.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect()
 }
 
 // ─── axum Handlers ──────────────────────────────────────────────────────────
@@ -1469,11 +1623,19 @@ async fn health_handler(AxumState(state): AxumState<ServerState>) -> Json<Value>
     }))
 }
 
-async fn stats_handler(AxumState(state): AxumState<ServerState>) -> Json<Value> {
+async fn stats_handler(AxumState(state): AxumState<ServerState>) -> Json<BridgeStats> {
     let mut stats = state.stats.read().await.clone();
     stats.uptime_ms = state.started_at.elapsed().as_millis() as u64;
     stats.active_model_count = state.config.read().await.models.len();
-    Json(serde_json::to_value(&stats).unwrap_or(json!({})))
+    // `getStats` reads `logs[0].timestamp` (bridgeServer.ts:97) — the newest
+    // entry, since logs are stored newest-first.
+    stats.last_request_at = state
+        .logs
+        .read()
+        .await
+        .first()
+        .map(|entry| entry.timestamp.clone());
+    Json(stats)
 }
 
 async fn logs_handler(AxumState(state): AxumState<ServerState>) -> Json<Value> {
@@ -1481,8 +1643,10 @@ async fn logs_handler(AxumState(state): AxumState<ServerState>) -> Json<Value> {
     Json(json!({"data": logs}))
 }
 
+/// `/v1` is a 404 with express's default `{ detail }` body, not the OpenAI
+/// error envelope (bridgeServer.ts:145-147).
 async fn v1_index_handler() -> Response {
-    json_error(StatusCode::NOT_FOUND, "Not Found", "bridge_not_found")
+    (StatusCode::NOT_FOUND, Json(json!({"detail": "Not Found"}))).into_response()
 }
 
 async fn v1_models_handler(AxumState(state): AxumState<ServerState>) -> Response {
@@ -1502,8 +1666,12 @@ async fn v1_models_handler(AxumState(state): AxumState<ServerState>) -> Response
 
 async fn chat_completions_handler(
     AxumState(state): AxumState<ServerState>,
-    Json(mut body): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    let mut body = match json_body_or_error(body) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     {
         let config = state.config.read().await;
         if !has_configured_upstream(&config) {
@@ -1519,26 +1687,30 @@ async fn chat_completions_handler(
     let model = extract_model(&body);
     let (status, ct, resp_body) =
         forward_request(&state, "/v1/chat/completions", "POST", Some(&body)).await;
-    let response = build_upstream_response(status, &ct, &resp_body);
 
-    // Attach model to most-recent log entry for error cases
+    // On failure the log entry carries the upstream path's model, which for an
+    // error response may be missing — backfill from the request
+    // (`writeResponse`, bridgeServer.ts:1548-1551).
     if status >= 400 {
         if let Some(m) = model {
-            let mut logs = state.logs.write().await;
-            if let Some(entry) = logs.first_mut() {
+            if let Some(entry) = state.logs.write().await.first_mut() {
                 entry.model = Some(m);
             }
         }
     }
 
-    response
+    build_upstream_response(status, &ct, &resp_body)
 }
 
 async fn responses_handler(
     AxumState(state): AxumState<ServerState>,
-    Json(request_body): Json<Value>,
+    request_body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
-    {
+    let request_body = match json_body_or_error(request_body) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let chat_body = {
         let config = state.config.read().await;
         if !has_configured_upstream(&config) {
             return json_error(
@@ -1547,102 +1719,87 @@ async fn responses_handler(
                 "bridge_config_error",
             );
         }
-    }
-
-    let chat_body = {
-        let config = state.config.read().await;
-        let mut body = map_responses_request_to_chat(&request_body, &config, &*get_or_init_sessions().read().await);
+        let mut body = map_responses_request_to_chat(&request_body, &config, &*SESSIONS.read().await);
         apply_model_defaults(&mut body, &config);
         body
     };
 
-    let (status, ct, resp_body) =
-        run_responses_agent_loop(&state, chat_body.clone(), &request_body, get_or_init_sessions()).await;
+    let model = extract_model(&chat_body);
+    let (status, ct, resp_body, stream_tool_items) =
+        run_responses_agent_loop(&state, chat_body, &request_body).await;
 
-    let is_json = ct.contains("application/json");
-    let is_success = status >= 200 && status < 400;
-
-    if is_json && is_success {
-        let model = extract_model(&chat_body);
-        let translated =
-            map_chat_response_to_responses(&resp_body, &request_body, model.as_deref());
-
-        // Store session
-        {
-            let response_id = translated
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let mut sessions = get_or_init_sessions().write().await;
-
-            // Collect input items
-            let current_input = request_body
-                .get("input")
-                .map(|input| {
-                    if let Some(arr) = input.as_array() {
-                        arr.iter()
-                            .filter(|i| i.is_object())
-                            .cloned()
-                            .collect::<Vec<_>>()
-                    } else if let Some(s) = input.as_str() {
-                        vec![json!({"role": "user", "content": s})]
-                    } else {
-                        vec![]
-                    }
-                })
-                .unwrap_or_default();
-
-            let output_items: Vec<Value> = translated
-                .get("output")
-                .and_then(|o| o.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter(|i| i.is_object())
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let prev_id = request_body
-                .get("previous_response_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let previous_items = if !prev_id.is_empty() {
-                sessions.get(prev_id).cloned().unwrap_or_default()
-            } else {
-                vec![]
-            };
-
-            let mut all_items = previous_items;
-            all_items.extend(current_input);
-            all_items.extend(output_items);
-
-            if !response_id.is_empty() {
-                sessions.insert(response_id, all_items);
-            }
-
-            // Evict oldest if over limit
-            if sessions.len() > RESPONSES_SESSION_LIMIT {
-                if let Some(oldest) = sessions.keys().next().cloned() {
-                    sessions.remove(&oldest);
+    // Anything that isn't a successful JSON chat completion is relayed as-is;
+    // only a real completion can be translated to the Responses shape.
+    if !ct.contains("application/json") || status >= 400 {
+        if status >= 400 {
+            if let Some(m) = model {
+                if let Some(entry) = state.logs.write().await.first_mut() {
+                    entry.model = Some(m);
                 }
             }
         }
-
-        let wants_stream = request_body
-            .get("stream")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        if wants_stream {
-            return build_sse_response(&translated);
-        }
-
-        return build_upstream_response(status, &ct, &translated);
+        return build_upstream_response(status, &ct, &resp_body);
     }
 
-    build_upstream_response(status, &ct, &resp_body)
+    let translated = map_chat_response_to_responses(&resp_body, &request_body, model.as_deref());
+
+    store_responses_session(&request_body, &translated).await;
+
+    // `Boolean(requestBody.stream)` is a truthiness test, not a strict bool
+    // check — a client sending `1` or `"true"` still wants SSE.
+    let wants_stream = is_truthy(request_body.get("stream"));
+
+    if wants_stream {
+        return build_sse_response(&translated, &stream_tool_items);
+    }
+
+    build_upstream_response(status, &ct, &translated)
+}
+
+/// Remember the conversation behind a response id so `previous_response_id`
+/// can replay it. Port of `storeResponsesSession` (bridgeServer.ts:973-994).
+async fn store_responses_session(request_body: &Value, translated: &Value) {
+    let Some(response_id) = translated
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+
+    let current_input: Vec<Value> = request_body
+        .get("input")
+        .map(|input| {
+            if let Some(arr) = input.as_array() {
+                arr.iter().filter(|i| i.is_object()).cloned().collect()
+            } else if let Some(s) = input.as_str() {
+                vec![json!({"role": "user", "content": s})]
+            } else {
+                vec![]
+            }
+        })
+        .unwrap_or_default();
+
+    let output_items: Vec<Value> = translated
+        .get("output")
+        .and_then(|o| o.as_array())
+        .map(|arr| arr.iter().filter(|i| i.is_object()).cloned().collect())
+        .unwrap_or_default();
+
+    let prev_id = request_body
+        .get("previous_response_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let mut sessions = SESSIONS.write().await;
+    let mut all_items = if prev_id.is_empty() {
+        Vec::new()
+    } else {
+        sessions.get(prev_id).cloned().unwrap_or_default()
+    };
+    all_items.extend(current_input);
+    all_items.extend(output_items);
+    sessions.insert(response_id.to_string(), all_items);
 }
 
 // ─── Response builders ──────────────────────────────────────────────────────
@@ -1660,11 +1817,15 @@ fn build_upstream_response(status: u16, content_type: &str, body: &Value) -> Res
 }
 
 /// Build an SSE response for the Responses streaming format.
-fn build_sse_response(response_body: &Value) -> Response {
-    let id = response_body
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+///
+/// Port of `writeResponsesStream` (bridgeServer.ts:996-1157). Two deliberate
+/// deviations from the JS, both places where the original contradicts itself:
+/// `sequence_number` increments in emission order (the JS numbered the trailing
+/// events before building the tool events, so its stream was non-monotonic),
+/// and each tool call/output pair gets its own `output_index` (the JS reused
+/// `index + 1` and `index + 2`, so consecutive tool calls collided).
+fn build_sse_response(response_body: &Value, tool_items: &[StreamToolItem]) -> Response {
+    let id = response_body.get("id").and_then(|v| v.as_str()).unwrap_or("");
     let object = response_body
         .get("object")
         .and_then(|v| v.as_str())
@@ -1677,22 +1838,38 @@ fn build_sse_response(response_body: &Value) -> Response {
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-
     let output_text = response_body
         .get("output_text")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let item_id = format!("msg_{}", Uuid::new_v4().as_simple());
-    let mut seq: u64 = 1;
+    // Reuse the id of the message item already in `output` so the streamed
+    // item and the final response agree; only synthesize one if it's absent.
+    let item_id = response_body
+        .get("output")
+        .and_then(|o| o.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|item| item.get("type").and_then(|t| t.as_str()) == Some("message"))
+        })
+        .and_then(|item| item.get("id"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| format!("msg_{}", Uuid::new_v4().as_simple()));
 
+    let content_part = json!({
+        "type": "output_text",
+        "text": output_text,
+        "annotations": [],
+    });
+
+    let mut seq: u64 = 1;
     let mut events: Vec<String> = Vec::new();
 
-    // response.created
     events.push(sse_event(
         "response.created",
         &mut seq,
-        &json!({
+        json!({
             "type": "response.created",
             "response": {
                 "id": id,
@@ -1706,11 +1883,59 @@ fn build_sse_response(response_body: &Value) -> Response {
         }),
     ));
 
-    // response.output_item.added (message)
+    // Locally executed tool calls, replayed before the assistant message.
+    for (index, tool_item) in tool_items.iter().enumerate() {
+        let call_index = 1 + 2 * index;
+        let output_index = call_index + 1;
+
+        let mut in_progress_call = tool_item.call.clone();
+        in_progress_call["status"] = json!("in_progress");
+        events.push(sse_event(
+            "response.output_item.added",
+            &mut seq,
+            json!({
+                "type": "response.output_item.added",
+                "output_index": call_index,
+                "item": in_progress_call,
+            }),
+        ));
+        events.push(sse_event(
+            "response.output_item.done",
+            &mut seq,
+            json!({
+                "type": "response.output_item.done",
+                "output_index": call_index,
+                "item": tool_item.call,
+            }),
+        ));
+
+        let mut in_progress_output = tool_item.output.clone();
+        in_progress_output["status"] = json!("in_progress");
+        in_progress_output["output"] = json!("");
+        events.push(sse_event(
+            "response.output_item.added",
+            &mut seq,
+            json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": in_progress_output,
+            }),
+        ));
+        events.push(sse_event(
+            "response.output_item.done",
+            &mut seq,
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": tool_item.output,
+            }),
+        ));
+    }
+
     events.push(sse_event(
         "response.output_item.added",
         &mut seq,
-        &json!({
+        json!({
             "type": "response.output_item.added",
             "output_index": 0,
             "item": {
@@ -1723,11 +1948,10 @@ fn build_sse_response(response_body: &Value) -> Response {
         }),
     ));
 
-    // response.content_part.added
     events.push(sse_event(
         "response.content_part.added",
         &mut seq,
-        &json!({
+        json!({
             "type": "response.content_part.added",
             "item_id": item_id,
             "output_index": 0,
@@ -1740,11 +1964,10 @@ fn build_sse_response(response_body: &Value) -> Response {
         }),
     ));
 
-    // response.output_text.delta
     events.push(sse_event(
         "response.output_text.delta",
         &mut seq,
-        &json!({
+        json!({
             "type": "response.output_text.delta",
             "item_id": item_id,
             "output_index": 0,
@@ -1753,11 +1976,10 @@ fn build_sse_response(response_body: &Value) -> Response {
         }),
     ));
 
-    // response.output_text.done
     events.push(sse_event(
         "response.output_text.done",
         &mut seq,
-        &json!({
+        json!({
             "type": "response.output_text.done",
             "item_id": item_id,
             "output_index": 0,
@@ -1766,28 +1988,22 @@ fn build_sse_response(response_body: &Value) -> Response {
         }),
     ));
 
-    // response.content_part.done
     events.push(sse_event(
         "response.content_part.done",
         &mut seq,
-        &json!({
+        json!({
             "type": "response.content_part.done",
             "item_id": item_id,
             "output_index": 0,
             "content_index": 0,
-            "part": {
-                "type": "output_text",
-                "text": output_text,
-                "annotations": [],
-            }
+            "part": content_part,
         }),
     ));
 
-    // response.output_item.done (message)
     events.push(sse_event(
         "response.output_item.done",
         &mut seq,
-        &json!({
+        json!({
             "type": "response.output_item.done",
             "output_index": 0,
             "item": {
@@ -1795,31 +2011,23 @@ fn build_sse_response(response_body: &Value) -> Response {
                 "type": "message",
                 "status": "completed",
                 "role": "assistant",
-                "content": [{
-                    "type": "output_text",
-                    "text": output_text,
-                    "annotations": [],
-                }],
+                "content": [content_part],
             }
         }),
     ));
 
-    // response.completed
     let mut completed_response = response_body.clone();
-    completed_response["completed_at"] = json!(Utc::now().timestamp() as u64);
+    completed_response["completed_at"] = json!(Utc::now().timestamp());
     events.push(sse_event(
         "response.completed",
         &mut seq,
-        &json!({
+        json!({
             "type": "response.completed",
             "response": completed_response,
         }),
     ));
 
-    // [DONE]
     events.push("data: [DONE]\n\n".to_string());
-
-    let body = events.join("");
 
     (
         StatusCode::OK,
@@ -1828,33 +2036,43 @@ fn build_sse_response(response_body: &Value) -> Response {
             (axum::http::header::CACHE_CONTROL, "no-cache, no-transform"),
             (axum::http::header::CONNECTION, "keep-alive"),
         ],
-        body,
+        events.concat(),
     )
         .into_response()
 }
 
-fn sse_event(event_type: &str, seq: &mut u64, data: &Value) -> String {
-    let num = *seq;
-    *seq += 1;
-    let mut obj = data.clone();
-    if let Some(map) = obj.as_object_mut() {
-        map.insert("sequence_number".to_string(), json!(num));
+fn sse_event(event_type: &str, seq: &mut u64, mut data: Value) -> String {
+    if let Some(map) = data.as_object_mut() {
+        map.insert("sequence_number".to_string(), json!(*seq));
     }
-    format!("event: {event_type}\ndata: {}\n\n", obj)
+    *seq += 1;
+    format!("event: {event_type}\ndata: {data}\n\n")
 }
 
 // ─── Server lifecycle ───────────────────────────────────────────────────────
 
-/// Start the bridge HTTP server. Blocks until shutdown signal.
-pub async fn start_bridge_server(state: Arc<AppState>) -> anyhow::Result<()> {
-    let config = state.config.read().await.clone();
+/// Signals the supervisor that the current listener should be torn down and a
+/// fresh one bound from the latest config. Safe to call when no server is up.
+pub async fn request_rebind() {
+    if let Some(tx) = SHUTDOWN_TX.lock().take() {
+        let _ = tx.send(());
+    }
+}
+
+/// Bind the listener once and serve until a rebind is requested.
+///
+/// Returns `Ok(())` on a graceful shutdown (rebind requested) so the supervisor
+/// knows to loop; returns `Err` only when binding or serving genuinely failed.
+async fn serve_once(state: Arc<AppState>) -> anyhow::Result<()> {
+    let (enable_cors, port) = {
+        let config = state.config.read().await;
+        (config.enable_cors, config.local_port)
+    };
+
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    *SHUTDOWN_TX.lock() = Some(shutdown_tx);
 
-    // Store shutdown sender for restart
-    *SHUTDOWN_TX.lock().unwrap() = Some(shutdown_tx);
-
-    let local_base_url;
-    let cors_layer = if config.enable_cors {
+    let cors_layer = if enable_cors {
         CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -1874,21 +2092,19 @@ pub async fn start_bridge_server(state: Arc<AppState>) -> anyhow::Result<()> {
         .layer(cors_layer)
         .with_state(state.clone());
 
-    // Try configured port, fallback to 0 (OS-assigned)
-    let port = config.local_port;
+    // Try the configured port; fall back to an OS-assigned one if taken.
     let listener = match TcpListener::bind(format!("127.0.0.1:{port}")).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            tracing::warn!("Port {port} in use, trying port 0");
+            tracing::warn!("Port {port} is in use; binding an OS-assigned port instead");
             TcpListener::bind("127.0.0.1:0").await?
         }
         Err(e) => return Err(e.into()),
     };
 
     let addr = listener.local_addr()?;
-    local_base_url = format!("http://localhost:{}", addr.port());
+    let local_base_url = format!("http://localhost:{}", addr.port());
 
-    // Update stats
     {
         let mut stats = state.stats.write().await;
         stats.local_base_url = local_base_url.clone();
@@ -1897,14 +2113,12 @@ pub async fn start_bridge_server(state: Arc<AppState>) -> anyhow::Result<()> {
 
     tracing::info!("Bridge server listening on {local_base_url}");
 
-    // Run the server until shutdown
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = shutdown_rx.await;
         })
         .await;
 
-    // Mark server stopped
     {
         let mut stats = state.stats.write().await;
         stats.server_running = false;
@@ -1913,10 +2127,22 @@ pub async fn start_bridge_server(state: Arc<AppState>) -> anyhow::Result<()> {
     result.map_err(|e| anyhow::anyhow!("Bridge server error: {e}"))
 }
 
-/// Restart the bridge server (shutdown + re-bind).
-pub async fn restart() -> anyhow::Result<()> {
-    if let Some(tx) = SHUTDOWN_TX.lock().unwrap().take() {
-        let _ = tx.send(());
-    }
-    Ok(())
+/// Spawn the supervising task that keeps the bridge listening for the whole
+/// process lifetime.
+///
+/// `serve_once` returns whenever a rebind is requested (config changed, port
+/// changed, explicit restart); the loop then re-binds from the current config.
+/// Without this loop a single restart would leave the port dead for the rest of
+/// the session.
+pub fn spawn_supervisor(state: Arc<AppState>) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if let Err(error) = serve_once(state.clone()).await {
+                tracing::error!("Bridge listener failed: {error}");
+                // Bind failures are usually transient (port still releasing).
+                // Back off briefly so a hard failure can't spin the CPU.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    });
 }
