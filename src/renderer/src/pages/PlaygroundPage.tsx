@@ -22,7 +22,6 @@ function PlaygroundPageComponent({
   playgroundModelsLoading,
   playgroundResult,
   setPlaygroundResult,
-  setPlaygroundModelsResult,
   playgroundLoading,
   onLoadPlaygroundModels,
   onRunPlayground,
@@ -44,7 +43,6 @@ function PlaygroundPageComponent({
   playgroundModelsLoading: boolean;
   playgroundResult: PlaygroundTestResult | null;
   setPlaygroundResult: (value: PlaygroundTestResult | null) => void;
-  setPlaygroundModelsResult: (value: PlaygroundModelsResult | null) => void;
   playgroundLoading: boolean;
   onLoadPlaygroundModels: () => void;
   onRunPlayground: () => void;

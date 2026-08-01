@@ -1,5 +1,5 @@
 import { memo } from "react";
-import { Avatar, Button } from "@heroui/react";
+import { Button } from "@heroui/react";
 import { Icon } from "@iconify/react";
 import { motion } from "framer-motion";
 

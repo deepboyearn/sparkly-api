@@ -1,5 +1,4 @@
 import { memo, useState } from "react";
-import { Chip } from "@heroui/react";
 import { Icon } from "@iconify/react";
 import type { BridgeConfig, BridgeState } from "../../../shared/types";
 import { maskKey } from "../appState";
@@ -352,16 +351,6 @@ function ApiKeysPageComponent({
     </>
   );
 }
-
-const ToastStyles = () => (
-  <style>{`
-    @keyframes slideInUp { 
-      from { transform: translate(-50%, 100%); opacity: 0; } 
-      to { transform: translate(-50%, 0); opacity: 1; } 
-    }
-    .toast-enter { animation: slideInUp 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
-  `}</style>
-);
 
 export const ApiKeysPage = memo(ApiKeysPageComponent, (prev, next) => {
   return prev.state === next.state

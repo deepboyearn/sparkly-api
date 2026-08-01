@@ -1,7 +1,0 @@
-{
-  "model": "gpt-image-1",
-  "prompt": "a highly detailed cinematic shot of a cute baby dog in a spaceship, futuristic style, neon lights, 4k",
-  "n": 1,
-  "size": "1024x1024",
-  "response_format": "url"
-}
