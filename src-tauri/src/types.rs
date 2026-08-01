@@ -1,0 +1,243 @@
+// src-tauri/src/types.rs
+// Shared type definitions — Rust equivalents of shared/types.ts
+// All agents implement against these types.
+
+use serde::{Deserialize, Serialize};
+
+// ─── Request/Response Logging ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestLogEntry {
+    pub id: String,
+    pub timestamp: String,
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+// ─── Config ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeConfig {
+    pub upstream_base_url: String,
+    pub api_key: String,
+    pub models: Vec<String>,
+    pub selected_model: String,
+    pub local_port: u16,
+    #[serde(default = "default_true")]
+    pub enable_cors: bool,
+    #[serde(default)]
+    pub system_prompt: String,
+    #[serde(default)]
+    pub accounts: Vec<UpstreamAccount>,
+    #[serde(default)]
+    pub active_account_id: String,
+}
+
+fn default_true() -> bool { true }
+
+// ─── Upstream Accounts ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpstreamAccount {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_provider")]
+    pub provider: AccountProvider,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_usage_tags")]
+    pub usage_tags: Vec<String>,
+    #[serde(default = "default_true")]
+    pub is_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+}
+
+fn default_provider() -> AccountProvider { AccountProvider::OpenaiCompatible }
+fn default_usage_tags() -> Vec<String> { vec!["coding".into()] }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccountProvider {
+    #[serde(rename = "openai-compatible")]
+    OpenaiCompatible,
+    #[serde(rename = "v0")]
+    V0,
+}
+
+pub const V0_BASE_URL: &str = "https://api.v0.dev/v1";
+pub const V0_MODELS: &[&str] = &["v0-auto", "v0-mini", "v0-pro", "v0-max", "v0-max-fast"];
+
+// ─── Client API Keys ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientApiKey {
+    pub id: String,
+    pub name: String,
+    pub key: String,
+    pub masked_key: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+    #[serde(default = "default_true")]
+    pub is_active: bool,
+}
+
+// ─── Stats ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeStats {
+    pub total_requests: u64,
+    pub success_count: u64,
+    pub error_count: u64,
+    pub active_model_count: usize,
+    pub last_request_at: Option<String>,
+    pub uptime_ms: u64,
+    pub local_base_url: String,
+    pub server_running: bool,
+}
+
+// ─── Combined State (returned to frontend) ───────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeState {
+    pub config: BridgeConfig,
+    pub stats: BridgeStats,
+    pub logs: Vec<RequestLogEntry>,
+    pub client_keys: Vec<ClientApiKey>,
+}
+
+// ─── Input Types (Tauri command arguments) ───────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateClientKeyInput { pub name: String }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateClientKeyInput { pub id: String, pub name: String }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteClientKeyInput { pub id: String }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateAccountInput {
+    pub name: String,
+    #[serde(default = "default_provider")]
+    pub provider: AccountProvider,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_usage_tags")]
+    pub usage_tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAccountInput {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_provider")]
+    pub provider: AccountProvider,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_usage_tags")]
+    pub usage_tags: Vec<String>,
+    #[serde(default = "default_true")]
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteAccountInput { pub id: String }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectAccountInput { pub id: String }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaygroundTestInput {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaygroundModelsInput {
+    pub base_url: String,
+    pub api_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaygroundTestResult {
+    pub ok: bool,
+    pub status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaygroundModelsResult {
+    pub ok: bool,
+    pub status: u16,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResetUsageInput { pub confirm: bool }
+
+// ─── Default config ──────────────────────────────────────────────────────────
+
+impl Default for BridgeConfig {
+    fn default() -> Self {
+        Self {
+            upstream_base_url: "https://api.bluesminds.com".into(),
+            api_key: String::new(),
+            models: vec![
+                "gpt-5.4".into(), "gpt-4.1".into(), "gpt-4.1-mini".into(),
+                "claude-sonnet-4-5".into(), "deepseek-reasoner".into(),
+                "deepseek-v3".into(), "qwen3.6-plus".into(),
+                "gemini-2.5-pro".into(), "o4-mini".into(), "o3".into(),
+            ],
+            selected_model: "gpt-5.4".into(),
+            local_port: 48231,
+            enable_cors: true,
+            system_prompt: String::new(),
+            accounts: vec![],
+            active_account_id: String::new(),
+        }
+    }
+}

@@ -2,59 +2,22 @@
   "name": "sparkly-api",
   "version": "1.2.0",
   "private": true,
-  "description": "Electron and React desktop app that exposes a local OpenAI-compatible bridge for configurable upstream providers.",
-  "main": "dist-electron/main/main.js",
+  "description": "Tauri + React local OpenAI-compatible bridge proxy and API dashboard.",
+  "type": "module",
   "scripts": {
-    "dev": "npm run dev:localhost",
-    "dev:localhost": "npm run build:electron && concurrently -k \"npm:dev:renderer\" \"npm:local-server\"",
-    "dev:renderer": "vite --strictPort --host 127.0.0.1",
-    "dev:electron": "npm run build:electron && wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .",
-    "electron:localhost": "cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 SPARKLY_USE_LOCALHOST_BRIDGE=1 electron .",
-    "local-server": "node dist-electron/main/localHost.js",
-    "build": "npm run build:renderer && npm run build:electron",
+    "dev": "tauri dev",
     "build:renderer": "vite build",
-    "build:electron": "tsc -p tsconfig.electron.json",
-    "start": "npm run build && electron .",
-    "dist:win": "node ./scripts/generate-icons.cjs && npm run build && electron-builder --win nsis portable"
-  },
-  "build": {
-    "appId": "com.sparklyapi.sparklyapi",
-    "productName": "Sparkly API",
-    "directories": {
-      "output": "release"
-    },
-    "files": [
-      "dist/**",
-      "dist-electron/**",
-      "node_modules/**",
-      "package.json",
-      "src/logo/**"
-    ],
-    "win": {
-      "target": [
-        "nsis",
-        "portable"
-      ],
-      "icon": "src/logo/logp.ico"
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true,
-      "shortcutName": "Sparkly API"
-    },
-    "portable": {
-      "artifactName": "Sparkly-API-Portable.exe"
-    }
+    "build": "vite build",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
   },
   "dependencies": {
     "@heroui/react": "^3.0.2",
     "@heroui/styles": "^3.0.2",
     "@iconify/react": "^6.0.2",
+    "@tauri-apps/api": "^2",
     "chart.js": "^4.5.1",
-    "cors": "^2.8.5",
-    "express": "^4.21.2",
     "framer-motion": "^12.38.0",
     "react": "^19.2.5",
     "react-chartjs-2": "^5.3.1",
@@ -62,20 +25,12 @@
     "tailwindcss": "^4.2.2"
   },
   "devDependencies": {
-    "@types/cors": "^2.8.17",
-    "@types/express": "^5.0.1",
+    "@tauri-apps/cli": "^2",
     "@types/node": "^22.13.10",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^4.3.4",
-    "concurrently": "^9.1.2",
-    "cross-env": "^7.0.3",
-    "electron": "^35.1.4",
-    "electron-builder": "^26.0.12",
-    "png-to-ico": "^3.0.1",
-    "sharp": "^0.34.5",
     "typescript": "^5.7.3",
-    "vite": "^6.2.1",
-    "wait-on": "^8.0.3"
+    "vite": "^6.2.1"
   }
 }

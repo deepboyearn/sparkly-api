@@ -1,0 +1,48 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegui/tauri/dev/crates/tauri-config-schema/schema.json",
+  "productName": "Sparkly API",
+  "version": "1.2.0",
+  "identifier": "com.sparklyapi.sparklyapi",
+  "build": {
+    "beforeDevCommand": "npx vite --strictPort --host 127.0.0.1",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeBuildCommand": "npm run build:renderer",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Sparkly API",
+        "width": 1400,
+        "height": 940,
+        "minWidth": 1100,
+        "minHeight": 760,
+        "center": true,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; connect-src 'self' http://127.0.0.1:*"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/logo.png",
+      "icons/logo.ico"
+    ],
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0"]
+      }
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "both",
+        "installerIcon": "icons/logo.ico"
+      }
+    }
+  }
+}

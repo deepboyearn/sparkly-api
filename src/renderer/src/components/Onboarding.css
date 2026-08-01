@@ -139,8 +139,14 @@
   display: block;
 }
 
+/* Plain accent colour. This class is also used by icons on the Playground page
+   (PlaygroundPage.tsx), so it must stay cheap — the animated gradient-shimmer
+   treatment below is scoped to the onboarding title only. */
 .text-accent {
-  font-family: 'Galada', cursive;
+  color: #f4b400;
+}
+
+.onboarding-title.text-accent {
   background: linear-gradient(90deg,
       #f4b400 0%,
       #fff 25%,
@@ -152,7 +158,6 @@
   background-clip: text;
   -webkit-text-fill-color: transparent;
   animation: shimmer 15s linear infinite;
-  filter: drop-shadow(0 0 30px rgba(244, 180, 0, 0.3));
 }
 
 @keyframes shimmer {
@@ -196,42 +201,44 @@
   transform: translateY(0) scale(1) !important;
 }
 
+/* Ambient background glows.
+   Previously three 900x900 elements with `filter: blur(140px)` animated by
+   `morph` + `rotate`. WebKitGTW re-runs that blur every frame over ~810k px
+   each, which alone can hold the compositor at single-digit FPS.
+   A radial-gradient produces the same soft glow with zero per-frame filter
+   work, and the animation is dropped. */
 .onboarding-bg-glow-1,
 .onboarding-bg-glow-2,
 .onboarding-bg-glow-3 {
   position: absolute;
   width: 900px;
   height: 900px;
-  border-radius: 40% 60% 70% 30% / 40% 50% 60% 50%;
-  filter: blur(140px);
+  border-radius: 50%;
   z-index: 1;
   opacity: 0.12;
   pointer-events: none;
-  animation: morph 20s linear infinite alternate, rotate 30s linear infinite;
 }
 
 .onboarding-bg-glow-1 {
-  background: var(--primary);
+  background: radial-gradient(circle closest-side, var(--primary), transparent);
   top: -400px;
   left: -400px;
 }
 
 .onboarding-bg-glow-2 {
-  background: #3b82f6;
+  background: radial-gradient(circle closest-side, #3b82f6, transparent);
   bottom: -400px;
   right: -400px;
-  animation-delay: -5s;
 }
 
 .onboarding-bg-glow-3 {
-  background: #f43f5e;
+  background: radial-gradient(circle closest-side, #f43f5e, transparent);
   top: 50%;
   left: 50%;
   width: 1000px;
   height: 1000px;
   transform: translate(-50%, -50%);
   opacity: 0.08;
-  animation-delay: -10s;
 }
 
 @keyframes morph {
