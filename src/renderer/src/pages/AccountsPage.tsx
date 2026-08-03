@@ -1,5 +1,5 @@
 import { memo } from "react";
-import { Icon } from "@iconify/react/offline";
+import { Icon } from "@iconify/react";
 import type { BridgeConfig, BridgeState, UpstreamAccount } from "../../../shared/types";
 import { maskKey } from "../appState";
 
@@ -25,7 +25,7 @@ function AccountsPageComponent({
   return (
     <>
       <section className="api-keys-summary admin-panel">
-        <div className="section-heading">
+        <div className="section-heading" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%" }}>
           <div className="summary-title-row">
             <span className="metric-chip blue">
               <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24">
@@ -98,7 +98,7 @@ function AccountsPageComponent({
                   <div className="meta-icon"><Icon icon="solar:server-square-cloud-bold-duotone" /></div>
                   <div className="meta-content">
                     <label>Provider</label>
-                    <strong>{account.provider === "v0" ? "v0 Platform API" : "OpenAI Compatible"}</strong>
+                    <strong>{account.provider === "v0" ? "v0 Platform API" : account.provider === "anthropic" ? "Anthropic" : "OpenAI Compatible"}</strong>
                   </div>
                 </div>
                 <div className="meta-item">

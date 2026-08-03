@@ -1,6 +1,6 @@
 import { memo } from "react";
-import { Button } from "@heroui/react";
-import { Icon } from "@iconify/react/offline";
+import { Button } from "./ui";
+import { Icon } from "@iconify/react";
 
 import type { SectionKey } from "./Sidebar";
 
@@ -50,6 +50,12 @@ const sectionMeta: Record<SectionKey, { title: string; description: string; icon
     description: "Man-in-the-Middle for Antigravity integration",
     buttonText: "",
     icon: "solar:shield-check-bold-duotone",
+  },
+  consoleLogs: {
+    title: "Console Logs",
+    description: "API calls and system events",
+    buttonText: "",
+    icon: "material-symbols:bug-report-rounded",
   },
 };
 
@@ -165,7 +171,7 @@ function HeaderComponent({
               gap: '10px'
             }}
             onPress={onReset}
-            isDisabled={saving}
+            disabled={saving}
           >
             <Icon icon="solar:trash-bin-trash-bold-duotone" style={{ fontSize: '18px', flexShrink: 0 }} />
             <span style={{ position: 'relative', top: '0px' }}>Reset Data</span>
@@ -191,7 +197,7 @@ function HeaderComponent({
               gap: '8px'
             }}
             onPress={onOpenElectron}
-            isDisabled={saving || !onOpenElectron}
+            disabled={saving || !onOpenElectron}
           >
             <Icon icon="solar:monitor-bold-duotone" style={{ fontSize: '18px', flexShrink: 0 }} />
             <span>Open Desktop</span>
@@ -217,7 +223,7 @@ function HeaderComponent({
               gap: '8px'
             }}
             onPress={onRestart}
-            isDisabled={saving}
+            disabled={saving}
           >
             <Icon icon="solar:restart-bold-duotone" style={{ fontSize: '18px', flexShrink: 0 }} />
             <span>Restart Server</span>
@@ -242,7 +248,7 @@ function HeaderComponent({
               boxShadow: '0 10px 24px rgba(244, 180, 0, 0.18)'
             }}
             onPress={onPrimaryAction}
-            isDisabled={primaryActionDisabled}
+            disabled={primaryActionDisabled}
           >
             <Icon icon={meta.icon} style={{ fontSize: '18px', flexShrink: 0 }} />
             <span>{meta.buttonText}</span>

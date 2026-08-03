@@ -1,4 +1,4 @@
-import { Icon } from "@iconify/react/offline";
+import { Icon } from "@iconify/react";
 import { memo } from "react";
 
 type UsageRecord = {

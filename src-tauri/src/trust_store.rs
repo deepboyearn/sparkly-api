@@ -1,7 +1,7 @@
 // trust_store.rs — Self-signed CA cert generation + system trust store install
 //
-// Modeled after 9router's MITM cert generation but implemented directly in Rust
-// without any 9router dependency. Generates a self-signed Root CA with SANs for
+// Modeled after sparkly-api's MITM cert generation but implemented directly in Rust
+// without any sparkly-api dependency. Generates a self-signed Root CA with SANs for
 // common AI provider domains, then installs it into the OS trust store.
 
 use anyhow::{Context, Result};
@@ -9,7 +9,7 @@ use rcgen::{CertificateParams, KeyPair, SanType};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Domains the generated CA is valid for (matches 9router's TARGET_HOSTS + extras).
+/// Domains the generated CA is valid for (matches sparkly-api's TARGET_HOSTS + extras).
 const MITM_DOMAINS: &[&str] = &[
     "api.anthropic.com",
     "api.openai.com",
@@ -129,7 +129,8 @@ pub fn is_trusted(data_dir: &Path) -> bool {
         match output {
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
-                stderr.contains("CmdResult: 0x0") || o.stdout.windows(b"CertUtil").next().is_some()
+                stderr.contains("CmdResult: 0x0")
+                    || o.stdout.windows(b"CertUtil".len()).any(|w| w == b"CertUtil")
             }
             Err(_) => false,
         }

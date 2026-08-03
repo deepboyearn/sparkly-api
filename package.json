@@ -16,8 +16,7 @@
     "tauri:build": "tauri build"
   },
   "dependencies": {
-    "@heroui/react": "^3.0.2",
-    "@heroui/styles": "^3.0.2",
+    "@iconify-json/material-symbols": "^1.2.88",
     "@iconify-json/solar": "^1.2.5",
     "@iconify/react": "^6.0.2",
     "@tauri-apps/api": "^2",

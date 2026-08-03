@@ -69,32 +69,14 @@ pub fn request_elevation() -> Result<bool, String> {
 
 #[cfg(target_os = "windows")]
 fn windows_check_admin() -> bool {
-    use std::ffi::c_void;
-
-    type HANDLE = *mut c_void;
     type BOOL = i32;
 
-    #[link(name = "advapi32")]
+    #[link(name = "shell32")]
     extern "system" {
-        fn CheckTokenMembership(TokenHandle: HANDLE, SidToCheck: *const c_void, IsMember: *mut BOOL) -> BOOL;
-    }
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetCurrentToken() -> HANDLE;
-        fn CloseHandle(hObject: HANDLE) -> BOOL;
+        fn IsUserAnAdmin() -> BOOL;
     }
 
-    unsafe {
-        let mut is_member: BOOL = 0;
-        let mut sid = [0u8; 8];
-        sid[0] = 1; sid[1] = 1;
-        let sub_auth = [32u16.to_le_bytes(), 544u16.to_le_bytes()].concat();
-        std::ptr::copy_nonoverlapping(sub_auth.as_ptr(), sid[8..].as_mut_ptr() as *mut u8, 4);
-        let token = GetCurrentToken();
-        let result = CheckTokenMembership(token, sid.as_ptr() as *const c_void, &mut is_member);
-        CloseHandle(token);
-        result != 0 && is_member != 0
-    }
+    unsafe { IsUserAnAdmin() != 0 }
 }
 
 #[cfg(target_os = "windows")]
@@ -601,8 +583,19 @@ async fn start_mitm_server_cmd(
         let mappings = state.model_mappings.read().await;
         Arc::new(tokio::sync::RwLock::new(mappings.clone()))
     };
+    // Forward to the bridge's actual listening URL (client base URL), not a
+    // hardcoded port — keeps local dev and the client on the same base URL.
+    let upstream_url = {
+        let stats = state.stats.read().await;
+        let base = stats.local_base_url.clone();
+        if base.is_empty() {
+            format!("http://localhost:{}", state.config.read().await.local_port)
+        } else {
+            base
+        }
+    };
     tokio::spawn(async move {
-        let result = mitm_server::start_mitm_server(data_dir, 443, shutdown_rx, mappings_clone).await;
+        let result = mitm_server::start_mitm_server(data_dir, 443, shutdown_rx, mappings_clone, upstream_url).await;
         if let Err(e) = result {
             tracing::error!("MITM server failed: {e}");
         }

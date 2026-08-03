@@ -3,7 +3,6 @@
 // All agents implement against these types.
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 // ─── Request/Response Logging ────────────────────────────────────────────────
 
@@ -303,19 +302,6 @@ pub const DEFAULT_MODELS: &[&str] = &[
 
 impl Default for BridgeConfig {
     fn default() -> Self {
-        // One placeholder account, exactly like `defaultConfig` in configStore.ts:
-        // without it `has_configured_upstream` fails and the UI has no row to edit.
-        let account = UpstreamAccount {
-            id: Uuid::new_v4().to_string(),
-            name: "Primary Account".into(),
-            provider: AccountProvider::OpenaiCompatible,
-            base_url: DEFAULT_UPSTREAM_BASE_URL.into(),
-            api_key: String::new(),
-            usage_tags: vec!["coding".into()],
-            is_active: true,
-            last_used_at: None,
-        };
-
         Self {
             upstream_base_url: DEFAULT_UPSTREAM_BASE_URL.into(),
             api_key: String::new(),
@@ -324,8 +310,8 @@ impl Default for BridgeConfig {
             local_port: DEFAULT_LOCAL_PORT,
             enable_cors: true,
             system_prompt: String::new(),
-            active_account_id: account.id.clone(),
-            accounts: vec![account],
+            active_account_id: String::new(),
+            accounts: Vec::new(),
         }
     }
 }

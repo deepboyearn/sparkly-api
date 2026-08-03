@@ -5,6 +5,10 @@ description = "High-Performance OpenAI-Compatible Local Bridge Proxy & API Dashb
 authors = ["Sparkly Team"]
 edition = "2021"
 
+
+[lib]
+name = "sparkly"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -40,3 +44,104 @@ custom-protocol = ["tauri/custom-protocol"]
 # OFF by default: enabling it lets model-emitted tool calls run commands and
 # touch files on the host. Opt in with `cargo run --features tool-execution`.
 tool-execution = []
+
+[[test]]
+name = "test_config_atomic_write"
+path = "../test/test_config_atomic_write.rs"
+
+[[test]]
+name = "test_config_load_default"
+path = "../test/test_config_load_default.rs"
+
+[[test]]
+name = "test_config_normalize_accounts"
+path = "../test/test_config_normalize_accounts.rs"
+
+[[test]]
+name = "test_config_normalize_models"
+path = "../test/test_config_normalize_models.rs"
+
+[[test]]
+name = "test_config_normalize_port"
+path = "../test/test_config_normalize_port.rs"
+
+[[test]]
+name = "test_config_persistence"
+path = "../test/test_config_persistence.rs"
+
+[[test]]
+name = "test_elevation_is_elevated"
+path = "../test/test_elevation_is_elevated.rs"
+
+[[test]]
+name = "test_elevation_request"
+path = "../test/test_elevation_request.rs"
+
+[[test]]
+name = "test_mitm_server_cert_provider"
+path = "../test/test_mitm_server_cert_provider.rs"
+
+[[test]]
+name = "test_mitm_server_request_parsing"
+path = "../test/test_mitm_server_request_parsing.rs"
+
+[[test]]
+name = "test_mitm_server_streaming_detection"
+path = "../test/test_mitm_server_streaming_detection.rs"
+
+[[test]]
+name = "test_mitm_server_tls_config"
+path = "../test/test_mitm_server_tls_config.rs"
+
+[[test]]
+name = "test_mitm_server_upstream_forwarding"
+path = "../test/test_mitm_server_upstream_forwarding.rs"
+
+[[test]]
+name = "test_model_mapper_defaults"
+path = "../test/test_model_mapper_defaults.rs"
+
+[[test]]
+name = "test_model_mapper_empty_body"
+path = "../test/test_model_mapper_empty_body.rs"
+
+[[test]]
+name = "test_model_mapper_no_mapping"
+path = "../test/test_model_mapper_no_mapping.rs"
+
+[[test]]
+name = "test_model_mapper_rewrite"
+path = "../test/test_model_mapper_rewrite.rs"
+
+[[test]]
+name = "test_trust_store_ca_generation"
+path = "../test/test_trust_store_ca_generation.rs"
+
+[[test]]
+name = "test_trust_store_check_exists"
+path = "../test/test_trust_store_check_exists.rs"
+
+[[test]]
+name = "test_trust_store_linux_trust"
+path = "../test/test_trust_store_linux_trust.rs"
+
+[[test]]
+name = "test_trust_store_macos_trust"
+path = "../test/test_trust_store_macos_trust.rs"
+
+[[test]]
+name = "test_trust_store_windows_trust"
+path = "../test/test_trust_store_windows_trust.rs"
+
+[[test]]
+name = "test_types_bridge_config"
+path = "../test/test_types_bridge_config.rs"
+
+[[test]]
+name = "test_types_client_api_key"
+path = "../test/test_types_client_api_key.rs"
+
+[[test]]
+name = "test_types_upstream_account"
+path = "../test/test_types_upstream_account.rs"
+

@@ -1,11 +1,11 @@
 import { memo } from "react";
-import { Button } from "@heroui/react";
-import { Icon } from "@iconify/react/offline";
+import { Button } from "./ui";
+import { Icon } from "@iconify/react";
 
 
 import logo from "../../../logo/logp.png";
 
-export type SectionKey = "overview" | "apiKeys" | "usage" | "accounts" | "playground" | "mitm";
+export type SectionKey = "overview" | "apiKeys" | "usage" | "accounts" | "playground" | "mitm" | "consoleLogs";
 
 interface SidebarProps {
   activeSection: SectionKey;
@@ -23,6 +23,7 @@ const navItems: { key: SectionKey; label: string; icon: string }[] = [
   { key: "accounts", label: "Accounts", icon: "solar:users-group-rounded-bold-duotone" },
   { key: "playground", label: "Playground", icon: "solar:code-square-bold-duotone" },
   { key: "mitm", label: "MITM", icon: "solar:shield-check-bold-duotone" },
+  { key: "consoleLogs", label: "Console Logs", icon: "material-symbols:bug-report-rounded" },
 ];
 
 function SidebarComponent({

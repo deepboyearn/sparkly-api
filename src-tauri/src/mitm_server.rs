@@ -17,11 +17,10 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::trust_store;
 
-const UPSTREAM_URL: &str = "http://127.0.0.1:48231";
 const MITM_DOMAINS: &[&str] = &[
-    "api.anthropic.com", "api.openai.com", "api2.cursor.sh",
-    "cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com",
-    "runtime.us-east-1.kiro.dev", "localhost", "*.googleapis.com", "*.openai.com",
+    "*.googleapis.com", "*.openai.com", "api.anthropic.com",
+    "api.openai.com", "api2.cursor.sh", "cloudcode-pa.googleapis.com",
+    "daily-cloudcode-pa.googleapis.com", "localhost", "runtime.us-east-1.kiro.dev",
 ];
 
 #[derive(Debug)]
@@ -128,6 +127,7 @@ pub async fn start_mitm_server(
     port: u16,
     shutdown_rx: oneshot::Receiver<()>,
     model_mappings: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
+    upstream_url: String,
 ) -> Result<()> {
     let tls_config = build_tls_config(&data_dir)?;
     let acceptor = TlsAcceptor::from(tls_config);
@@ -137,7 +137,7 @@ pub async fn start_mitm_server(
         .await
         .with_context(|| format!("binding MITM server on port {port}"))?;
 
-    tracing::info!("MITM server listening on port {port}");
+    tracing::info!("MITM server listening on port {port}, forwarding to {upstream_url}");
 
     tokio::spawn(async move {
         let mut shutdown_rx = shutdown_rx;
@@ -148,10 +148,11 @@ pub async fn start_mitm_server(
                         Ok((tcp_stream, peer_addr)) => {
                             let acceptor = acceptor.clone();
                             let mappings = model_mappings.clone();
+                            let upstream = upstream_url.clone();
                             tokio::spawn(async move {
                                 match acceptor.accept(tcp_stream).await {
                                     Ok(tls_stream) => {
-                                        handle_connection(tls_stream, &mappings).await;
+                                        handle_connection(tls_stream, &mappings, &upstream).await;
                                     }
                                     Err(e) => {
                                         tracing::debug!("TLS accept error from {peer_addr}: {e}");
@@ -175,7 +176,7 @@ pub async fn start_mitm_server(
     Ok(())
 }
 
-async fn handle_connection<S>(mut stream: S, model_mappings: &tokio::sync::RwLock<HashMap<String, String>>)
+async fn handle_connection<S>(mut stream: S, model_mappings: &tokio::sync::RwLock<HashMap<String, String>>, upstream_url: &str)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -249,7 +250,7 @@ where
         body
     };
 
-    let upstream_url = format!("{UPSTREAM_URL}{path}");
+    let upstream_url = format!("{upstream_url}{path}");
 
     let mut req_builder = match method {
         "POST" => reqwest::Client::new().post(&upstream_url),

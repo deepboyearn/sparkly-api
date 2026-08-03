@@ -1,8 +1,8 @@
 import { memo, useState, useEffect, useRef } from "react";
 import { Line } from "react-chartjs-2";
 import "../chartSetup";
-import { Icon } from "@iconify/react/offline";
-import { Card, Button } from "@heroui/react";
+import { Icon } from "@iconify/react";
+import { Card, Button } from "../components/ui";
 import { UsageRecordsTable } from "../components/UsageRecordsTable";
 type UsageRecord = {
   id: string;

@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { motion, AnimatePresence, type Variants } from "framer-motion";
-import { Button } from "@heroui/react";
-import { Icon } from "@iconify/react/offline";
+import { Button } from "./ui";
+import { Icon } from "@iconify/react";
 import "./Onboarding.css";
 
 interface OnboardingProps {

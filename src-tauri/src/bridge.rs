@@ -1165,6 +1165,7 @@ pub async fn playground_test(input: PlaygroundTestInput) -> Result<PlaygroundTes
 /// Returns (status, content_type, body).
 async fn forward_request(
     state: &AppState,
+    incoming_path: &str,
     upstream_path: &str,
     method: &str,
     body: Option<&Value>,
@@ -1212,7 +1213,7 @@ async fn forward_request(
                 record_log(
                     &state.logs,
                     method,
-                    upstream_path,
+                    incoming_path,
                     status,
                     model.clone(),
                     duration,
@@ -1241,7 +1242,7 @@ async fn forward_request(
                 record_log(
                     &state.logs,
                     method,
-                    upstream_path,
+                    incoming_path,
                     502,
                     model.clone(),
                     duration,
@@ -1760,7 +1761,7 @@ async fn run_responses_agent_loop(
 
     for _turn in 0..MAX_AGENT_TURNS {
         let (status, ct, resp_body) =
-            forward_request(state, "/v1/chat/completions", "POST", Some(&chat_body)).await;
+            forward_request(state, "/v1/responses", "/v1/chat/completions", "POST", Some(&chat_body)).await;
 
         let is_json = ct.contains("application/json");
         let is_success = (200..300).contains(&status);
@@ -1939,7 +1940,108 @@ async fn v1_index_handler() -> Response {
     (StatusCode::NOT_FOUND, Json(json!({"detail": "Not Found"}))).into_response()
 }
 
-async fn v1_models_handler(AxumState(state): AxumState<ServerState>) -> Response {
+async fn check_auth(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), (StatusCode, String, String)> {
+    let api_key = if let Some(auth_header) = headers.get(axum::http::header::AUTHORIZATION) {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                Some(token.trim().to_string())
+            } else {
+                Some(auth_str.trim().to_string())
+            }
+        } else {
+            None
+        }
+    } else if let Some(x_api_key_header) = headers.get("x-api-key") {
+        if let Ok(x_key_str) = x_api_key_header.to_str() {
+            Some(x_key_str.trim().to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let Some(key) = api_key else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "API key is missing.".to_string(),
+            "authentication_error".to_string(),
+        ));
+    };
+
+    let client_keys = state.client_keys.read().await;
+    let matched = client_keys.iter().any(|k| k.key == key && k.is_active);
+
+    if matched {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            "Incorrect or inactive API key.".to_string(),
+            "authentication_error".to_string(),
+        ))
+    }
+}
+
+fn ensure_structured_error(status: u16, body: &Value) -> Value {
+    if let Some(error_obj) = body.get("error") {
+        if error_obj.get("message").is_some() {
+            return body.clone();
+        }
+    }
+
+    let message = match body {
+        Value::String(s) => {
+            let title = extract_html_title(s);
+            if !title.is_empty() {
+                format!("Upstream error: {}", title)
+            } else if s.len() > 512 {
+                format!("{}...", &s[..512])
+            } else {
+                s.clone()
+            }
+        }
+        other => {
+            let s = other.to_string();
+            if s.is_empty() {
+                "Unknown upstream error.".to_string()
+            } else {
+                s
+            }
+        }
+    };
+
+    let error_type = if status == 401 {
+        "authentication_error"
+    } else if status == 403 {
+        "permission_error"
+    } else if status == 429 {
+        "rate_limit_error"
+    } else if status >= 500 {
+        "api_error"
+    } else {
+        "invalid_request_error"
+    };
+
+    json!({
+        "error": {
+            "message": message,
+            "type": error_type,
+        }
+    })
+}
+
+async fn v1_models_handler(
+    AxumState(state): AxumState<ServerState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Err((status, msg, err_type)) = check_auth(&state, &headers).await {
+        return json_error(status, &msg, &err_type);
+    }
+
     let config = state.config.read().await;
     if !has_configured_upstream(&config) {
         return json_error(
@@ -1950,43 +2052,60 @@ async fn v1_models_handler(AxumState(state): AxumState<ServerState>) -> Response
     }
     drop(config);
 
-    let (status, ct, body) = forward_request(&state, "/v1/models", "GET", None).await;
+    let (status, ct, body) = forward_request(&state, "/v1/models", "/v1/models", "GET", None).await;
+    if status >= 400 {
+        let structured_error = ensure_structured_error(status, &body);
+        return build_upstream_response(status, "application/json", &structured_error);
+    }
     build_upstream_response(status, &ct, &body)
 }
 
 async fn chat_completions_handler(
     AxumState(state): AxumState<ServerState>,
+    headers: axum::http::HeaderMap,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    if let Err((status, msg, err_type)) = check_auth(&state, &headers).await {
+        return json_error(status, &msg, &err_type);
+    }
+
     let mut body = match json_body_or_error(body) {
         Ok(value) => value,
         Err(response) => return response,
     };
-    {
-        let config = state.config.read().await;
-        if !has_configured_upstream(&config) {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "API key is not configured.",
-                "bridge_config_error",
-            );
-        }
-        apply_model_defaults(&mut body, &config);
+
+    let config = state.config.read().await.clone();
+    if !has_configured_upstream(&config) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "API key is not configured.",
+            "bridge_config_error",
+        );
     }
 
-    let model = extract_model(&body);
-    let (status, ct, resp_body) =
-        forward_request(&state, "/v1/chat/completions", "POST", Some(&body)).await;
+    apply_model_defaults(&mut body, &config);
 
-    // On failure the log entry carries the upstream path's model, which for an
-    // error response may be missing — backfill from the request
-    // (`writeResponse`, bridgeServer.ts:1548-1551).
+    let model = extract_model(&body);
+    let model_str = model.clone().unwrap_or_default();
+    if model_str != "auto" && !config.models.contains(&model_str) {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            &format!("The model `{}` does not exist.", model_str),
+            "invalid_request_error",
+        );
+    }
+
+    let (status, ct, resp_body) =
+        forward_request(&state, "/v1/chat/completions", "/v1/chat/completions", "POST", Some(&body)).await;
+
     if status >= 400 {
         if let Some(m) = model {
             if let Some(entry) = state.logs.write().await.first_mut() {
                 entry.model = Some(m);
             }
         }
+        let structured_error = ensure_structured_error(status, &resp_body);
+        return build_upstream_response(status, "application/json", &structured_error);
     }
 
     build_upstream_response(status, &ct, &resp_body)
@@ -2968,8 +3087,13 @@ fn openai_sse_to_anthropic_sse(sse_text: &str, model: &str) -> String {
 /// can parse them.
 async fn anthropic_messages_handler(
     AxumState(state): AxumState<ServerState>,
+    headers: axum::http::HeaderMap,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    if let Err((status, msg, err_type)) = check_auth(&state, &headers).await {
+        return anthropic_error_response(status, &err_type, &msg);
+    }
+
     let body = match anthropic_json_body_or_error(body) {
         Ok(value) => value,
         Err(response) => return response,
@@ -2997,13 +3121,28 @@ async fn anthropic_messages_handler(
                 "API key is not configured.",
             );
         }
+
+        // Model validation
+        let model = body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|m| !m.is_empty())
+            .unwrap_or(&config.selected_model)
+            .to_string();
+
+        if model != "auto" && !config.models.contains(&model) {
+            return anthropic_error_response(
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                &format!("The model `{}` does not exist.", model),
+            );
+        }
+
         let is_anthropic = config
             .accounts
             .iter()
             .any(|a| a.id == config.active_account_id && a.provider == AccountProvider::Anthropic);
         if is_anthropic {
-            // Pass the original Anthropic body through; forward_anthropic_upstream
-            // will send it directly to the Anthropic API.
             (body.clone(), true)
         } else {
             (anthropic_to_openai(&body, &config), false)
@@ -3022,7 +3161,7 @@ async fn anthropic_messages_handler(
         "/v1/chat/completions"
     };
     let (status, _ct, resp_body) =
-        forward_request(&state, upstream_path, "POST", Some(&chat_body)).await;
+        forward_request(&state, "/v1/messages", upstream_path, "POST", Some(&chat_body)).await;
 
     // ── Error path (all upstream failures) ─────────────────────────
     if status >= 400 {
@@ -3103,8 +3242,13 @@ async fn anthropic_messages_handler(
 
 async fn responses_handler(
     AxumState(state): AxumState<ServerState>,
+    headers: axum::http::HeaderMap,
     request_body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    if let Err((status, msg, err_type)) = check_auth(&state, &headers).await {
+        return json_error(status, &msg, &err_type);
+    }
+
     let request_body = match json_body_or_error(request_body) {
         Ok(value) => value,
         Err(response) => return response,
@@ -3124,6 +3268,18 @@ async fn responses_handler(
     };
 
     let model = extract_model(&chat_body);
+    let model_str = model.clone().unwrap_or_default();
+    {
+        let config = state.config.read().await;
+        if model_str != "auto" && !config.models.contains(&model_str) {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                &format!("The model `{}` does not exist.", model_str),
+                "invalid_request_error",
+            );
+        }
+    }
+
     let (status, ct, resp_body, stream_tool_items) =
         run_responses_agent_loop(&state, chat_body, &request_body).await;
 
@@ -3136,6 +3292,8 @@ async fn responses_handler(
                     entry.model = Some(m);
                 }
             }
+            let structured_error = ensure_structured_error(status, &resp_body);
+            return build_upstream_response(status, "application/json", &structured_error);
         }
         return build_upstream_response(status, &ct, &resp_body);
     }
@@ -3458,6 +3616,14 @@ pub async fn request_rebind() {
     }
 }
 
+/// Helper to check if a port is already in use by attempting a TCP connection to both
+/// IPv4 loopback (127.0.0.1) and IPv6 loopback (::1).
+async fn is_port_in_use(port: u16) -> bool {
+    let ipv4_in_use = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await.is_ok();
+    let ipv6_in_use = tokio::net::TcpStream::connect(format!("[::1]:{port}")).await.is_ok();
+    ipv4_in_use || ipv6_in_use
+}
+
 /// Bind the listener once and serve until a rebind is requested.
 ///
 /// Returns `Ok(())` on a graceful shutdown (rebind requested) so the supervisor
@@ -3493,14 +3659,26 @@ async fn serve_once(state: Arc<AppState>) -> anyhow::Result<()> {
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .with_state(state.clone());
 
-    // Try the configured port; fall back to an OS-assigned one if taken.
-    let listener = match TcpListener::bind(format!("127.0.0.1:{port}")).await {
-        Ok(l) => l,
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            tracing::warn!("Port {port} is in use; binding an OS-assigned port instead");
-            TcpListener::bind("127.0.0.1:0").await?
+    // Try the configured port; fall back to the next deterministic port (48232
+    // by default) instead of a random OS-assigned one. In dev the Vite server
+    // owns the primary port, so the bridge takes port+1 and Vite proxies /v1,
+    // /health, /stats, /logs to it — keeping one client base URL (48231).
+    let port_occupied = is_port_in_use(port).await;
+
+    let listener = if port_occupied {
+        let fallback = port.saturating_add(1);
+        tracing::warn!("Port {port} is detected in use on loopback; binding port {fallback} instead");
+        TcpListener::bind(format!("127.0.0.1:{fallback}")).await?
+    } else {
+        match TcpListener::bind(format!("127.0.0.1:{port}")).await {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                let fallback = port.saturating_add(1);
+                tracing::warn!("Port {port} is in use; binding port {fallback} instead");
+                TcpListener::bind(format!("127.0.0.1:{fallback}")).await?
+            }
+            Err(e) => return Err(e.into()),
         }
-        Err(e) => return Err(e.into()),
     };
 
     let addr = listener.local_addr()?;

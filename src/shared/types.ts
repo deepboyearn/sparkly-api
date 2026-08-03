@@ -33,7 +33,7 @@ export type UpstreamAccount = {
   lastUsedAt: string | null;
 };
 
-export type AccountProvider = "openai-compatible" | "v0";
+export type AccountProvider = "openai-compatible" | "v0" | "anthropic";
 
 export type AccountUsageTag = "coding";
 

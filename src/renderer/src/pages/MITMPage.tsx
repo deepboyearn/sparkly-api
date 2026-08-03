@@ -1,6 +1,7 @@
-import { useState, useEffect } from "react";
-import { Icon } from "@iconify/react/offline";
+import { useState, useEffect, useMemo } from "react";
+import { Icon } from "@iconify/react";
 import logo from "../../../logo/logp.png";
+import type { BridgeState } from "../../../shared/types";
 
 const AG_MODELS = [
   "Gemini 3.6 Flash (High)",
@@ -17,9 +18,22 @@ const AG_MODELS = [
   "Gemini 3 Flash (Command)",
 ];
 
-export default function MITMPage() {
-  const [baseUrl, setBaseUrl] = useState("http://localhost:20128");
-  const [apiKey, setApiKey] = useState("");
+export default function MITMPage({ state }: { state: BridgeState }) {
+  const mainApiBaseUrl = useMemo(() => {
+    const raw = import.meta.env.DEV
+      ? `${window.location.origin}/v1`
+      : state.stats.localBaseUrl || "";
+    return raw.endsWith("/v1") ? raw : raw ? `${raw}/v1` : "";
+  }, [state.stats.localBaseUrl]);
+
+  const [baseUrl, setBaseUrl] = useState(() => mainApiBaseUrl);
+
+  useEffect(() => {
+    if (mainApiBaseUrl) {
+      setBaseUrl(mainApiBaseUrl);
+    }
+  }, [mainApiBaseUrl]);
+
   const [isRunning, setIsRunning] = useState(false);
   const [isCertTrusted, setIsCertTrusted] = useState(false);
   const [isCertGenerated, setIsCertGenerated] = useState(true);
@@ -228,10 +242,10 @@ export default function MITMPage() {
           }}
         >
           <div>
-            <strong style={{ color: "var(--text)" }}>Purpose:</strong> Use Antigravity IDE &amp; GitHub Copilot → with ANY provider/model from 9Router
+            <strong style={{ color: "var(--text)" }}>Purpose:</strong> Use Antigravity IDE &amp; GitHub Copilot → with ANY provider/model from Sparkly API
           </div>
           <div>
-            <strong style={{ color: "var(--text)" }}>How it works:</strong> Antigravity/Copilot IDE request → DNS redirect to localhost:443 → MITM proxy intercepts → 9Router → response to Antigravity/Copilot
+            <strong style={{ color: "var(--text)" }}>How it works:</strong> Antigravity/Copilot IDE request → DNS redirect to localhost:443 → MITM proxy intercepts → Sparkly API → response to Antigravity/Copilot
           </div>
         </div>
 
@@ -246,12 +260,12 @@ export default function MITMPage() {
             }}
           >
             <span style={{ fontSize: "13px", fontWeight: "600", color: "var(--text)" }}>
-              9Router Base URL
+              Sparkly API Base URL
             </span>
             <Icon icon="solar:alt-arrow-right-bold" style={{ color: "var(--muted)", fontSize: "14px" }} />
             <input
               type="text"
-              placeholder="http://localhost:20128"
+              placeholder={mainApiBaseUrl}
               value={baseUrl}
               onChange={(e) => setBaseUrl(e.target.value)}
               style={{
@@ -265,42 +279,6 @@ export default function MITMPage() {
                 outline: "none",
               }}
             />
-          </div>
-
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "140px 24px 1fr",
-              alignItems: "center",
-              gap: "8px",
-            }}
-          >
-            <span style={{ fontSize: "13px", fontWeight: "600", color: "var(--text)" }}>
-              API Key
-            </span>
-            <Icon icon="solar:alt-arrow-right-bold" style={{ color: "var(--muted)", fontSize: "14px" }} />
-            <input
-              type="text"
-              list="mitm-api-keys"
-              placeholder="sk_9router (default)"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              style={{
-                width: "100%",
-                padding: "8px 12px",
-                background: "rgba(0, 0, 0, 0.4)",
-                border: "1px solid var(--line)",
-                borderRadius: "8px",
-                color: "var(--text)",
-                fontSize: "13px",
-                outline: "none",
-              }}
-            />
-            <datalist id="mitm-api-keys">
-              <option value="sk-764625c2f61b54f5-23rqmw-438bb820">ew</option>
-              <option value="sk-b0797d3452a0d6a7-ff82cc-04028b46">Untitled</option>
-              <option value="sk-b0797d3452a0d6a7-a59003-fd20334a">Untitled</option>
-            </datalist>
           </div>
         </div>
 
@@ -459,7 +437,7 @@ export default function MITMPage() {
 
             {/* DNS Note */}
             <div style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px", color: "var(--muted)" }}>
-              <p style={{ margin: 0 }}>Toggle DNS to redirect Antigravity traffic through 9Router via MITM.</p>
+              <p style={{ margin: 0 }}>Toggle DNS to redirect Antigravity traffic through Sparkly API via MITM.</p>
               {!isDnsStarted && (
                 <p style={{ margin: "2px 0 0 0", color: "#d97706", fontSize: "11px", fontWeight: "600" }}>
                   ⚠️ Enable DNS to edit model mappings

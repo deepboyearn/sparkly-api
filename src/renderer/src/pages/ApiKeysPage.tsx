@@ -1,5 +1,5 @@
 import { memo, useState } from "react";
-import { Icon } from "@iconify/react/offline";
+import { Icon } from "@iconify/react";
 import type { BridgeConfig, BridgeState } from "../../../shared/types";
 import { maskKey } from "../appState";
 import { ModelPicker } from "../components/ModelPicker";
@@ -50,12 +50,12 @@ function ApiKeysPageComponent({
   return (
     <>
       <section className="api-keys-summary admin-panel">
-        <div className="section-heading">
+        <div className="section-heading" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%" }}>
           <div className="summary-title-row">
             <span className="metric-chip orange">
               <Icon icon="solar:key-bold-duotone" />
             </span>
-            <h3>1 active / 10 max API keys</h3>
+            <h3>{state.clientKeys.length} active / 10 max API keys</h3>
           </div>
           <button className="premium-button primary" onClick={onOpenCreateKey}>
             <Icon icon="solar:add-circle-bold" className="btn-icon" />
@@ -73,9 +73,9 @@ function ApiKeysPageComponent({
                 <h3>Active upstream account</h3>
               </div>
             </div>
-            <span className="premium-badge success">
-              <div className="pulse-dot success" />
-              ACTIVE
+            <span className={`premium-badge ${activeAccount ? "success" : "muted-tag"}`}>
+              <div className={`pulse-dot ${activeAccount ? "success" : "muted"}`} />
+              {activeAccount ? "ACTIVE" : "NO ACCOUNT"}
             </span>
           </div>
           
@@ -87,49 +87,32 @@ function ApiKeysPageComponent({
                 <span className="label-text">UPSTREAM API KEY</span>
                 <div className="key-display-box">
                   <Icon icon="solar:key-bold-duotone" className="field-icon" />
-                  <code>{maskKey(state.config.apiKey)}</code>
+                  <code>{activeAccount ? maskKey(activeAccount.apiKey) : "No account configured"}</code>
                 </div>
               </div>
               <div className="meta-info">
                 <div className="meta-item">
                   <Icon icon="solar:calendar-minimalistic-bold-duotone" />
-                  <span>Created: <strong>{new Date().toLocaleDateString()}</strong></span>
+                  <span>Created: <strong>{activeAccount ? new Date().toLocaleDateString() : "N/A"}</strong></span>
                 </div>
                 <div className="meta-item">
                   <Icon icon="solar:clock-circle-bold-duotone" />
-                  <span>Last used: <strong>{state.stats.lastRequestAt ? new Date(state.stats.lastRequestAt).toLocaleString() : "Never"}</strong></span>
+                  <span>Last used: <strong>{activeAccount?.lastUsedAt ? new Date(activeAccount.lastUsedAt).toLocaleString() : "Never"}</strong></span>
                 </div>
-              </div>
-            </div>
-
-            <div className="key-meta-grid-premium">
-              <div className="meta-card-premium">
-                <div className="meta-label">
-                  <Icon icon="solar:link-bold-duotone" />
-                  <span>Base URL</span>
-                </div>
-                <strong className="meta-value">{activeAccount?.baseUrl || form.upstreamBaseUrl || "Not configured"}</strong>
-              </div>
-              <div className="meta-card-premium">
-                <div className="meta-label">
-                  <Icon icon="solar:box-bold-duotone" />
-                  <span>Selected model</span>
-                </div>
-                <strong className="meta-value">{form.selectedModel || "Not selected"}</strong>
               </div>
             </div>
 
             <div className="card-divider" style={{ margin: '20px 0' }} />
             
             <div style={{ marginBottom: '8px' }}>
-              <span className="label-text">CLIENT USAGE</span>
+              <span className="label-text">USAGE</span>
             </div>
             
             <div className="config-meta-grid" style={{ marginTop: '16px', paddingTop: 0, borderTop: 'none' }}>
               <div className="config-meta-item">
                 <div className="meta-label">
                   <Icon icon="solar:link-round-bold-duotone" />
-                  <span>Client Base URL</span>
+                  <span>Base URL</span>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0, width: '100%' }}>
                   <strong className="meta-value" style={{ flex: 1 }}>{clientBaseUrl}</strong>
@@ -149,7 +132,7 @@ function ApiKeysPageComponent({
               <div className="config-meta-item">
                 <div className="meta-label">
                   <Icon icon="solar:key-bold-duotone" />
-                  <span>Client API Key</span>
+                  <span>API Key</span>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0, width: '100%' }}>
                   <strong className="meta-value" style={{ flex: 1 }}>{localClientKey}</strong>
@@ -192,13 +175,12 @@ function ApiKeysPageComponent({
         </article>
 
         <article className="admin-panel settings-panel">
-          <div className="section-heading">
+          <div className="section-heading" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%" }}>
             <div className="title-row">
               <Icon icon="solar:settings-minimalistic-bold-duotone" style={{ fontSize: '22px', color: 'var(--primary-color)' }} />
               <h3>Model configuration</h3>
             </div>
             <div className="actions-row">
-              <span className="premium-badge">ACTIVE ACCOUNT DRIVEN</span>
               <button
                 className="premium-button primary sm"
                 onClick={onRefreshActiveAccountModels}
@@ -222,18 +204,10 @@ function ApiKeysPageComponent({
                 setApiKeyModelQuery(model);
                 onSave(nextForm);
               }}
-              footerLeft={
-                <>
-                  <span className="premium-badge">
-                    <Icon icon="solar:user-id-bold-duotone" /> {activeAccount?.name || "No active account"}
-                  </span>
-                  <span className="premium-badge">
-                    <Icon icon="solar:link-round-bold-duotone" /> {activeAccount?.baseUrl || "Not configured"}
-                  </span>
-                  <span className="premium-badge">
-                    <Icon icon="solar:box-bold-duotone" /> {state.config.models.length} Models
-                  </span>
-                </>
+              footerRight={
+                <span className="premium-badge">
+                  <Icon icon="solar:box-bold-duotone" /> {state.config.models.length} Models
+                </span>
               }
             />
           </div>

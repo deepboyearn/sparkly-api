@@ -1,10 +1,12 @@
-import { memo, useState } from "react";
-import { Icon } from "@iconify/react/offline";
-import type { PlaygroundModelsResult, PlaygroundTestResult } from "../../../shared/types";
+import { memo, useState, useEffect } from "react";
+import { Icon } from "@iconify/react";
+import type { PlaygroundModelsResult, PlaygroundTestResult, UpstreamAccount } from "../../../shared/types";
 import { getPlaygroundErrorSummary, normalizeOpenAiBaseUrl } from "../appState";
 import { ModelPicker } from "../components/ModelPicker";
+import { AccountPicker } from "../components/AccountPicker";
 
 function PlaygroundPageComponent({
+  accounts,
   models,
   playgroundModelQuery,
   setPlaygroundModelQuery,
@@ -26,6 +28,7 @@ function PlaygroundPageComponent({
   onLoadPlaygroundModels,
   onRunPlayground,
 }: {
+  accounts?: UpstreamAccount[];
   models: string[];
   playgroundModelQuery: string;
   setPlaygroundModelQuery: (value: string) => void;
@@ -47,7 +50,32 @@ function PlaygroundPageComponent({
   onLoadPlaygroundModels: () => void;
   onRunPlayground: () => void;
 }) {
+  const [selectedAccountId, setSelectedAccountId] = useState<string>("");
   const [isModelsExpanded, setIsModelsExpanded] = useState(true);
+
+  // Sync selected account when accounts or URLs change
+  useEffect(() => {
+    if (accounts && accounts.length > 0 && !selectedAccountId) {
+      const active = accounts.find((a) => a.isActive) || accounts[0];
+      if (active) {
+        setSelectedAccountId(active.id);
+        setPlaygroundBaseUrl(active.baseUrl);
+        setPlaygroundApiKey(active.apiKey);
+      }
+    }
+  }, [accounts]);
+
+  const handleSelectAccount = (accId: string) => {
+    setSelectedAccountId(accId);
+    if (accounts) {
+      const found = accounts.find((a) => a.id === accId);
+      if (found) {
+        setPlaygroundBaseUrl(found.baseUrl);
+        setPlaygroundApiKey(found.apiKey);
+      }
+    }
+  };
+
   const normalizedPlaygroundBaseUrl = normalizeOpenAiBaseUrl(playgroundBaseUrl);
   const playgroundErrorSummary = getPlaygroundErrorSummary(playgroundResult);
   const runDisabled = playgroundLoading || !normalizedPlaygroundBaseUrl || !playgroundApiKey.trim() || !playgroundModel.trim() || !playgroundMessage.trim();
@@ -66,23 +94,21 @@ function PlaygroundPageComponent({
 
           <div className="premium-input-stack">
             <div className="compact-input-group">
-              <label>Service URL</label>
-              <input
-                className="glass-input"
-                value={playgroundBaseUrl}
-                onChange={(e) => setPlaygroundBaseUrl(e.target.value)}
-                placeholder="https://api.souimagery.fun"
+              <label>Account Title</label>
+              <AccountPicker
+                accounts={accounts || []}
+                selectedAccountId={selectedAccountId}
+                onSelectAccount={handleSelectAccount}
               />
             </div>
 
             <div className="compact-input-group">
-              <label>API Auth Key</label>
+              <label>Base URL</label>
               <input
-                type="password"
                 className="glass-input"
-                value={playgroundApiKey}
-                onChange={(e) => setPlaygroundApiKey(e.target.value)}
-                placeholder="sk-..."
+                value={playgroundBaseUrl}
+                onChange={(e) => setPlaygroundBaseUrl(e.target.value)}
+                placeholder="Base URL"
               />
             </div>
 
@@ -94,7 +120,7 @@ function PlaygroundPageComponent({
                   onClick={onLoadPlaygroundModels}
                   disabled={loadModelsDisabled}
                 >
-                  <Icon icon={playgroundModelsLoading ? "solar:spinner-bold-duotone" : "solar:refresh-bold-duotone"} className={`btn-icon ${playgroundModelsLoading ? "animate-spin" : ""}`} />
+                  <Icon icon={playgroundModelsLoading ? "solar:refresh-bold-duotone" : "solar:refresh-bold-duotone"} className={`btn-icon ${playgroundModelsLoading ? "animate-spin" : ""}`} />
                   {playgroundModelsLoading ? "Loading..." : "Load Models"}
                 </button>
               </div>
@@ -139,7 +165,7 @@ function PlaygroundPageComponent({
           />
           <div className="button-row-spacious mt-8">
             <button className="premium-button primary flex-[2.5] justify-center" onClick={onRunPlayground} disabled={runDisabled}>
-              <Icon icon={playgroundLoading ? "solar:spinner-bold-duotone" : "solar:play-bold-duotone"} className={`btn-icon ${playgroundLoading ? "animate-spin" : ""}`} />
+              <Icon icon={playgroundLoading ? "solar:refresh-bold-duotone" : "solar:play-bold-duotone"} className={`btn-icon ${playgroundLoading ? "animate-spin" : ""}`} />
               {playgroundLoading ? "Running..." : "Execute Test"}
             </button>
             
@@ -253,7 +279,8 @@ function PlaygroundPageComponent({
 }
 
 export const PlaygroundPage = memo(PlaygroundPageComponent, (prev, next) => {
-  return prev.models === next.models
+  return prev.accounts === next.accounts
+    && prev.models === next.models
     && prev.playgroundModelQuery === next.playgroundModelQuery
     && prev.playgroundBaseUrl === next.playgroundBaseUrl
     && prev.playgroundApiKey === next.playgroundApiKey

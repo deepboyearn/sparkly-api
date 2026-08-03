@@ -1,5 +1,5 @@
 import React, { Suspense, startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Card, Input } from "@heroui/react";
+import { Alert, Card, Input, Select } from "./components/ui";
 import { Icon } from "@iconify/react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { ChartOptions } from "chart.js";
@@ -8,8 +8,10 @@ import "./chartSetup";
 import { V0_BASE_URL, V0_MODELS } from "../../shared/types";
 import type { AccountProvider, AccountUsageTag, BridgeConfig, BridgeState, PlaygroundModelsResult, PlaygroundTestResult } from "../../shared/types";
 import { emptyState, ensureBridgeMethod, getDayPoints, getHourlyPoints, getRequestPoints, getUsageRecords, groupKeyStats, groupModelStats, normalizeBridgeState, normalizeOpenAiBaseUrl } from "./appState";
+import { logUserAction } from "./consoleLogStore";
 import { Header } from "./components/Header";
 import { Sidebar } from "./components/Sidebar";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import type { SectionKey } from "./components/Sidebar";
 import { Onboarding } from "./components/Onboarding";
 const AccountsPage = React.lazy(() => import("./pages/AccountsPage"));
@@ -17,6 +19,7 @@ const ApiKeysPage = React.lazy(() => import("./pages/ApiKeysPage"));
 const PlaygroundPage = React.lazy(() => import("./pages/PlaygroundPage"));
 const UsagePage = React.lazy(() => import("./pages/UsagePage"));
 const MITMPage = React.lazy(() => import("./pages/MITMPage"));
+const ConsoleLogsPage = React.lazy(() => import("./pages/ConsoleLogsPage"));
 
 const accountProviderOptions: Array<{ value: AccountProvider; label: string; description: string }> = [
   {
@@ -28,6 +31,11 @@ const accountProviderOptions: Array<{ value: AccountProvider; label: string; des
     value: "v0",
     label: "v0 Platform API",
     description: "Use v0 chat generation through api.v0.dev",
+  },
+  {
+    value: "anthropic",
+    label: "Anthropic",
+    description: "Use Claude models through the native Anthropic Messages API",
   },
 ];
 
@@ -182,6 +190,7 @@ export default function App() {
   const isAccounts = activeSection === "accounts";
   const isPlayground = activeSection === "playground";
   const isMITM = activeSection === "mitm";
+  const isConsoleLogs = activeSection === "consoleLogs";
 
   // Overview analytics: Only show last 5 hours
   const requestPoints = useMemo(() => (
@@ -317,12 +326,14 @@ export default function App() {
       },
     },
   }), [overviewHasTraffic, overviewMaxPoint]);
-  const clientBaseUrl = `${state.stats.localBaseUrl}/v1`;
+  const clientBaseUrl = import.meta.env.DEV
+    ? `${window.location.origin}/v1`
+    : `${state.stats.localBaseUrl}/v1`;
   // Auto-reset logs older than 30 days
   useEffect(() => {
     const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
     const hasOldLogs = state.logs.some(log => new Date(log.timestamp).getTime() < thirtyDaysAgo);
-    
+
     if (hasOldLogs) {
       const filteredLogs = state.logs.filter(log => new Date(log.timestamp).getTime() >= thirtyDaysAgo);
       setState(prev => ({ ...prev, logs: filteredLogs }));
@@ -576,10 +587,17 @@ export default function App() {
     }
     try {
       const nextState = applyLoadedBridgeState(await window.bridgeApi.getState());
-      setPlaygroundBaseUrl(nextState.config.upstreamBaseUrl);
-      setPlaygroundApiKey(nextState.config.apiKey);
+      // Only set playground from active account if one exists
+      const activeAccount = nextState.config.accounts.find(a => a.id === nextState.config.activeAccountId) || nextState.config.accounts[0];
+      if (activeAccount) {
+        setPlaygroundBaseUrl(activeAccount.baseUrl);
+        setPlaygroundApiKey(activeAccount.apiKey);
+      } else {
+        setPlaygroundBaseUrl("");
+        setPlaygroundApiKey("");
+      }
       setPlaygroundModel(nextState.config.selectedModel);
-      
+
       if (loading) {
         setActiveSection("overview");
       }
@@ -595,6 +613,7 @@ export default function App() {
       ...nextForm,
       models: nextForm.models,
     }));
+    logUserAction("Configuration saved");
     return savedState;
   }
 
@@ -640,6 +659,7 @@ export default function App() {
     try {
       if (!window.bridgeApi) return;
       applyLoadedBridgeState(await window.bridgeApi.restartServer());
+      logUserAction("Server restarted");
     } catch (restartError) {
       setError(restartError instanceof Error ? restartError.message : "Failed to restart local server");
     } finally {
@@ -656,6 +676,7 @@ export default function App() {
       setState(nextState);
       setNewKeyName("");
       setIsCreateKeyOpen(false);
+      logUserAction(`Client key created: ${newKeyName}`);
     } catch (createError) {
       setError(createError instanceof Error ? createError.message : "Failed to create client key");
     } finally {
@@ -739,6 +760,7 @@ export default function App() {
       setAccountBaseUrl("https://api.bluesminds.com");
       setAccountApiKey("");
       setAccountUsageTags(["coding"]);
+      logUserAction(editingAccountId ? `Account updated: ${accountName}` : `Account added: ${accountName}`);
     } catch (accountError) {
       setError(accountError instanceof Error ? accountError.message : "Failed to save account");
     } finally {
@@ -751,6 +773,7 @@ export default function App() {
     setError(null);
     try {
       applyLoadedBridgeState(await ensureBridgeMethod("deleteAccount")({ id }));
+      logUserAction("Account deleted");
     } catch (accountError) {
       setError(accountError instanceof Error ? accountError.message : "Failed to delete account");
     } finally {
@@ -804,7 +827,16 @@ export default function App() {
       return;
     }
 
-    setAccountBaseUrl((current) => current === V0_BASE_URL ? "https://api.bluesminds.com" : current);
+    if (provider === "anthropic") {
+      setAccountName((current) => current.trim() ? current : "Anthropic");
+      setAccountBaseUrl("https://api.anthropic.com");
+      setAccountUsageTags(["coding"]);
+      return;
+    }
+
+    setAccountBaseUrl((current) =>
+      current === V0_BASE_URL || current === "https://api.anthropic.com" ? "" : current
+    );
   }
 
   async function onRefreshActiveAccountModels() {
@@ -911,12 +943,12 @@ export default function App() {
 
   if (loading) return (
     <motion.div
-      initial={{ opacity: 0,  }}
-      animate={{ opacity: 1,  }}
+      initial={{ opacity: 0, }}
+      animate={{ opacity: 1, }}
       className="screen centered"
       style={{ background: '#000', color: '#fff', fontSize: '14px', letterSpacing: '1px' }}
     >
-      <Icon icon="solar:spinner-bold-duotone" className="animate-spin mr-3" width={24} />
+      <Icon icon="solar:refresh-bold-duotone" className="animate-spin mr-3" width={24} />
       Loading bridge system...
     </motion.div>
   );
@@ -948,313 +980,326 @@ export default function App() {
           <main className="" style={{ flex: 1, overflowY: 'auto', padding: '10px 20px' }}>
             {error ? <Alert status="danger" title={error} className="mb-4 border border-red-500/20 bg-red-500/10 text-white" /> : null}
 
-            <Suspense fallback={<div style={{padding: 40, color: '#888'}}>Loading...</div>}>
-            <AnimatePresence mode="wait">
-              {isOverview ? (
-                <motion.div
-                  key="overview"
-                  initial={{ opacity: 0, y: 15,  }}
-                  animate={{ opacity: 1, y: 0,  }}
-                  exit={{ opacity: 0, y: -15,  }}
-                  transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-                >
-                  <motion.section
-                    className="stats-grid"
-                    variants={{
-                      hidden: { opacity: 0 },
-                      show: {
-                        opacity: 1,
-                        transition: {
-                          staggerChildren: 0.08,
-                          delayChildren: 0.1
+            <ErrorBoundary>
+            <Suspense fallback={<div style={{ padding: 40, color: '#888' }}>Loading...</div>}>
+              <AnimatePresence mode="wait">
+                {isOverview ? (
+                  <motion.div
+                    key="overview"
+                    initial={{ opacity: 0, y: 15, }}
+                    animate={{ opacity: 1, y: 0, }}
+                    exit={{ opacity: 0, y: -15, }}
+                    transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                  >
+                    <motion.section
+                      className="stats-grid"
+                      variants={{
+                        hidden: { opacity: 0 },
+                        show: {
+                          opacity: 1,
+                          transition: {
+                            staggerChildren: 0.08,
+                            delayChildren: 0.1
+                          }
                         }
-                      }
-                    }}
-                    initial="hidden"
-                    animate="show"
-                  >
-                    <motion.div variants={{ hidden: { opacity: 0, y: 20,  }, show: { opacity: 1, y: 0,  } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
-                      <Card className="metric-card">
-                        <Card.Content className="metric-card-content">
-                          <div className="metric-head">
-                            <span className="metric-title">Today's requests</span>
-                            <div className="metric-icon-circle green">
-                              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"><path fill="currentColor" fillRule="evenodd" d="M3.464 3.464C2 4.93 2 7.286 2 12s0 7.071 1.464 8.535C4.93 22 7.286 22 12 22s7.071 0 8.535-1.465C22 19.072 22 16.714 22 12s0-7.071-1.465-8.536C19.072 2 16.714 2 12 2S4.929 2 3.464 3.464M13.75 10c0 .414.336.75.75.75h.69l-2.013 2.013a.25.25 0 0 1-.354 0l-1.586-1.586a1.75 1.75 0 0 0-2.474 0L6.47 13.47a.75.75 0 1 0 1.06 1.06l2.293-2.293a.25.25 0 0 1 .354 0l1.586 1.586a1.75 1.75 0 0 0 2.474 0l2.013-2.012v.689a.75.75 0 0 0 1.5 0V10a.75.75 0 0 0-.75-.75h-2.5a.75.75 0 0 0-.75.75" clipRule="evenodd" strokeWidth="0.5" stroke="currentColor" /></svg>
-                            </div>
-                          </div>
-                          <strong>{overviewFilteredLogs.length}</strong>
-                          <p>Success: {overviewSuccessCount} / Failed: {overviewFailedCount}</p>
-
-                        </Card.Content>
-                      </Card>
-                    </motion.div>
-
-                    <motion.div variants={{ hidden: { opacity: 0, y: 20,  }, show: { opacity: 1, y: 0,  } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
-                      <Card className="metric-card">
-                        <Card.Content className="metric-card-content">
-                          <div className="metric-head">
-                            <span className="metric-title">Today's tokens</span>
-                            <div className="metric-icon-circle orange">
-                              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 512 512"><path fill="currentColor" d="M256 117c-65.2 0-124.2 11.6-166.13 29.7c-20.95 9.1-37.57 19.8-48.57 31.1S25 200.4 25 212s5.3 22.9 16.3 34.2s27.62 22 48.57 31.1C131.8 295.4 190.8 307 256 307s124.2-11.6 166.1-29.7c21-9.1 37.6-19.8 48.6-31.1S487 223.6 487 212s-5.3-22.9-16.3-34.2s-27.6-22-48.6-31.1C380.2 128.6 321.2 117 256 117M25 255.1v50.2c0 6.3 5.3 17.6 16.3 28.9s27.62 22 48.57 31.1C131.8 383.4 190.8 395 256 395s124.2-11.6 166.1-29.7c21-9.1 37.6-19.8 48.6-31.1s16.3-22.6 16.3-28.9v-50.2c-1.1 1.3-2.2 2.5-3.4 3.7c-13.3 13.6-31.8 25.3-54.3 35c-45 19.5-106 31.2-173.3 31.2s-128.3-11.7-173.28-31.2c-22.49-9.7-41.01-21.4-54.3-35c-1.19-1.2-2.32-2.5-3.42-3.7" strokeWidth="13" stroke="currentColor" /></svg>
-                            </div>
-                          </div>
-                          <strong>{overviewTokens}</strong>
-                          <p>Cached: 0 Reasoning: {Math.round(overviewTokens * 0.094)}</p>
-
-                        </Card.Content>
-                      </Card>
-                    </motion.div>
-
-                    <motion.div variants={{ hidden: { opacity: 0, y: 20,  }, show: { opacity: 1, y: 0,  } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
-                      <Card className="metric-card">
-                        <Card.Content className="metric-card-content">
-                          <div className="metric-head">
-                            <span className="metric-title">Rate Limit</span>
-                            <div className="metric-icon-circle green">
-                              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"><path fill="currentColor" d="M17 3.34a10 10 0 1 1-14.995 8.984L2 12l.005-.324A10 10 0 0 1 17 3.34M12 6a1 1 0 0 0-.993.883L11 7v5l.009.131a1 1 0 0 0 .197.477l.087.1l3 3l.094.082a1 1 0 0 0 1.226 0l.094-.083l.083-.094a1 1 0 0 0 0-1.226l-.083-.094L13 11.585V7l-.007-.117A1 1 0 0 0 12 6" strokeWidth="0.5" stroke="currentColor" /></svg>
-                            </div>
-                          </div>
-                          <strong>10 RPM</strong>
-                          <p>{overviewCurrentRpm.toFixed(1)} RPM current</p>
-
-                        </Card.Content>
-                      </Card>
-                    </motion.div>
-
-                    <motion.div variants={{ hidden: { opacity: 0, y: 20,  }, show: { opacity: 1, y: 0,  } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
-                      <Card className="metric-card">
-                        <Card.Content className="metric-card-content">
-                          <div className="metric-head">
-                            <span className="metric-title">Active Keys</span>
-                            <div className="metric-icon-circle blue">
-                              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 512 512"><path fill="currentColor" d="M218.1 167.2c0 13 0 25.6 4.1 37.4c-43.1 50.6-167.5 194.5-167.5 194.5l2.9 36.3s34.8 33 40 28c15.4-15 24.8-25.2 24.8-25.2l7.24-43.35l47.11-3.47l3.78-46.8l49.63-.95l.49-50.09l52.69 2.1l9-18.84c15.5 6.7 29.6 9.4 47.7 9.4c68.5 0 124-53.4 124-119.2S408.5 48 340 48s-121.9 53.4-121.9 119.2M406.85 144A38.85 38.85 0 1 1 368 105.15A38.81 38.81 0 0 1 406.85 144" strokeWidth="13" stroke="currentColor" /></svg>
-                            </div>
-                          </div>
-                          <strong>{state.clientKeys.length}</strong>
-                          <p>Max 10</p>
-
-                        </Card.Content>
-                      </Card>
-                    </motion.div>
-                  </motion.section>
-
-                  <section className="content-grid overview-main-grid">
-                    <motion.article
-                      className="admin-panel chart-panel"
-                      initial={{ opacity: 0, scale: 0.98,  }}
-                      animate={{ opacity: 1, scale: 1,  }}
-                      transition={{ delay: 0.4, duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
+                      }}
+                      initial="hidden"
+                      animate="show"
                     >
-                      <div className="section-heading">
-                        <h3>Request trends (Reset every 5 Hours)</h3>
-                        <span className="status-pill success">LIVE</span>
-                      </div>
-                      <div className="overview-chart-stats">
-                        <div className="overview-chart-stat"><span>Total requests</span><strong>{overviewFilteredLogs.length}</strong></div>
-                        <div className="overview-chart-stat"><span>Success rate</span><strong>{overviewSuccessRate}%</strong></div>
-                        <div className="overview-chart-stat"><span>Selected model</span><strong>{state.config.selectedModel || "None"}</strong></div>
-                      </div>
-                      <div className="chartjs-shell overview-chart-shell" style={{ background: 'linear-gradient(180deg, rgba(255,255,255,0.02) 0%, rgba(255,255,255,0.008) 100%)', borderRadius: '20px', padding: '18px 18px 12px', border: '1px solid rgba(255,255,255,0.05)' }}>
-                        <Line data={requestTrendData} options={requestTrendOptions} />
-                      </div>
-                    </motion.article>
+                      <motion.div variants={{ hidden: { opacity: 0, y: 20, }, show: { opacity: 1, y: 0, } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
+                        <Card className="metric-card">
+                          <Card.Content className="metric-card-content">
+                            <div className="metric-head">
+                              <span className="metric-title">Today's requests</span>
+                              <div className="metric-icon-circle green">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"><path fill="currentColor" fillRule="evenodd" d="M3.464 3.464C2 4.93 2 7.286 2 12s0 7.071 1.464 8.535C4.93 22 7.286 22 12 22s7.071 0 8.535-1.465C22 19.072 22 16.714 22 12s0-7.071-1.465-8.536C19.072 2 16.714 2 12 2S4.929 2 3.464 3.464M13.75 10c0 .414.336.75.75.75h.69l-2.013 2.013a.25.25 0 0 1-.354 0l-1.586-1.586a1.75 1.75 0 0 0-2.474 0L6.47 13.47a.75.75 0 1 0 1.06 1.06l2.293-2.293a.25.25 0 0 1 .354 0l1.586 1.586a1.75 1.75 0 0 0 2.474 0l2.013-2.012v.689a.75.75 0 0 0 1.5 0V10a.75.75 0 0 0-.75-.75h-2.5a.75.75 0 0 0-.75.75" clipRule="evenodd" strokeWidth="0.5" stroke="currentColor" /></svg>
+                              </div>
+                            </div>
+                            <strong>{overviewFilteredLogs.length}</strong>
+                            <p>Success: {overviewSuccessCount} / Failed: {overviewFailedCount}</p>
 
-                    <motion.article
-                      className="admin-panel activity-panel overview-activity-panel"
-                      initial={{ opacity: 0, x: 20,  }}
-                      animate={{ opacity: 1, x: 0,  }}
-                      transition={{ delay: 0.5, duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
+                          </Card.Content>
+                        </Card>
+                      </motion.div>
+
+                      <motion.div variants={{ hidden: { opacity: 0, y: 20, }, show: { opacity: 1, y: 0, } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
+                        <Card className="metric-card">
+                          <Card.Content className="metric-card-content">
+                            <div className="metric-head">
+                              <span className="metric-title">Today's tokens</span>
+                              <div className="metric-icon-circle orange">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 512 512"><path fill="currentColor" d="M256 117c-65.2 0-124.2 11.6-166.13 29.7c-20.95 9.1-37.57 19.8-48.57 31.1S25 200.4 25 212s5.3 22.9 16.3 34.2s27.62 22 48.57 31.1C131.8 295.4 190.8 307 256 307s124.2-11.6 166.1-29.7c21-9.1 37.6-19.8 48.6-31.1S487 223.6 487 212s-5.3-22.9-16.3-34.2s-27.6-22-48.6-31.1C380.2 128.6 321.2 117 256 117M25 255.1v50.2c0 6.3 5.3 17.6 16.3 28.9s27.62 22 48.57 31.1C131.8 383.4 190.8 395 256 395s124.2-11.6 166.1-29.7c21-9.1 37.6-19.8 48.6-31.1s16.3-22.6 16.3-28.9v-50.2c-1.1 1.3-2.2 2.5-3.4 3.7c-13.3 13.6-31.8 25.3-54.3 35c-45 19.5-106 31.2-173.3 31.2s-128.3-11.7-173.28-31.2c-22.49-9.7-41.01-21.4-54.3-35c-1.19-1.2-2.32-2.5-3.42-3.7" strokeWidth="13" stroke="currentColor" /></svg>
+                              </div>
+                            </div>
+                            <strong>{overviewTokens}</strong>
+                            <p>Cached: 0 Reasoning: {Math.round(overviewTokens * 0.094)}</p>
+
+                          </Card.Content>
+                        </Card>
+                      </motion.div>
+
+                      <motion.div variants={{ hidden: { opacity: 0, y: 20, }, show: { opacity: 1, y: 0, } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
+                        <Card className="metric-card">
+                          <Card.Content className="metric-card-content">
+                            <div className="metric-head">
+                              <span className="metric-title">Rate Limit</span>
+                              <div className="metric-icon-circle green">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"><path fill="currentColor" d="M17 3.34a10 10 0 1 1-14.995 8.984L2 12l.005-.324A10 10 0 0 1 17 3.34M12 6a1 1 0 0 0-.993.883L11 7v5l.009.131a1 1 0 0 0 .197.477l.087.1l3 3l.094.082a1 1 0 0 0 1.226 0l.094-.083l.083-.094a1 1 0 0 0 0-1.226l-.083-.094L13 11.585V7l-.007-.117A1 1 0 0 0 12 6" strokeWidth="0.5" stroke="currentColor" /></svg>
+                              </div>
+                            </div>
+                            <strong>10 RPM</strong>
+                            <p>{overviewCurrentRpm.toFixed(1)} RPM current</p>
+
+                          </Card.Content>
+                        </Card>
+                      </motion.div>
+
+                      <motion.div variants={{ hidden: { opacity: 0, y: 20, }, show: { opacity: 1, y: 0, } }} whileHover={{ y: -5, transition: { duration: 0.2 } }}>
+                        <Card className="metric-card">
+                          <Card.Content className="metric-card-content">
+                            <div className="metric-head">
+                              <span className="metric-title">Active Keys</span>
+                              <div className="metric-icon-circle blue">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 512 512"><path fill="currentColor" d="M218.1 167.2c0 13 0 25.6 4.1 37.4c-43.1 50.6-167.5 194.5-167.5 194.5l2.9 36.3s34.8 33 40 28c15.4-15 24.8-25.2 24.8-25.2l7.24-43.35l47.11-3.47l3.78-46.8l49.63-.95l.49-50.09l52.69 2.1l9-18.84c15.5 6.7 29.6 9.4 47.7 9.4c68.5 0 124-53.4 124-119.2S408.5 48 340 48s-121.9 53.4-121.9 119.2M406.85 144A38.85 38.85 0 1 1 368 105.15A38.81 38.81 0 0 1 406.85 144" strokeWidth="13" stroke="currentColor" /></svg>
+                              </div>
+                            </div>
+                            <strong>{state.clientKeys.length}</strong>
+                            <p>Max 10</p>
+
+                          </Card.Content>
+                        </Card>
+                      </motion.div>
+                    </motion.section>
+
+                    <section className="content-grid overview-main-grid">
+                      <motion.article
+                        className="admin-panel chart-panel"
+                        initial={{ opacity: 0, scale: 0.98, }}
+                        animate={{ opacity: 1, scale: 1, }}
+                        transition={{ delay: 0.4, duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
+                      >
+                        <div className="section-heading">
+                          <h3>Request trends (Reset every 5 Hours)</h3>
+                          <span className="status-pill success">LIVE</span>
+                        </div>
+                        <div className="overview-chart-stats">
+                          <div className="overview-chart-stat"><span>Total requests</span><strong>{overviewFilteredLogs.length}</strong></div>
+                          <div className="overview-chart-stat"><span>Success rate</span><strong>{overviewSuccessRate}%</strong></div>
+                          <div className="overview-chart-stat"><span>Selected model</span><strong>{state.config.selectedModel || "None"}</strong></div>
+                        </div>
+                        <div className="chartjs-shell overview-chart-shell" style={{ background: 'linear-gradient(180deg, rgba(255,255,255,0.02) 0%, rgba(255,255,255,0.008) 100%)', borderRadius: '20px', padding: '18px 18px 12px', border: '1px solid rgba(255,255,255,0.05)' }}>
+                          <Line data={requestTrendData} options={requestTrendOptions} />
+                        </div>
+                      </motion.article>
+
+                      <motion.article
+                        className="admin-panel activity-panel overview-activity-panel"
+                        initial={{ opacity: 0, x: 20, }}
+                        animate={{ opacity: 1, x: 0, }}
+                        transition={{ delay: 0.5, duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
+                      >
+                        <div className="section-heading">
+                          <h3>Recent activity</h3>
+                          <button className="premium-button ghost sm" onClick={() => refresh()}>
+                            <Icon icon="solar:refresh-bold" className="btn-icon" />
+                            Refresh
+                          </button>
+                        </div>
+                        {overviewFilteredLogs.length === 0 ? <div className="empty-logs dark-empty" style={{ background: 'rgba(255,255,255,0.01)', border: '1px dashed rgba(255,255,255,0.05)', borderRadius: '14px', padding: '32px' }}>No activity yet.</div> : null}
+                        <div className="activity-list">
+                          {overviewFilteredLogs.slice(0, 6).map((entry) => (
+                            <div className="activity-item" key={entry.id}>
+                              <div className="activity-info">
+                                <strong style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                  {entry.path}
+                                  {entry.requestType === 'model_probe' && (
+                                    <span style={{
+                                      fontSize: '9px', fontWeight: 800, padding: '1px 5px',
+                                      background: 'rgba(99, 102, 241, 0.15)', color: '#818cf8',
+                                      border: '1px solid rgba(99, 102, 241, 0.3)', borderRadius: '3px',
+                                      textTransform: 'uppercase', letterSpacing: '0.05em'
+                                    }}>Model Probe</span>
+                                  )}
+                                </strong>
+                                <p>{entry.requestType === 'model_probe' ? 'Auto-triggered by client model switch' : (entry.model ?? "No model")}</p>
+                              </div>
+                              <div className="activity-meta">
+                                <span className={`status-badge ${entry.status >= 400 ? "status-bad" : "status-good"}`}>
+                                  {entry.status} {entry.status >= 400 ? 'Error' : 'Success'}
+                                </span>
+                                <span className="activity-time">{new Date(entry.timestamp).toLocaleTimeString()}</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </motion.article>
+                    </section>
+
+                    <motion.section
+                      className="content-grid lower-grid overview-lower-grid"
+                      initial={{ opacity: 0, y: 20, }}
+                      animate={{ opacity: 1, y: 0, }}
+                      transition={{ delay: 0.6, duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
                     >
-                      <div className="section-heading">
-                        <h3>Recent activity</h3>
-                        <button className="premium-button ghost sm" onClick={() => refresh()}>
-                          <Icon icon="solar:refresh-bold" className="btn-icon" />
-                          Refresh
-                        </button>
-                      </div>
-                      {overviewFilteredLogs.length === 0 ? <div className="empty-logs dark-empty" style={{ background: 'rgba(255,255,255,0.01)', border: '1px dashed rgba(255,255,255,0.05)', borderRadius: '14px', padding: '32px' }}>No activity yet.</div> : null}
-                      <div className="activity-list">
-                        {overviewFilteredLogs.slice(0, 6).map((entry) => (
-                          <div className="activity-item" key={entry.id}>
-                            <div className="activity-info">
-                              <strong style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                {entry.path}
-                                {entry.requestType === 'model_probe' && (
-                                  <span style={{
-                                    fontSize: '9px', fontWeight: 800, padding: '1px 5px',
-                                    background: 'rgba(99, 102, 241, 0.15)', color: '#818cf8',
-                                    border: '1px solid rgba(99, 102, 241, 0.3)', borderRadius: '3px',
-                                    textTransform: 'uppercase', letterSpacing: '0.05em'
-                                  }}>Model Probe</span>
-                                )}
-                              </strong>
-                              <p>{entry.requestType === 'model_probe' ? 'Auto-triggered by client model switch' : (entry.model ?? "No model")}</p>
+                      <article className="admin-panel settings-panel overview-settings-panel">
+                        <div className="settings-content-wrap split-layout" style={{ gap: '24px' }}>
+                          <div className="settings-column" style={{ flex: 1 }}>
+                            <div className="section-heading" style={{ marginBottom: '12px' }}>
+                              <h3 style={{ fontSize: '14px', opacity: 0.8 }}>Local Port settings</h3>
                             </div>
-                            <div className="activity-meta">
-                              <span className={`status-badge ${entry.status >= 400 ? "status-bad" : "status-good"}`}>
-                                {entry.status} {entry.status >= 400 ? 'Error' : 'Success'}
-                              </span>
-                              <span className="activity-time">{new Date(entry.timestamp).toLocaleTimeString()}</span>
+                            <div className="settings-sub-card">
+                              <label className="inline-setting-row no-bg" style={{ margin: 0, border: 'none', background: 'transparent' }}>
+                                <span>Local port change</span>
+                                <input type="number" value={form.localPort} onChange={(e) => setForm({ ...form, localPort: Number(e.target.value) })} />
+                              </label>
                             </div>
                           </div>
-                        ))}
-                      </div>
-                    </motion.article>
-                  </section>
 
-                  <motion.section
-                    className="content-grid lower-grid overview-lower-grid"
-                    initial={{ opacity: 0, y: 20,  }}
-                    animate={{ opacity: 1, y: 0,  }}
-                    transition={{ delay: 0.6, duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
-                  >
-                    <article className="admin-panel settings-panel overview-settings-panel">
-                      <div className="settings-content-wrap split-layout" style={{ gap: '24px' }}>
-                        <div className="settings-column" style={{ flex: 1 }}>
-                          <div className="section-heading" style={{ marginBottom: '12px' }}>
-                            <h3 style={{ fontSize: '14px', opacity: 0.8 }}>Local Port settings</h3>
-                          </div>
-                          <div className="settings-sub-card">
-                            <label className="inline-setting-row no-bg" style={{ margin: 0, border: 'none', background: 'transparent' }}>
-                              <span>Local port change</span>
-                              <input type="number" value={form.localPort} onChange={(e) => setForm({ ...form, localPort: Number(e.target.value) })} />
-                            </label>
+                          <div className="settings-column" style={{ flex: 1 }}>
+                            <div className="section-heading" style={{ marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                              <h3 style={{ fontSize: '14px', opacity: 0.8 }}>Community & Support</h3>
+                              <span style={{ fontSize: '10px', color: 'var(--muted)', fontWeight: 600, letterSpacing: '0.05em' }}>(Sparkly Official)</span>
+                            </div>
+                            <div className="settings-sub-card support-sub-card" style={{ margin: 0, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.05)' }}>
+                              <div className="inline-support-links">
+                                <a href="https://t.me/sparklydeep" target="_blank" rel="noreferrer" className="footer-support-btn tg">Telegram</a>
+                                <a href="https://discord.gg/dH2GJX8X7" target="_blank" rel="noreferrer" className="footer-support-btn ds">Discord</a>
+                              </div>
+                            </div>
                           </div>
                         </div>
-
-                        <div className="settings-column" style={{ flex: 1 }}>
-                          <div className="section-heading" style={{ marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                            <h3 style={{ fontSize: '14px', opacity: 0.8 }}>Community & Support</h3>
-                            <span style={{ fontSize: '10px', color: 'var(--muted)', fontWeight: 600, letterSpacing: '0.05em' }}>(Sparkly Official)</span>
-                          </div>
-                          <div className="settings-sub-card support-sub-card" style={{ margin: 0, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.05)' }}>
-                            <div className="inline-support-links">
-                              <a href="https://t.me/sparklydeep" target="_blank" rel="noreferrer" className="footer-support-btn tg">Telegram</a>
-                              <a href="https://discord.gg/dH2GJX8X7" target="_blank" rel="noreferrer" className="footer-support-btn ds">Discord</a>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    </article>
-                  </motion.section>
-                </motion.div>
-              ) : isApiKeys ? (
-                <motion.div
-                  key="apiKeys"
-                  initial={{ opacity: 0, y: 15,  }}
-                  animate={{ opacity: 1, y: 0,  }}
-                  exit={{ opacity: 0, y: -15,  }}
-                  transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-                >
-                  <ApiKeysPage
-                    state={state}
-                    form={form}
-                    setForm={setForm}
-                    apiKeyModelQuery={apiKeyModelQuery}
-                    setApiKeyModelQuery={setApiKeyModelQuery}
-                    clientBaseUrl={clientBaseUrl}
-                    localClientKey={localClientKey}
-                    saving={saving}
-                    onRefreshActiveAccountModels={onRefreshActiveAccountModels}
-                    openEditKeyModal={openEditKeyModal}
-                    onDeleteKey={onDeleteKey}
-                    onOpenCreateKey={() => { setNewKeyName(""); setIsCreateKeyOpen(true); }}
-                    onSave={onSave}
-                  />
-                </motion.div>
-              ) : isUsage ? (
-                <motion.div
-                  key="usage"
-                  initial={{ opacity: 0, y: 15,  }}
-                  animate={{ opacity: 1, y: 0,  }}
-                  exit={{ opacity: 0, y: -15,  }}
-                  transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-                >
-                  <UsagePage
-                    usageMode={usageMode}
-                    setUsageMode={setUsageMode}
-                    state={state}
-                    realLogs={realLogs}
-                    totalTokenEstimate={totalTokenEstimate}
-                    rpm={rpm}
-                    totalCostEstimate={totalCostEstimate}
-                    usageRequestChartData={usageRequestChartData}
-                    usageRequestChartOptions={usageRequestChartOptions}
-                    usageTokenChartData={usageTokenChartData}
-                    usageTokenChartOptions={usageTokenChartOptions}
-                    modelStats={modelStats}
-                    keyStats={keyStats}
-                    usageRecords={usageRecords}
-                    requestTab={requestTab}
-                    setRequestTab={setRequestTab}
-                    tokenTab={tokenTab}
-                    setTokenTab={setTokenTab}
-                    timeFilter={timeFilter}
-                    setTimeFilter={setTimeFilter}
-                  />
-                </motion.div>
-              ) : isAccounts ? (
-                <motion.div
-                  key="accounts"
-                  initial={{ opacity: 0, y: 15,  }}
-                  animate={{ opacity: 1, y: 0,  }}
-                  exit={{ opacity: 0, y: -15,  }}
-                  transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-                >
-                  <AccountsPage
-                    state={state}
-                    form={form}
-                    saving={saving}
-                    onRefreshActiveAccountModels={onRefreshActiveAccountModels}
-                    openEditAccountModal={openEditAccountModal}
-                    onSelectAccount={onSelectAccount}
-                    onDeleteAccount={onDeleteAccount}
-                  />
-                </motion.div>
-              ) : isPlayground ? (
-                <motion.div
-                  key="playground"
-                  initial={{ opacity: 0, y: 15,  }}
-                  animate={{ opacity: 1, y: 0,  }}
-                  exit={{ opacity: 0, y: -15,  }}
-                  transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-                >
-                  <PlaygroundPage
-                    models={playgroundAvailableModels}
-                    playgroundModelQuery={playgroundModelQuery}
-                    setPlaygroundModelQuery={setPlaygroundModelQuery}
-                    playgroundBaseUrl={playgroundBaseUrl}
-                    setPlaygroundBaseUrl={setPlaygroundBaseUrl}
-                    playgroundApiKey={playgroundApiKey}
-                    setPlaygroundApiKey={setPlaygroundApiKey}
-                    playgroundModel={playgroundModel}
-                    setPlaygroundModel={setPlaygroundModel}
-                    playgroundSystemPrompt={playgroundSystemPrompt}
-                    setPlaygroundSystemPrompt={setPlaygroundSystemPrompt}
-                    playgroundMessage={playgroundMessage}
-                    setPlaygroundMessage={setPlaygroundMessage}
-                    playgroundModelsResult={playgroundModelsResult}
-                    playgroundModelsLoading={playgroundModelsLoading}
-                    playgroundResult={playgroundResult}
-                    setPlaygroundResult={setPlaygroundResult}
-                    playgroundLoading={playgroundLoading}
-                    onLoadPlaygroundModels={onLoadPlaygroundModels}
-                    onRunPlayground={onRunPlayground}
-                  />
-                </motion.div>
-              ) : activeSection === "mitm" ? (
-                <motion.div
-                  key="mitm"
-                  initial={{ opacity: 0, y: 15 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -15 }}
-                  transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-                >
-                  <MITMPage />
-                </motion.div>
-              ) : null}
-            </AnimatePresence>
+                      </article>
+                    </motion.section>
+                  </motion.div>
+                ) : isApiKeys ? (
+                  <motion.div
+                    key="apiKeys"
+                    initial={{ opacity: 0, y: 15, }}
+                    animate={{ opacity: 1, y: 0, }}
+                    exit={{ opacity: 0, y: -15, }}
+                    transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                  >
+                    <ApiKeysPage
+                      state={state}
+                      form={form}
+                      setForm={setForm}
+                      apiKeyModelQuery={apiKeyModelQuery}
+                      setApiKeyModelQuery={setApiKeyModelQuery}
+                      clientBaseUrl={clientBaseUrl}
+                      localClientKey={localClientKey}
+                      saving={saving}
+                      onRefreshActiveAccountModels={onRefreshActiveAccountModels}
+                      openEditKeyModal={openEditKeyModal}
+                      onDeleteKey={onDeleteKey}
+                      onOpenCreateKey={() => { setNewKeyName(""); setIsCreateKeyOpen(true); }}
+                      onSave={onSave}
+                    />
+                  </motion.div>
+                ) : isUsage ? (
+                  <motion.div
+                    key="usage"
+                    initial={{ opacity: 0, y: 15, }}
+                    animate={{ opacity: 1, y: 0, }}
+                    exit={{ opacity: 0, y: -15, }}
+                    transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                  >
+                    <UsagePage
+                      usageMode={usageMode}
+                      setUsageMode={setUsageMode}
+                      state={state}
+                      realLogs={realLogs}
+                      totalTokenEstimate={totalTokenEstimate}
+                      rpm={rpm}
+                      totalCostEstimate={totalCostEstimate}
+                      usageRequestChartData={usageRequestChartData}
+                      usageRequestChartOptions={usageRequestChartOptions}
+                      usageTokenChartData={usageTokenChartData}
+                      usageTokenChartOptions={usageTokenChartOptions}
+                      modelStats={modelStats}
+                      keyStats={keyStats}
+                      usageRecords={usageRecords}
+                      requestTab={requestTab}
+                      setRequestTab={setRequestTab}
+                      tokenTab={tokenTab}
+                      setTokenTab={setTokenTab}
+                      timeFilter={timeFilter}
+                      setTimeFilter={setTimeFilter}
+                    />
+                  </motion.div>
+                ) : isAccounts ? (
+                  <motion.div
+                    key="accounts"
+                    initial={{ opacity: 0, y: 15, }}
+                    animate={{ opacity: 1, y: 0, }}
+                    exit={{ opacity: 0, y: -15, }}
+                    transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                  >
+                    <AccountsPage
+                      state={state}
+                      form={form}
+                      saving={saving}
+                      onRefreshActiveAccountModels={onRefreshActiveAccountModels}
+                      openEditAccountModal={openEditAccountModal}
+                      onSelectAccount={onSelectAccount}
+                      onDeleteAccount={onDeleteAccount}
+                    />
+                  </motion.div>
+                ) : isPlayground ? (
+                  <motion.div
+                    key="playground"
+                    initial={{ opacity: 0, y: 15, }}
+                    animate={{ opacity: 1, y: 0, }}
+                    exit={{ opacity: 0, y: -15, }}
+                    transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                  >
+                    <PlaygroundPage
+                      accounts={state.config.accounts}
+                      models={playgroundAvailableModels}
+                      playgroundModelQuery={playgroundModelQuery}
+                      setPlaygroundModelQuery={setPlaygroundModelQuery}
+                      playgroundBaseUrl={playgroundBaseUrl}
+                      setPlaygroundBaseUrl={setPlaygroundBaseUrl}
+                      playgroundApiKey={playgroundApiKey}
+                      setPlaygroundApiKey={setPlaygroundApiKey}
+                      playgroundModel={playgroundModel}
+                      setPlaygroundModel={setPlaygroundModel}
+                      playgroundSystemPrompt={playgroundSystemPrompt}
+                      setPlaygroundSystemPrompt={setPlaygroundSystemPrompt}
+                      playgroundMessage={playgroundMessage}
+                      setPlaygroundMessage={setPlaygroundMessage}
+                      playgroundModelsResult={playgroundModelsResult}
+                      playgroundModelsLoading={playgroundModelsLoading}
+                      playgroundResult={playgroundResult}
+                      setPlaygroundResult={setPlaygroundResult}
+                      playgroundLoading={playgroundLoading}
+                      onLoadPlaygroundModels={onLoadPlaygroundModels}
+                      onRunPlayground={onRunPlayground}
+                    />
+                  </motion.div>
+                ) : activeSection === "mitm" ? (
+                  <motion.div
+                    key="mitm"
+                    initial={{ opacity: 0, y: 15 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -15 }}
+                    transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                  >
+                    <MITMPage state={state} />
+                  </motion.div>
+                ) : activeSection === "consoleLogs" ? (
+                  <motion.div
+                    key="consoleLogs"
+                    initial={{ opacity: 0, y: 15 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -15 }}
+                    transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                  >
+                    <ConsoleLogsPage />
+                  </motion.div>
+                ) : null}
+              </AnimatePresence>
             </Suspense>
+            </ErrorBoundary>
           </main>
 
           <AnimatePresence>
@@ -1267,9 +1312,9 @@ export default function App() {
                 onKeyDown={(e) => { if (e.key === 'Escape') setIsCreateKeyOpen(false); }}
               >
                 <motion.div
-                  initial={{ opacity: 0, scale: 0.9,  }}
-                  animate={{ opacity: 1, scale: 1,  }}
-                  exit={{ opacity: 0, scale: 0.9,  }}
+                  initial={{ opacity: 0, scale: 0.9, }}
+                  animate={{ opacity: 1, scale: 1, }}
+                  exit={{ opacity: 0, scale: 0.9, }}
                   transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
                   style={{ width: '100%', maxWidth: '480px' }}
                 >
@@ -1305,9 +1350,9 @@ export default function App() {
                 onKeyDown={(e) => { if (e.key === 'Escape') setIsEditKeyOpen(false); }}
               >
                 <motion.div
-                  initial={{ opacity: 0, scale: 0.9,  }}
-                  animate={{ opacity: 1, scale: 1,  }}
-                  exit={{ opacity: 0, scale: 0.9,  }}
+                  initial={{ opacity: 0, scale: 0.9, }}
+                  animate={{ opacity: 1, scale: 1, }}
+                  exit={{ opacity: 0, scale: 0.9, }}
                   transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
                   style={{ width: '100%', maxWidth: '480px' }}
                 >
@@ -1342,9 +1387,9 @@ export default function App() {
                 onKeyDown={(e) => { if (e.key === 'Escape') setIsAccountModalOpen(false); }}
               >
                 <motion.div
-                  initial={{ opacity: 0, scale: 0.9,  }}
-                  animate={{ opacity: 1, scale: 1,  }}
-                  exit={{ opacity: 0, scale: 0.9,  }}
+                  initial={{ opacity: 0, scale: 0.9, }}
+                  animate={{ opacity: 1, scale: 1, }}
+                  exit={{ opacity: 0, scale: 0.9, }}
                   transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
                   style={{ width: '100%', maxWidth: '560px' }}
                 >
@@ -1370,19 +1415,11 @@ export default function App() {
                       </label>
                       <label className="account-modal-field">
                         <span>Provider</span>
-                        <select
-                          className="provider-dropdown account-provider-select"
+                        <Select
+                          options={accountProviderOptions}
                           value={accountProvider}
-                          onChange={(event) => onSelectAccountProvider(event.target.value as AccountProvider)}
-                        >
-                          {accountProviderOptions.map((provider) => (
-                            <option key={provider.value} value={provider.value}>{provider.label}</option>
-                          ))}
-                        </select>
-                        <div className="account-provider-hint">
-                          <Icon icon={accountProvider === "v0" ? "solar:stars-bold-duotone" : "solar:server-square-cloud-bold-duotone"} />
-                          <span>{accountProviderOptions.find((provider) => provider.value === accountProvider)?.description}</span>
-                        </div>
+                          onChange={(val) => onSelectAccountProvider(val as AccountProvider)}
+                        />
                       </label>
                       <label className="account-modal-field">
                         <span>Base URL</span>

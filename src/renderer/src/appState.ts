@@ -260,7 +260,7 @@ export function getUsageRecords(logs: BridgeState["logs"], clientKeys: BridgeSta
   });
 }
 
-export type SectionKey = "overview" | "apiKeys" | "usage" | "accounts" | "playground";
+export type SectionKey = "overview" | "apiKeys" | "usage" | "accounts" | "playground" | "mitm" | "consoleLogs";
 
 export type AppViewModel = {
   state: BridgeState;
