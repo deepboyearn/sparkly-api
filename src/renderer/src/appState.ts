@@ -1,5 +1,14 @@
 import type { BridgeConfig, BridgeState, PlaygroundTestResult } from "../../shared/types";
 
+function shallowEqual(a: any, b: any): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  const ka = Object.keys(a), kb = Object.keys(b);
+  if (ka.length !== kb.length) return false;
+  for (const k of ka) if (a[k] !== b[k]) return false;
+  return true;
+}
+
 export const emptyState: BridgeState = {
   config: {
     upstreamBaseUrl: "https://cn.chrouter.com:8443",
@@ -26,19 +35,24 @@ export const emptyState: BridgeState = {
   clientKeys: [],
 };
 
-export function normalizeBridgeState(input: Partial<BridgeState>): BridgeState {
-  return {
-    config: {
-      ...emptyState.config,
-      ...input.config,
-    },
-    stats: {
-      ...emptyState.stats,
-      ...input.stats,
-    },
-    logs: Array.isArray(input.logs) ? input.logs : [],
-    clientKeys: Array.isArray(input.clientKeys) ? input.clientKeys : [],
-  };
+export function normalizeBridgeState(input: Partial<BridgeState>, prev?: BridgeState): BridgeState {
+  const config = { ...emptyState.config, ...input.config };
+  const stats = { ...emptyState.stats, ...input.stats };
+  const logs = Array.isArray(input.logs) ? [...input.logs] : [];
+  const clientKeys = Array.isArray(input.clientKeys) ? [...input.clientKeys] : [];
+
+  // Skip re-render if data is identical
+  if (prev &&
+      shallowEqual(config, prev.config) &&
+      shallowEqual(stats, prev.stats) &&
+      logs.length === prev.logs.length &&
+      logs[0]?.id === prev.logs[0]?.id &&
+      clientKeys.length === prev.clientKeys.length &&
+      clientKeys[0]?.id === prev.clientKeys[0]?.id) {
+    return prev; // Same reference = no re-render
+  }
+
+  return { config, stats, logs, clientKeys };
 }
 
 export function parseModels(value: string) {

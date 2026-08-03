@@ -6,11 +6,196 @@ pub mod types;
 pub mod config;
 pub mod bridge;
 pub mod tools;
+pub mod trust_store;
+pub mod mitm_server;
+pub mod model_mapper;
 
 use std::sync::Arc;
 use tauri::Manager;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use types::*;
+use std::collections::HashMap;
+
+// ─── Cross-Platform Elevation ────────────────────────────────────────────────
+
+/// Check if the current process has admin/root privileges.
+pub fn is_elevated() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows_check_admin()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var("PKEXEC_UID").is_ok() || std::env::var("SUDO_UID").is_ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var("SUDO_UID").is_ok()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
+}
+
+/// Request elevation: re-launch with admin/root privileges.
+/// Returns Ok(true) if elevated instance launched, Ok(false) if user declined.
+pub fn request_elevation() -> Result<bool, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe_str = exe.to_str().ok_or("exe path not valid UTF-8")?;
+
+    #[cfg(target_os = "windows")]
+    {
+        windows_request_elevation(exe_str)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        linux_request_elevation(exe_str)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        macos_request_elevation(exe_str)
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        Err("Elevation not supported on this platform".into())
+    }
+}
+
+// ── Windows ──────────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "windows")]
+fn windows_check_admin() -> bool {
+    use std::ffi::c_void;
+
+    type HANDLE = *mut c_void;
+    type BOOL = i32;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn CheckTokenMembership(TokenHandle: HANDLE, SidToCheck: *const c_void, IsMember: *mut BOOL) -> BOOL;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentToken() -> HANDLE;
+        fn CloseHandle(hObject: HANDLE) -> BOOL;
+    }
+
+    unsafe {
+        let mut is_member: BOOL = 0;
+        let mut sid = [0u8; 8];
+        sid[0] = 1; sid[1] = 1;
+        let sub_auth = [32u16.to_le_bytes(), 544u16.to_le_bytes()].concat();
+        std::ptr::copy_nonoverlapping(sub_auth.as_ptr(), sid[8..].as_mut_ptr() as *mut u8, 4);
+        let token = GetCurrentToken();
+        let result = CheckTokenMembership(token, sid.as_ptr() as *const c_void, &mut is_member);
+        CloseHandle(token);
+        result != 0 && is_member != 0
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_request_elevation(exe: &str) -> Result<bool, String> {
+    use std::ffi::c_void;
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    type HANDLE = *mut c_void;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn ShellExecuteW(hwnd: HANDLE, lpOperation: *const u16, lpFile: *const u16,
+                         lpParameters: *const u16, lpDirectory: *const u16, nShowCmd: i32) -> HANDLE;
+    }
+
+    let to_wide = |s: &str| -> Vec<u16> {
+        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    };
+
+    unsafe {
+        let verb = to_wide("runas");
+        let file = to_wide(exe);
+        let empty = to_wide("");
+        let result = ShellExecuteW(
+            std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(),
+            empty.as_ptr(), empty.as_ptr(), 1,
+        );
+        if (result as usize) > 32 { Ok(true) } else { Ok(false) }
+    }
+}
+
+// ── Linux ────────────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+fn linux_request_elevation(exe: &str) -> Result<bool, String> {
+    // Try pkexec first (standard Polkit prompt — GNOME/KDE/XFCE)
+    if command_exists("pkexec") {
+        std::process::Command::new("pkexec")
+            .arg(exe)
+            .spawn()
+            .map_err(|e| format!("pkexec failed: {e}"))?;
+        return Ok(true);
+    }
+
+    // Fallback: gksudo (GNOME2 / some XFCE)
+    if command_exists("gksudo") {
+        std::process::Command::new("gksudo")
+            .args(["--", exe])
+            .spawn()
+            .map_err(|e| format!("gksudo failed: {e}"))?;
+        return Ok(true);
+    }
+
+    // Fallback: kdesudo (KDE)
+    if command_exists("kdesudo") {
+        std::process::Command::new("kdesudo")
+            .args(["-c", exe])
+            .spawn()
+            .map_err(|e| format!("kdesudo failed: {e}"))?;
+        return Ok(true);
+    }
+
+    Err("No elevation tool found (pkexec/gksudo/kdesudo). Run with: sudo ./sparkly-api".into())
+}
+
+#[cfg(target_os = "linux")]
+fn command_exists(cmd: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(cmd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+// ── macOS ────────────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+fn macos_request_elevation(exe: &str) -> Result<bool, String> {
+    // osascript shows the native macOS "Password" dialog
+    let script = format!(
+        "do shell script \"\\\"{}\\\"\" with administrator privileges",
+        exe.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+
+    let output = std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .map_err(|e| format!("osascript failed: {e}"))?;
+
+    if output.status.success() {
+        Ok(true)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("User canceled") || stderr.contains("(-128)") {
+            Ok(false) // User clicked Cancel
+        } else {
+            Err(format!("macOS elevation failed: {stderr}"))
+        }
+    }
+}
 
 /// Shared application state.
 ///
@@ -24,6 +209,9 @@ pub struct AppState {
     pub stats: RwLock<BridgeStats>,
     pub started_at: std::time::Instant,
     pub data_dir: std::path::PathBuf,
+    pub mitm_running: RwLock<bool>,
+    pub mitm_shutdown_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    pub model_mappings: RwLock<HashMap<String, String>>,
 }
 
 pub fn run() {
@@ -67,6 +255,9 @@ pub fn run() {
                 }),
                 started_at: std::time::Instant::now(),
                 data_dir: data_dir.clone(),
+                mitm_running: RwLock::new(false),
+                mitm_shutdown_tx: Mutex::new(None),
+                model_mappings: RwLock::new(model_mapper::default_mappings()),
             };
 
             let state_arc = Arc::new(state);
@@ -94,6 +285,13 @@ pub fn run() {
             reset_usage,
             playground_load_models,
             playground_test,
+            trust_mitm_cert,
+            untrust_mitm_cert,
+            get_mitm_cert_status,
+            start_mitm_server_cmd,
+            stop_mitm_server_cmd,
+            update_mitm_model_mappings,
+            get_mitm_model_mappings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -294,4 +492,175 @@ async fn playground_test(
     input: PlaygroundTestInput,
 ) -> Result<PlaygroundTestResult, String> {
     bridge::playground_test(input).await
+}
+
+// ─── MITM Trust Store Commands ───────────────────────────────────────────────
+
+#[tauri::command]
+async fn trust_mitm_cert(state: tauri::State<'_, Arc<AppState>>) -> Result<bool, String> {
+    // Ensure CA cert exists
+    trust_store::get_or_generate_ca(&state.data_dir).map_err(|e| e.to_string())?;
+
+    // Try trust first — may succeed without elevation on some systems
+    match trust_store::trust(&state.data_dir) {
+        Ok(result) => return Ok(result),
+        Err(e) => {
+            let msg = e.to_string();
+            // Permission denied → request elevation
+            if msg.contains("Permission denied") || msg.contains("Operation not permitted")
+                || msg.contains("EACCES") || msg.contains("access denied")
+            {
+                tracing::info!("Trust requires elevation: {msg}");
+                match request_elevation() {
+                    Ok(true) => return Err("ADMIN_ELEVATION_REQUESTED".into()),
+                    Ok(false) => return Err("User declined elevation. Certificate trust requires administrator.".into()),
+                    Err(elev_err) => return Err(format!("Elevation failed: {elev_err}\n\nAlternatively, run:\nsudo update-ca-certificates")),
+                }
+            }
+            return Err(msg);
+        }
+    }
+}
+
+#[tauri::command]
+async fn untrust_mitm_cert(state: tauri::State<'_, Arc<AppState>>) -> Result<bool, String> {
+    match trust_store::untrust(&state.data_dir) {
+        Ok(result) => return Ok(result),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("Permission denied") || msg.contains("Operation not permitted")
+                || msg.contains("EACCES") || msg.contains("access denied")
+            {
+                match request_elevation() {
+                    Ok(true) => return Err("ADMIN_ELEVATION_REQUESTED".into()),
+                    Ok(false) => return Err("User declined elevation.".into()),
+                    Err(elev_err) => return Err(format!("Elevation failed: {elev_err}")),
+                }
+            }
+            return Err(msg);
+        }
+    }
+}
+
+#[tauri::command]
+async fn get_mitm_cert_status(state: tauri::State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+    let exists = trust_store::cert_exists(&state.data_dir);
+    let trusted = trust_store::is_trusted(&state.data_dir);
+    Ok(serde_json::json!({
+        "exists": exists,
+        "trusted": trusted,
+    }))
+}
+
+// ─── MITM Server Commands ────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn start_mitm_server_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    let running = *state.mitm_running.read().await;
+    if running {
+        return Ok(true);
+    }
+
+    // ── Cross-platform: check elevation, request if needed ──
+    if !is_elevated() {
+        tracing::info!("Requesting elevation for MITM server (port 443 requires root/admin)...");
+        match request_elevation() {
+            Ok(true) => {
+                return Err("ADMIN_ELEVATION_REQUESTED".into());
+            }
+            Ok(false) => {
+                return Err("User declined elevation. Port 443 requires administrator/root.".into());
+            }
+            Err(e) => {
+                return Err(format!("Elevation failed: {e}\n\nAlternatively, run the app as root:\nsudo ./sparkly-api"));
+            }
+        }
+    }
+
+    // Ensure CA cert exists
+    trust_store::get_or_generate_ca(&state.data_dir).map_err(|e| e.to_string())?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let data_dir = state.data_dir.clone();
+
+    {
+        let mut tx = state.mitm_shutdown_tx.lock().await;
+        *tx = Some(shutdown_tx);
+    }
+    {
+        let mut running = state.mitm_running.write().await;
+        *running = true;
+    }
+
+    let running_flag = Arc::new(tokio::sync::RwLock::new(true));
+    let flag_clone = running_flag.clone();
+
+    let mappings_clone = {
+        let mappings = state.model_mappings.read().await;
+        Arc::new(tokio::sync::RwLock::new(mappings.clone()))
+    };
+    tokio::spawn(async move {
+        let result = mitm_server::start_mitm_server(data_dir, 443, shutdown_rx, mappings_clone).await;
+        if let Err(e) = result {
+            tracing::error!("MITM server failed: {e}");
+        }
+        let mut flag = flag_clone.write().await;
+        *flag = false;
+    });
+
+    // Poll until the server is either started or failed
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if !*running_flag.read().await {
+            let mut running = state.mitm_running.write().await;
+            *running = false;
+            return Err("MITM server failed to start — check port 443 permissions".into());
+        }
+        let running = *state.mitm_running.read().await;
+        if running {
+            return Ok(true);
+        }
+    }
+
+    Ok(true)
+}
+
+#[tauri::command]
+async fn stop_mitm_server_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    let tx = {
+        let mut tx = state.mitm_shutdown_tx.lock().await;
+        tx.take()
+    };
+    if let Some(tx) = tx {
+        let _ = tx.send(());
+    }
+    {
+        let mut running = state.mitm_running.write().await;
+        *running = false;
+    }
+    Ok(true)
+}
+
+// ─── MITM Model Mapping Commands ────────────────────────────────────────────
+
+#[tauri::command]
+async fn update_mitm_model_mappings(
+    mappings: HashMap<String, String>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let mut stored = state.model_mappings.write().await;
+    *stored = mappings;
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_mitm_model_mappings(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<HashMap<String, String>, String> {
+    let mappings = state.model_mappings.read().await;
+    Ok(mappings.clone())
 }

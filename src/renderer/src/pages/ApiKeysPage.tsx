@@ -1,5 +1,5 @@
 import { memo, useState } from "react";
-import { Icon } from "@iconify/react";
+import { Icon } from "@iconify/react/offline";
 import type { BridgeConfig, BridgeState } from "../../../shared/types";
 import { maskKey } from "../appState";
 import { ModelPicker } from "../components/ModelPicker";
@@ -360,3 +360,5 @@ export const ApiKeysPage = memo(ApiKeysPageComponent, (prev, next) => {
     && prev.localClientKey === next.localClientKey
     && prev.saving === next.saving;
 });
+
+export default ApiKeysPage;

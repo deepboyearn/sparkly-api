@@ -21,5 +21,12 @@ export function installTauriBridgeApi() {
     openElectron: async () => {},
     openExternal: async (url: string) => { window.open(url, '_blank', 'noopener,noreferrer'); },
     openDevTools: async () => {},
+    trustMitmCert: () => invoke('trust_mitm_cert'),
+    untrustMitmCert: () => invoke('untrust_mitm_cert'),
+    getMitmCertStatus: () => invoke('get_mitm_cert_status'),
+    startMitmServer: () => invoke('start_mitm_server_cmd'),
+    stopMitmServer: () => invoke('stop_mitm_server_cmd'),
+    updateMitmModelMappings: (mappings: Record<string, string>) => invoke('update_mitm_model_mappings', { mappings }),
+    getMitmModelMappings: () => invoke('get_mitm_model_mappings'),
   };
 }

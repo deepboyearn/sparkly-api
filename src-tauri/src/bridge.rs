@@ -1194,10 +1194,14 @@ async fn forward_request(
     for (index, account) in accounts.iter().enumerate() {
         let is_last = index == last_index;
 
-        let result = if account.provider == AccountProvider::V0 {
-            forward_v0_request(account, upstream_path, method, body).await
-        } else {
-            forward_openai_compatible_request(account, upstream_path, method, body).await
+        let result = match account.provider {
+            AccountProvider::V0 => forward_v0_request(account, upstream_path, method, body).await,
+            AccountProvider::Anthropic => {
+                forward_anthropic_upstream(account, upstream_path, method, body).await
+            }
+            AccountProvider::OpenaiCompatible => {
+                forward_openai_compatible_request(account, upstream_path, method, body).await
+            }
         };
 
         match result {
@@ -1474,6 +1478,263 @@ async fn forward_v0_request(
             "v0": raw,
         }),
     ))
+}
+
+/// Forward to an Anthropic provider.
+///
+/// When the upstream account is configured as `AccountProvider::Anthropic`,
+/// we forward to `{base_url}/v1/messages` with `x-api-key` headers.
+///
+/// If `upstream_path` is `/v1/messages`, the body is already in Anthropic
+/// format and is forwarded as-is. If `upstream_path` is `/v1/chat/completions`
+/// (from `chat_completions_handler`), the body is in OpenAI format and is
+/// converted via `openai_to_anthropic_request` first.
+async fn forward_anthropic_upstream(
+    account: &UpstreamAccount,
+    upstream_path: &str,
+    method: &str,
+    body: Option<&Value>,
+) -> Result<(u16, String, Value), String> {
+    // Only forward POST to /v1/messages — other methods aren't part of the
+    // Anthropic Messages API.
+    if method != "POST" {
+        return Ok((
+            400,
+            "application/json".into(),
+            json!({"type": "error", "error": {"type": "invalid_request_error", "message": "Anthropic upstream only supports POST /v1/messages"}}),
+        ));
+    }
+
+    // Determine whether the body needs conversion from OpenAI → Anthropic.
+    // If the request came from `/v1/messages`, it's already Anthropic format.
+    // If from `/v1/chat/completions`, it's OpenAI format and needs conversion.
+    let forward_body = if upstream_path == "/v1/chat/completions" {
+        let request_body = body.unwrap_or(&Value::Null);
+        let model = request_body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("claude-sonnet-4-20250514");
+        openai_to_anthropic_request(request_body, model)
+    } else {
+        body.cloned().unwrap_or(json!({}))
+    };
+
+    let url = format!("{}/v1/messages", account.base_url.trim_end_matches('/'));
+    let client = &*UPSTREAM_CLIENT;
+
+    let resp = client
+        .post(&url)
+        .header("x-api-key", &account.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&forward_body)
+        .send()
+        .await
+        .map_err(|e| format!("Anthropic upstream request failed: {e}"))?;
+
+    let status = resp.status().as_u16();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let text = resp.text().await.unwrap_or_default();
+    let parsed: Value = if ct.contains("application/json") && !text.is_empty() {
+        serde_json::from_str(&text).unwrap_or(Value::String(text))
+    } else {
+        Value::String(text)
+    };
+
+    Ok((status, ct, parsed))
+}
+
+/// Convert an OpenAI chat-completions request body into an Anthropic Messages
+/// request body, for forwarding to an Anthropic upstream.
+///
+/// This is the inverse of `anthropic_to_openai`: it reconstructs the
+/// Anthropic-native request shape so that Anthropic's API receives a body
+/// it understands directly, avoiding a lossy round-trip.
+fn openai_to_anthropic_request(body: &Value, model: &str) -> Value {
+    let mut messages = Vec::new();
+
+    // Extract system message(s) from the OpenAI messages array and convert
+    // to the Anthropic top-level `system` field.
+    let mut system_parts: Vec<Value> = Vec::new();
+    let mut non_system: Vec<Value> = Vec::new();
+
+    if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
+        for msg in msgs {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if role == "system" {
+                // System messages become content blocks for the `system` field.
+                if let Some(content) = msg.get("content") {
+                    match content {
+                        Value::String(s) => {
+                            system_parts.push(json!({"type": "text", "text": s}));
+                        }
+                        Value::Array(arr) => {
+                            for part in arr {
+                                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                    system_parts.push(json!({"type": "text", "text": text}));
+                                } else if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                    system_parts.push(part.clone());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                non_system.push(msg.clone());
+            }
+        }
+    }
+
+    // Convert message content to Anthropic format (string → string,
+    // array of parts → array of content blocks).
+    for msg in &non_system {
+        let mut anthropic_msg = json!({
+            "role": msg.get("role").and_then(|r| r.as_str()).unwrap_or("user"),
+        });
+        if let Some(content) = msg.get("content") {
+            match content {
+                Value::String(s) => {
+                    anthropic_msg["content"] = Value::String(s.clone());
+                }
+                Value::Array(parts) => {
+                    let blocks: Vec<Value> = parts
+                        .iter()
+                        .filter_map(|part| {
+                            let ptype = part.get("type").and_then(|t| t.as_str())?;
+                            match ptype {
+                                "text" => Some(json!({
+                                    "type": "text",
+                                    "text": part.get("text").and_then(|t| t.as_str()).unwrap_or(""),
+                                })),
+                                "image_url" => {
+                                    // OpenAI image_url → Anthropic image source
+                                    let url = part.pointer("/image_url/url").and_then(|u| u.as_str())?;
+                                    if let Some(b64) = url.strip_prefix("data:").and_then(|d| d.split(',').nth(1)) {
+                                        let media_type = url.split(';').nth(1)
+                                            .and_then(|s| {
+                                                let slash = s.find('/')?;
+                                                Some(s[slash + 1..].to_string())
+                                            })
+                                            .unwrap_or_else(|| "png".to_string());
+                                        Some(json!({
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": format!("image/{media_type}"),
+                                                "data": b64,
+                                            },
+                                        }))
+                                    } else {
+                                        Some(json!({
+                                            "type": "image",
+                                            "source": {
+                                                "type": "url",
+                                                "url": url,
+                                            },
+                                        }))
+                                    }
+                                }
+                                "tool_call" => {
+                                    let call_id = part.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                                    let name = part.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
+                                    let args_str = part.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()).unwrap_or("{}");
+                                    let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                                    Some(json!({
+                                        "type": "tool_use",
+                                        "id": call_id,
+                                        "name": name,
+                                        "input": input,
+                                    }))
+                                }
+                                "tool_result" => {
+                                    let call_id = part.get("tool_call_id").and_then(|i| i.as_str()).unwrap_or("");
+                                    let content_val = part.get("content").cloned().unwrap_or(Value::String(String::new()));
+                                    Some(json!({
+                                        "type": "tool_result",
+                                        "tool_use_id": call_id,
+                                        "content": content_val,
+                                    }))
+                                }
+                                _ => None,
+                            }
+                        })
+                        .collect();
+                    anthropic_msg["content"] = Value::Array(blocks);
+                }
+                _ => {
+                    anthropic_msg["content"] = content.clone();
+                }
+            }
+        }
+        messages.push(anthropic_msg);
+    }
+
+    let mut anthropic_body = json!({
+        "model": model,
+        "messages": messages,
+    });
+
+    // System field (only if non-empty).
+    if !system_parts.is_empty() {
+        anthropic_body["system"] = if system_parts.len() == 1 {
+            system_parts.into_iter().next().unwrap()
+        } else {
+            Value::Array(system_parts)
+        };
+    }
+
+    // max_tokens — Anthropic requires this; map from OpenAI's max_tokens or default 4096.
+    if let Some(mt) = body.get("max_tokens") {
+        anthropic_body["max_tokens"] = mt.clone();
+    } else if anthropic_body.get("max_tokens").is_none() {
+        anthropic_body["max_tokens"] = json!(4096);
+    }
+
+    // stop_sequences ← stop
+    if let Some(stop) = body.get("stop") {
+        match stop {
+            Value::String(s) => {
+                anthropic_body["stop_sequences"] = json!([s]);
+            }
+            Value::Array(arr) => {
+                anthropic_body["stop_sequences"] = Value::Array(arr.clone());
+            }
+            _ => {}
+        }
+    }
+
+    // temperature
+    if let Some(temp) = body.get("temperature") {
+        anthropic_body["temperature"] = temp.clone();
+    }
+
+    // top_p
+    if let Some(tp) = body.get("top_p") {
+        anthropic_body["top_p"] = tp.clone();
+    }
+
+    // stream
+    if let Some(stream) = body.get("stream") {
+        anthropic_body["stream"] = stream.clone();
+    }
+
+    // tools
+    if let Some(tools) = body.get("tools") {
+        anthropic_body["tools"] = tools.clone();
+    }
+
+    // tool_choice
+    if let Some(tc) = body.get("tool_choice") {
+        anthropic_body["tool_choice"] = tc.clone();
+    }
+
+    anthropic_body
 }
 
 // ─── Agent loop for Responses API ───────────────────────────────────────────
@@ -2725,7 +2986,9 @@ async fn anthropic_messages_handler(
         );
     }
 
-    let chat_body = {
+    // Detect Anthropic upstream before converting, so we can pass the
+    // original Anthropic body through directly (avoiding lossy double-conversion).
+    let (chat_body, is_anthropic_upstream) = {
         let config = state.config.read().await;
         if !has_configured_upstream(&config) {
             return anthropic_error_response(
@@ -2734,7 +2997,17 @@ async fn anthropic_messages_handler(
                 "API key is not configured.",
             );
         }
-        anthropic_to_openai(&body, &config)
+        let is_anthropic = config
+            .accounts
+            .iter()
+            .any(|a| a.id == config.active_account_id && a.provider == AccountProvider::Anthropic);
+        if is_anthropic {
+            // Pass the original Anthropic body through; forward_anthropic_upstream
+            // will send it directly to the Anthropic API.
+            (body.clone(), true)
+        } else {
+            (anthropic_to_openai(&body, &config), false)
+        }
     };
 
     let model = chat_body
@@ -2743,8 +3016,13 @@ async fn anthropic_messages_handler(
         .unwrap_or("")
         .to_string();
 
+    let upstream_path = if is_anthropic_upstream {
+        "/v1/messages"
+    } else {
+        "/v1/chat/completions"
+    };
     let (status, _ct, resp_body) =
-        forward_request(&state, "/v1/chat/completions", "POST", Some(&chat_body)).await;
+        forward_request(&state, upstream_path, "POST", Some(&chat_body)).await;
 
     // ── Error path (all upstream failures) ─────────────────────────
     if status >= 400 {
@@ -2790,7 +3068,12 @@ async fn anthropic_messages_handler(
             Value::String(s) => s.clone(),
             _ => resp_body.to_string(),
         };
-        let anthropic_sse = openai_sse_to_anthropic_sse(&sse_text, &model);
+        let anthropic_sse = if is_anthropic_upstream {
+            // Anthropic upstream returns native Anthropic SSE — pass through as-is.
+            sse_text
+        } else {
+            openai_sse_to_anthropic_sse(&sse_text, &model)
+        };
         return (
             StatusCode::OK,
             [
@@ -2809,8 +3092,13 @@ async fn anthropic_messages_handler(
     }
 
     // ── Non-streaming path ─────────────────────────────────────────
-    let anthropic_resp = openai_to_anthropic(&resp_body, &model);
-    build_upstream_response(200, "application/json", &anthropic_resp)
+    if is_anthropic_upstream {
+        // Response is already in Anthropic format — pass through directly.
+        build_upstream_response(200, "application/json", &resp_body)
+    } else {
+        let anthropic_resp = openai_to_anthropic(&resp_body, &model);
+        build_upstream_response(200, "application/json", &anthropic_resp)
+    }
 }
 
 async fn responses_handler(
@@ -3200,6 +3488,7 @@ async fn serve_once(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/v1/models", get(v1_models_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
         .route("/v1/messages", post(anthropic_messages_handler))
+        .route("/v1/responses", post(responses_handler))
         .layer(cors_layer)
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .with_state(state.clone());

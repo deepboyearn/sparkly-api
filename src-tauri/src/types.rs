@@ -99,6 +99,8 @@ pub enum AccountProvider {
     OpenaiCompatible,
     #[serde(rename = "v0")]
     V0,
+    #[serde(rename = "anthropic")]
+    Anthropic,
 }
 
 pub const V0_BASE_URL: &str = "https://api.v0.dev/v1";
