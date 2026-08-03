@@ -1,30 +1,22 @@
-import { startTransition, useEffect, useMemo, useState } from "react";
+import React, { Suspense, startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Card, Input } from "@heroui/react";
 import { Icon } from "@iconify/react";
 import { motion, AnimatePresence } from "framer-motion";
-import {
-  CategoryScale,
-  Chart as ChartJS,
-  Filler,
-  LineElement,
-  LinearScale,
-  PointElement,
-  Tooltip as ChartTooltip,
-  type ChartOptions,
-} from "chart.js";
+import type { ChartOptions } from "chart.js";
 import { Line } from "react-chartjs-2";
+import "./chartSetup";
 import { V0_BASE_URL, V0_MODELS } from "../../shared/types";
 import type { AccountProvider, AccountUsageTag, BridgeConfig, BridgeState, PlaygroundModelsResult, PlaygroundTestResult } from "../../shared/types";
 import { emptyState, ensureBridgeMethod, getDayPoints, getHourlyPoints, getRequestPoints, getUsageRecords, groupKeyStats, groupModelStats, normalizeBridgeState, normalizeOpenAiBaseUrl } from "./appState";
 import { Header } from "./components/Header";
 import { Sidebar } from "./components/Sidebar";
+import type { SectionKey } from "./components/Sidebar";
 import { Onboarding } from "./components/Onboarding";
-import { AccountsPage } from "./pages/AccountsPage";
-import { ApiKeysPage } from "./pages/ApiKeysPage";
-import { PlaygroundPage } from "./pages/PlaygroundPage";
-import { UsagePage } from "./pages/UsagePage";
-
-ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, ChartTooltip, Filler);
+const AccountsPage = React.lazy(() => import("./pages/AccountsPage"));
+const ApiKeysPage = React.lazy(() => import("./pages/ApiKeysPage"));
+const PlaygroundPage = React.lazy(() => import("./pages/PlaygroundPage"));
+const UsagePage = React.lazy(() => import("./pages/UsagePage"));
+const MITMPage = React.lazy(() => import("./pages/MITMPage"));
 
 const accountProviderOptions: Array<{ value: AccountProvider; label: string; description: string }> = [
   {
@@ -46,13 +38,16 @@ export default function App() {
   const [saving, setSaving] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [activeSection, setActiveSection] = useState<"overview" | "apiKeys" | "usage" | "accounts" | "playground">("overview");
+  const [activeSection, setActiveSection] = useState<SectionKey>("overview");
   const [requestTab, setRequestTab] = useState<"By Hour" | "By Day">("By Hour");
   const [tokenTab, setTokenTab] = useState<"By Hour" | "By Day">("By Hour");
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [isCreateKeyOpen, setIsCreateKeyOpen] = useState(false);
   const [isEditKeyOpen, setIsEditKeyOpen] = useState(false);
   const [isAccountModalOpen, setIsAccountModalOpen] = useState(false);
+  const createKeyOverlayRef = useRef<HTMLDivElement>(null);
+  const editKeyOverlayRef = useRef<HTMLDivElement>(null);
+  const accountOverlayRef = useRef<HTMLDivElement>(null);
   const [newKeyName, setNewKeyName] = useState("");
   const [editingKeyId, setEditingKeyId] = useState<string | null>(null);
   const [editingKeyName, setEditingKeyName] = useState("");
@@ -80,6 +75,9 @@ export default function App() {
   const OVERVIEW_RESET_MS = 5 * 60 * 60 * 1000;
   const [overviewTokens, setOverviewTokens] = useState(0);
   const [overviewWindowStart, setOverviewWindowStart] = useState<number>(Date.now());
+
+  const onToggleCollapse = useCallback(() => setIsSidebarCollapsed(c => !c), []);
+  const onNavigate = useCallback((s: SectionKey) => setActiveSection(s), []);
 
   // Exclude model probe requests — defined early so effects below can use it
   const realLogs = useMemo(() => state.logs.filter(l => l.requestType !== 'model_probe'), [state.logs]);
@@ -183,6 +181,7 @@ export default function App() {
   const isUsage = activeSection === "usage";
   const isAccounts = activeSection === "accounts";
   const isPlayground = activeSection === "playground";
+  const isMITM = activeSection === "mitm";
 
   // Overview analytics: Only show last 5 hours
   const requestPoints = useMemo(() => (
@@ -614,7 +613,7 @@ export default function App() {
       window.bridgeApi?.getState()
         ?.then((nextState) => {
           startTransition(() => {
-            setState(normalizeBridgeState(nextState));
+            setState((prev) => normalizeBridgeState(nextState, prev));
           });
         })
         ?.catch(() => undefined);
@@ -874,6 +873,17 @@ export default function App() {
     }
   }, []);
 
+  // Auto-focus modal overlays when opened
+  useEffect(() => {
+    if (isCreateKeyOpen) createKeyOverlayRef.current?.focus();
+  }, [isCreateKeyOpen]);
+  useEffect(() => {
+    if (isEditKeyOpen) editKeyOverlayRef.current?.focus();
+  }, [isEditKeyOpen]);
+  useEffect(() => {
+    if (isAccountModalOpen) accountOverlayRef.current?.focus();
+  }, [isAccountModalOpen]);
+
   async function onResetUsage() {
     if (!confirm("Are you sure you want to reset all usage data? This cannot be undone.")) return;
     setSaving(true);
@@ -917,11 +927,11 @@ export default function App() {
       <div className="screen dashboard-shell heroui-dashboard-shell" style={{ display: 'grid', gridTemplateColumns: isSidebarCollapsed ? '88px 1fr' : '280px 1fr', transition: 'grid-template-columns 0.3s ease', height: '100vh', overflow: 'hidden' }}>
         <Sidebar
           activeSection={activeSection}
-          setActiveSection={setActiveSection}
+          setActiveSection={onNavigate}
           serverRunning={state.stats.serverRunning}
           setError={setError}
           isCollapsed={isSidebarCollapsed}
-          onToggleCollapse={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
+          onToggleCollapse={onToggleCollapse}
         />
 
         <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
@@ -938,6 +948,7 @@ export default function App() {
           <main className="" style={{ flex: 1, overflowY: 'auto', padding: '10px 20px' }}>
             {error ? <Alert status="danger" title={error} className="mb-4 border border-red-500/20 bg-red-500/10 text-white" /> : null}
 
+            <Suspense fallback={<div style={{padding: 40, color: '#888'}}>Loading...</div>}>
             <AnimatePresence mode="wait">
               {isOverview ? (
                 <motion.div
@@ -1231,13 +1242,30 @@ export default function App() {
                     onRunPlayground={onRunPlayground}
                   />
                 </motion.div>
+              ) : activeSection === "mitm" ? (
+                <motion.div
+                  key="mitm"
+                  initial={{ opacity: 0, y: 15 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -15 }}
+                  transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                >
+                  <MITMPage />
+                </motion.div>
               ) : null}
             </AnimatePresence>
+            </Suspense>
           </main>
 
           <AnimatePresence>
             {isCreateKeyOpen && (
-              <div className="modal-overlay">
+              <div
+                className="modal-overlay"
+                ref={createKeyOverlayRef}
+                tabIndex={-1}
+                onClick={() => setIsCreateKeyOpen(false)}
+                onKeyDown={(e) => { if (e.key === 'Escape') setIsCreateKeyOpen(false); }}
+              >
                 <motion.div
                   initial={{ opacity: 0, scale: 0.9,  }}
                   animate={{ opacity: 1, scale: 1,  }}
@@ -1245,7 +1273,7 @@ export default function App() {
                   transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
                   style={{ width: '100%', maxWidth: '480px' }}
                 >
-                  <Card className="modal-card heroui-modal-card" onClick={(e) => e.stopPropagation()}>
+                  <Card className="modal-card heroui-modal-card" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
                     <Card.Content className="heroui-modal-content">
                       <div className="section-heading heroui-section-heading">
                         <h3>Create key</h3>
@@ -1269,7 +1297,13 @@ export default function App() {
 
           <AnimatePresence>
             {isEditKeyOpen && (
-              <div className="modal-overlay">
+              <div
+                className="modal-overlay"
+                ref={editKeyOverlayRef}
+                tabIndex={-1}
+                onClick={() => setIsEditKeyOpen(false)}
+                onKeyDown={(e) => { if (e.key === 'Escape') setIsEditKeyOpen(false); }}
+              >
                 <motion.div
                   initial={{ opacity: 0, scale: 0.9,  }}
                   animate={{ opacity: 1, scale: 1,  }}
@@ -1277,7 +1311,7 @@ export default function App() {
                   transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
                   style={{ width: '100%', maxWidth: '480px' }}
                 >
-                  <Card className="modal-card heroui-modal-card" onClick={(e) => e.stopPropagation()}>
+                  <Card className="modal-card heroui-modal-card" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
                     <Card.Content className="heroui-modal-content">
                       <div className="section-heading heroui-section-heading">
                         <h3>Edit key</h3>
@@ -1300,7 +1334,13 @@ export default function App() {
 
           <AnimatePresence>
             {isAccountModalOpen && (
-              <div className="modal-overlay">
+              <div
+                className="modal-overlay"
+                ref={accountOverlayRef}
+                tabIndex={-1}
+                onClick={() => setIsAccountModalOpen(false)}
+                onKeyDown={(e) => { if (e.key === 'Escape') setIsAccountModalOpen(false); }}
+              >
                 <motion.div
                   initial={{ opacity: 0, scale: 0.9,  }}
                   animate={{ opacity: 1, scale: 1,  }}
@@ -1308,7 +1348,7 @@ export default function App() {
                   transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
                   style={{ width: '100%', maxWidth: '560px' }}
                 >
-                  <Card className="modal-card heroui-modal-card account-modal-card" onClick={(e) => e.stopPropagation()}>
+                  <Card className="modal-card heroui-modal-card account-modal-card" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
                     <Card.Content className="heroui-modal-content account-modal-content">
                       <div className="account-modal-header">
                         <div className="account-modal-title-row">

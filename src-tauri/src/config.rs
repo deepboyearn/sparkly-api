@@ -105,6 +105,7 @@ fn normalize_provider(provider: &AccountProvider) -> AccountProvider {
     match provider {
         AccountProvider::V0 => AccountProvider::V0,
         AccountProvider::OpenaiCompatible => AccountProvider::OpenaiCompatible,
+        AccountProvider::Anthropic => AccountProvider::Anthropic,
     }
 }
 
@@ -112,6 +113,7 @@ fn default_base_url_for_provider(provider: &AccountProvider) -> &'static str {
     match provider {
         AccountProvider::V0 => V0_BASE_URL,
         AccountProvider::OpenaiCompatible => DEFAULT_UPSTREAM_BASE_URL,
+        AccountProvider::Anthropic => "https://api.anthropic.com",
     }
 }
 
@@ -143,6 +145,7 @@ fn normalize_accounts(
                         AccountProvider::OpenaiCompatible => {
                             format!("Account {}", index + 1)
                         }
+                        AccountProvider::Anthropic => "anthropic".to_string(),
                     }
                 } else {
                     trimmed.to_string()
@@ -401,6 +404,7 @@ pub fn create_account(config: &mut BridgeConfig, input: &CreateAccountInput) {
                 AccountProvider::OpenaiCompatible => {
                     format!("Account {}", config.accounts.len() + 1)
                 }
+                AccountProvider::Anthropic => "anthropic".to_string(),
             }
         } else {
             trimmed.to_string()
@@ -423,6 +427,7 @@ pub fn create_account(config: &mut BridgeConfig, input: &CreateAccountInput) {
                         current.to_string()
                     }
                 }
+                AccountProvider::Anthropic => "https://api.anthropic.com".to_string(),
             }
         }
     };

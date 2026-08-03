@@ -22,6 +22,13 @@ declare global {
       openElectron: () => Promise<void>;
       openExternal: (url: string) => Promise<void>;
       openDevTools: () => Promise<void>;
+      trustMitmCert: () => Promise<boolean>;
+      untrustMitmCert: () => Promise<boolean>;
+      getMitmCertStatus: () => Promise<{ exists: boolean; trusted: boolean }>;
+      startMitmServer: () => Promise<boolean>;
+      stopMitmServer: () => Promise<boolean>;
+      updateMitmModelMappings: (mappings: Record<string, string>) => Promise<void>;
+      getMitmModelMappings: () => Promise<Record<string, string>>;
     };
   }
 }

@@ -1,8 +1,8 @@
 import { memo } from "react";
 import { Button } from "@heroui/react";
-import { Icon } from "@iconify/react";
+import { Icon } from "@iconify/react/offline";
 
-type SectionKey = "overview" | "apiKeys" | "usage" | "accounts" | "playground";
+import type { SectionKey } from "./Sidebar";
 
 interface HeaderProps {
   section: SectionKey;
@@ -44,6 +44,12 @@ const sectionMeta: Record<SectionKey, { title: string; description: string; icon
     description: "Safe local model experimentation",
     buttonText: "Run test",
     icon: "solar:play-bold-duotone",
+  },
+  mitm: {
+    title: "MITM Proxy",
+    description: "Man-in-the-Middle for Antigravity integration",
+    buttonText: "",
+    icon: "solar:shield-check-bold-duotone",
   },
 };
 

@@ -1,5 +1,5 @@
 import { memo, useState } from "react";
-import { Icon } from "@iconify/react";
+import { Icon } from "@iconify/react/offline";
 import type { PlaygroundModelsResult, PlaygroundTestResult } from "../../../shared/types";
 import { getPlaygroundErrorSummary, normalizeOpenAiBaseUrl } from "../appState";
 import { ModelPicker } from "../components/ModelPicker";
@@ -265,3 +265,5 @@ export const PlaygroundPage = memo(PlaygroundPageComponent, (prev, next) => {
     && prev.playgroundResult === next.playgroundResult
     && prev.playgroundLoading === next.playgroundLoading;
 });
+
+export default PlaygroundPage;

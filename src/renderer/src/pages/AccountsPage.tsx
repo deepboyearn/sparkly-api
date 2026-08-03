@@ -1,5 +1,5 @@
 import { memo } from "react";
-import { Icon } from "@iconify/react";
+import { Icon } from "@iconify/react/offline";
 import type { BridgeConfig, BridgeState, UpstreamAccount } from "../../../shared/types";
 import { maskKey } from "../appState";
 
@@ -168,3 +168,5 @@ export const AccountsPage = memo(AccountsPageComponent, (prev, next) => {
     && prev.form === next.form
     && prev.saving === next.saving;
 });
+
+export default AccountsPage;

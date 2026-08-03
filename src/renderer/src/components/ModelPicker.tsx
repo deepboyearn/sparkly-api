@@ -1,6 +1,6 @@
 import { useDeferredValue, useEffect, useMemo, useState } from "react";
 import { Chip, Input } from "@heroui/react";
-import { Icon } from "@iconify/react";
+import { Icon } from "@iconify/react/offline";
 
 const INITIAL_MODEL_PICKER_LIMIT = 40;
 

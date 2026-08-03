@@ -1,11 +1,11 @@
 import { memo } from "react";
 import { Button } from "@heroui/react";
-import { Icon } from "@iconify/react";
-import { motion } from "framer-motion";
+import { Icon } from "@iconify/react/offline";
+
 
 import logo from "../../../logo/logp.png";
 
-type SectionKey = "overview" | "apiKeys" | "usage" | "accounts" | "playground";
+export type SectionKey = "overview" | "apiKeys" | "usage" | "accounts" | "playground" | "mitm";
 
 interface SidebarProps {
   activeSection: SectionKey;
@@ -22,6 +22,7 @@ const navItems: { key: SectionKey; label: string; icon: string }[] = [
   { key: "usage", label: "Usage", icon: "solar:chart-2-bold-duotone" },
   { key: "accounts", label: "Accounts", icon: "solar:users-group-rounded-bold-duotone" },
   { key: "playground", label: "Playground", icon: "solar:code-square-bold-duotone" },
+  { key: "mitm", label: "MITM", icon: "solar:shield-check-bold-duotone" },
 ];
 
 function SidebarComponent({
@@ -108,10 +109,9 @@ function SidebarComponent({
             const isActive = activeSection === item.key;
 
             return (
-              <motion.div
+              <div
                 key={item.key}
-                whileHover={{ scale: 1.05, x: isCollapsed ? 0 : 5 }}
-                whileTap={{ scale: 0.95 }}
+                className="nav-item-hover"
                 style={{ width: isCollapsed ? '48px' : '100%' }}
                 title={isCollapsed ? item.label : undefined}
               >
@@ -145,7 +145,7 @@ function SidebarComponent({
                     )}
                   </div>
                 </Button>
-              </motion.div>
+              </div>
             );
           })}
         </div>

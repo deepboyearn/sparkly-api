@@ -1,6 +1,7 @@
 import { memo, useState, useEffect, useRef } from "react";
 import { Line } from "react-chartjs-2";
-import { Icon } from "@iconify/react";
+import "../chartSetup";
+import { Icon } from "@iconify/react/offline";
 import { Card, Button } from "@heroui/react";
 import { UsageRecordsTable } from "../components/UsageRecordsTable";
 type UsageRecord = {
@@ -358,3 +359,5 @@ export const UsagePage = memo(UsagePageComponent, (prev, next) => {
     && prev.tokenTab === next.tokenTab
     && prev.timeFilter === next.timeFilter;
 });
+
+export default UsagePage;
