@@ -13,8 +13,8 @@ name = "sparkly"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["devtools"] }
-tauri-plugin-shell = "2"
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -33,9 +33,9 @@ tracing-subscriber = "0.3"
 open = "5"
 home = "0.5"
 rcgen = "0.13"
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 [features]
 default = ["custom-protocol"]
@@ -45,103 +45,17 @@ custom-protocol = ["tauri/custom-protocol"]
 # touch files on the host. Opt in with `cargo run --features tool-execution`.
 tool-execution = []
 
-[[test]]
-name = "test_config_atomic_write"
-path = "../test/test_config_atomic_write.rs"
+# Rust unit/regression tests live beside their modules. Do not declare explicit
+# integration-test targets unless the referenced files are present.
 
-[[test]]
-name = "test_config_load_default"
-path = "../test/test_config_load_default.rs"
+# Keep development compilation predictable on laptops and shared workstations.
+# Dependency debug symbols are not needed for application-level debugging.
+[profile.dev]
+debug = 1
+codegen-units = 16
+incremental = true
 
-[[test]]
-name = "test_config_normalize_accounts"
-path = "../test/test_config_normalize_accounts.rs"
-
-[[test]]
-name = "test_config_normalize_models"
-path = "../test/test_config_normalize_models.rs"
-
-[[test]]
-name = "test_config_normalize_port"
-path = "../test/test_config_normalize_port.rs"
-
-[[test]]
-name = "test_config_persistence"
-path = "../test/test_config_persistence.rs"
-
-[[test]]
-name = "test_elevation_is_elevated"
-path = "../test/test_elevation_is_elevated.rs"
-
-[[test]]
-name = "test_elevation_request"
-path = "../test/test_elevation_request.rs"
-
-[[test]]
-name = "test_mitm_server_cert_provider"
-path = "../test/test_mitm_server_cert_provider.rs"
-
-[[test]]
-name = "test_mitm_server_request_parsing"
-path = "../test/test_mitm_server_request_parsing.rs"
-
-[[test]]
-name = "test_mitm_server_streaming_detection"
-path = "../test/test_mitm_server_streaming_detection.rs"
-
-[[test]]
-name = "test_mitm_server_tls_config"
-path = "../test/test_mitm_server_tls_config.rs"
-
-[[test]]
-name = "test_mitm_server_upstream_forwarding"
-path = "../test/test_mitm_server_upstream_forwarding.rs"
-
-[[test]]
-name = "test_model_mapper_defaults"
-path = "../test/test_model_mapper_defaults.rs"
-
-[[test]]
-name = "test_model_mapper_empty_body"
-path = "../test/test_model_mapper_empty_body.rs"
-
-[[test]]
-name = "test_model_mapper_no_mapping"
-path = "../test/test_model_mapper_no_mapping.rs"
-
-[[test]]
-name = "test_model_mapper_rewrite"
-path = "../test/test_model_mapper_rewrite.rs"
-
-[[test]]
-name = "test_trust_store_ca_generation"
-path = "../test/test_trust_store_ca_generation.rs"
-
-[[test]]
-name = "test_trust_store_check_exists"
-path = "../test/test_trust_store_check_exists.rs"
-
-[[test]]
-name = "test_trust_store_linux_trust"
-path = "../test/test_trust_store_linux_trust.rs"
-
-[[test]]
-name = "test_trust_store_macos_trust"
-path = "../test/test_trust_store_macos_trust.rs"
-
-[[test]]
-name = "test_trust_store_windows_trust"
-path = "../test/test_trust_store_windows_trust.rs"
-
-[[test]]
-name = "test_types_bridge_config"
-path = "../test/test_types_bridge_config.rs"
-
-[[test]]
-name = "test_types_client_api_key"
-path = "../test/test_types_client_api_key.rs"
-
-[[test]]
-name = "test_types_upstream_account"
-path = "../test/test_types_upstream_account.rs"
+[profile.dev.package."*"]
+debug = 0
+codegen-units = 16
 

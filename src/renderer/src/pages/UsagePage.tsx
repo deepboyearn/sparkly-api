@@ -1,6 +1,6 @@
 import { memo, useState, useEffect, useRef } from "react";
 import { Line } from "react-chartjs-2";
-import "../chartSetup";
+
 import { Icon } from "@iconify/react";
 import { Card, Button } from "../components/ui";
 import { UsageRecordsTable } from "../components/UsageRecordsTable";
@@ -89,9 +89,7 @@ function UsagePageComponent({
   usageMode,
   setUsageMode,
   state,
-  totalTokenEstimate,
   rpm,
-  totalCostEstimate,
   usageRequestChartData,
   usageRequestChartOptions,
   usageTokenChartData,
@@ -118,9 +116,7 @@ function UsagePageComponent({
   realLogs: any[];
   timeFilter: "24h" | "7d" | "30d" | "all";
   setTimeFilter: (val: "24h" | "7d" | "30d" | "all") => void;
-  totalTokenEstimate: number;
   rpm: number;
-  totalCostEstimate: number;
   usageRequestChartData: any;
   usageRequestChartOptions: any;
   usageTokenChartData: any;
@@ -236,8 +232,8 @@ function UsagePageComponent({
                   <Icon icon="solar:database-bold-duotone" />
                 </div>
               </div>
-              <strong>{totalTokenEstimate}</strong>
-              <p>Cached: 0 Reasoning: {Math.round(totalTokenEstimate * 0.14)}</p>
+              <strong>0</strong>
+              <p>Waiting for provider-reported usage.</p>
 
             </Card.Content>
           </Card>
@@ -262,8 +258,8 @@ function UsagePageComponent({
                   <Icon icon="solar:wad-of-money-bold-duotone" />
                 </div>
               </div>
-              <strong>${totalCostEstimate.toFixed(2)}</strong>
-              <p>Points: {Math.round(totalCostEstimate * 1000)}</p>
+              <strong>$0.00</strong>
+              <p>No fabricated latency-based cost estimate.</p>
 
             </Card.Content>
           </Card>
@@ -304,8 +300,8 @@ function UsagePageComponent({
               <div className="usage-table-row" key={row.model}>
                 <span>{row.model}</span>
                 <span>{row.requests}</span>
-                <span>{row.tokens}</span>
-                <span>${row.cost.toFixed(2)}</span>
+                <span>—</span>
+                <span>—</span>
               </div>
             ))}
             <div className="usage-table-footer"><strong>Model Statistics</strong><span>20 rows</span></div>
@@ -323,8 +319,8 @@ function UsagePageComponent({
               <div className="usage-table-row" key={row.id}>
                 <span>{row.name} • {row.maskedKey}</span>
                 <span>{row.requests}</span>
-                <span>{row.tokens}</span>
-                <span>${row.cost.toFixed(2)}</span>
+                <span>—</span>
+                <span>—</span>
               </div>
             ))}
             <div className="usage-table-footer"><strong>API Key Details</strong><span>5 rows</span></div>
@@ -345,9 +341,7 @@ export const UsagePage = memo(UsagePageComponent, (prev, next) => {
     && prev.state === next.state
     && prev.state.logs === next.state.logs
     && prev.realLogs === next.realLogs
-    && prev.totalTokenEstimate === next.totalTokenEstimate
     && prev.rpm === next.rpm
-    && prev.totalCostEstimate === next.totalCostEstimate
     && prev.usageRequestChartData === next.usageRequestChartData
     && prev.usageRequestChartOptions === next.usageRequestChartOptions
     && prev.usageTokenChartData === next.usageTokenChartData

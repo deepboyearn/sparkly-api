@@ -76,10 +76,10 @@ export const UsageRecordsTable = memo(({ records }: { records: UsageRecord[] }) 
                 </div>
               </td>
               <td style={{ ...cellStyle, textAlign: 'right', fontFamily: 'JetBrains Mono, monospace', color: '#a1a1aa' }}>
-                {record.requestType === 'model_probe' ? '—' : record.tokens.toLocaleString()}
+                —
               </td>
               <td style={{ ...cellStyle, textAlign: 'right', fontFamily: 'JetBrains Mono, monospace', color: '#a1a1aa' }}>
-                {record.requestType === 'model_probe' ? '—' : record.tps}
+                —
               </td>
               <td style={{ ...cellStyle, fontWeight: 500 }}>
                 <span style={{ color: parseInt(record.responseTime) > 1000 ? '#f59e0b' : '#fff' }}>{record.responseTime}</span>
@@ -117,10 +117,10 @@ export const UsageRecordsTable = memo(({ records }: { records: UsageRecord[] }) 
                 </div>
               </td>
               <td style={{ ...cellStyle, textAlign: 'right', color: '#fbbf24', fontWeight: 700, fontFamily: 'JetBrains Mono, monospace' }}>
-                {record.requestType === 'model_probe' ? '—' : record.amountSpent}
+                —
               </td>
               <td style={{ ...cellStyle, textAlign: 'right', color: record.balanceChange.startsWith('-') ? '#fb7185' : '#34d399', fontWeight: 600, fontFamily: 'JetBrains Mono, monospace' }}>
-                {record.requestType === 'model_probe' ? '—' : record.balanceChange}
+                —
               </td>
               <td style={{ ...cellStyle, borderLeft: '1px solid rgba(255,255,255,0.02)' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>

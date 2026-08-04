@@ -14,9 +14,9 @@ export const emptyState: BridgeState = {
     upstreamBaseUrl: "https://cn.chrouter.com:8443",
     apiKey: "",
     models: [],
-    selectedModel: "gpt-5.4",
+    selectedModel: "",
     localPort: 48231,
-    enableCors: true,
+    enableCors: false,
     systemPrompt: "",
     accounts: [],
     activeAccountId: "",
@@ -36,7 +36,43 @@ export const emptyState: BridgeState = {
 };
 
 export function normalizeBridgeState(input: Partial<BridgeState>, prev?: BridgeState): BridgeState {
-  const config = { ...emptyState.config, ...input.config };
+  const rawConfig = { ...emptyState.config, ...input.config };
+  const topLevelModels = Array.isArray(rawConfig.models)
+    ? rawConfig.models.filter((model): model is string => typeof model === "string")
+    : [];
+  const rawAccounts = Array.isArray(rawConfig.accounts) ? rawConfig.accounts : [];
+  const accounts = rawAccounts.map((account, index) => {
+    const isActive = account.id === rawConfig.activeAccountId
+      || (!rawConfig.activeAccountId && index === 0);
+    const models = Array.isArray(account.models)
+      ? account.models.filter((model): model is string => typeof model === "string")
+      : isActive ? topLevelModels : [];
+    const selectedModel = typeof account.selectedModel === "string" && models.includes(account.selectedModel)
+      ? account.selectedModel
+      : isActive && typeof rawConfig.selectedModel === "string" && models.includes(rawConfig.selectedModel)
+        ? rawConfig.selectedModel
+        : models[0] ?? "";
+
+    return {
+      ...account,
+      usageTags: Array.isArray(account.usageTags) ? account.usageTags : ["coding" as const],
+      provider: account.provider ?? "auto",
+      detectedProtocol: account.detectedProtocol ?? (account.provider && account.provider !== "auto" ? account.provider : null),
+      isActive,
+      lastUsedAt: account.lastUsedAt ?? null,
+      models,
+      selectedModel,
+      modelsLastRefreshedAt: account.modelsLastRefreshedAt ?? null,
+    };
+  });
+  const activeAccount = accounts.find((account) => account.id === rawConfig.activeAccountId) ?? accounts[0];
+  const config: BridgeConfig = {
+    ...rawConfig,
+    models: activeAccount?.models ?? topLevelModels,
+    selectedModel: activeAccount?.selectedModel ?? (typeof rawConfig.selectedModel === "string" ? rawConfig.selectedModel : ""),
+    accounts,
+    activeAccountId: activeAccount?.id ?? "",
+  };
   const stats = { ...emptyState.stats, ...input.stats };
   const logs = Array.isArray(input.logs) ? [...input.logs] : [];
   const clientKeys = Array.isArray(input.clientKeys) ? [...input.clientKeys] : [];
@@ -139,7 +175,7 @@ export function getPlaygroundErrorSummary(result: PlaygroundTestResult | null) {
 export function ensureBridgeMethod<T extends keyof Window["bridgeApi"]>(method: T) {
   const candidate = window.bridgeApi?.[method];
   if (typeof candidate !== "function") {
-    throw new Error(`Bridge runtime is outdated. Please fully restart the Electron app to load ${String(method)}.`);
+    throw new Error(`The native Tauri runtime is unavailable or outdated. Fully restart Sparkly API to load ${String(method)}.`);
   }
   return candidate;
 }
@@ -162,9 +198,7 @@ export function getHourlyPoints(logs: BridgeState["logs"], type: "requests" | "t
              logDate.getMonth() === d.getMonth();
     });
 
-    const value = type === "requests"
-      ? matchingLogs.length
-      : matchingLogs.reduce((total, entry) => total + Math.max(60, entry.durationMs * 3), 0);
+    const value = type === "requests" ? matchingLogs.length : 0;
 
     points.push({ label, value });
   }
@@ -187,9 +221,7 @@ export function getDayPoints(logs: BridgeState["logs"], type: "requests" | "toke
              logDate.getFullYear() === d.getFullYear();
     });
 
-    const value = type === "requests"
-      ? matchingLogs.length
-      : matchingLogs.reduce((total, entry) => total + Math.max(60, entry.durationMs * 3), 0);
+    const value = type === "requests" ? matchingLogs.length : 0;
 
     points.push({ label, value });
   }
@@ -203,8 +235,9 @@ export function groupModelStats(logs: BridgeState["logs"]) {
     const key = entry.model ?? "unknown";
     const current = map.get(key) ?? { requests: 0, tokens: 0, cost: 0 };
     current.requests += 1;
-    current.tokens += Math.max(60, entry.durationMs * 3);
-    current.cost += Math.max(0.001, entry.durationMs / 100000);
+    // Usage is unknown until the backend records provider-reported token data.
+    current.tokens += 0;
+    current.cost += 0;
     map.set(key, current);
   }
 
@@ -218,8 +251,8 @@ export function groupKeyStats(logs: BridgeState["logs"], clientKeys: BridgeState
 
   return clientKeys.map((key) => {
     const requests = logs.length;
-    const tokens = logs.reduce((total, entry) => total + Math.max(60, entry.durationMs * 3), 0);
-    const cost = logs.reduce((total, entry) => total + Math.max(0.001, entry.durationMs / 100000), 0);
+    const tokens = 0;
+    const cost = 0;
 
     return {
       id: key.id,
@@ -236,24 +269,23 @@ export function getUsageRecords(logs: BridgeState["logs"], clientKeys: BridgeSta
   const fallbackKey = clientKeys[0]?.maskedKey ?? maskKey(upstreamApiKey);
 
   return logs.map((entry) => {
-    const estimatedTokens = Math.max(60, entry.durationMs * 3);
-    const tps = Math.max(1, Math.round(estimatedTokens / Math.max(1, entry.durationMs / 1000)));
-    const amountSpent = Math.max(0.001, entry.durationMs / 100000);
+    const tokens = 0;
+    const tps = 0;
     const source = entry.path.includes("chat/completions") ? "chat.completions" : entry.path.replace(/^\//, "");
 
     return {
       id: entry.id,
       time: new Date(entry.timestamp).toLocaleString(),
       model: entry.model ?? "-",
-      tokens: estimatedTokens,
+      tokens,
       tps,
       responseTime: `${entry.durationMs} ms`,
       status: entry.status,
       source,
       ip: "localhost",
       apiKey: fallbackKey,
-      amountSpent: `$${amountSpent.toFixed(3)}`,
-      balanceChange: `-${Math.round(amountSpent * 1000)} pts`,
+      amountSpent: "$0.00",
+      balanceChange: "$0.00",
       requestId: entry.id.slice(0, 8),
       requestType: entry.requestType,
     };

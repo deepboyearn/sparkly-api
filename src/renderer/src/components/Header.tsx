@@ -10,7 +10,6 @@ interface HeaderProps {
   playgroundLoading: boolean;
   onRestart: () => void;
   onReset?: () => void;
-  onOpenElectron?: () => void;
   onPrimaryAction: () => void;
 }
 
@@ -55,7 +54,7 @@ const sectionMeta: Record<SectionKey, { title: string; description: string; icon
     title: "Console Logs",
     description: "API calls and system events",
     buttonText: "",
-    icon: "material-symbols:bug-report-rounded",
+    icon: "solar:bug-bold-duotone",
   },
 };
 
@@ -65,7 +64,6 @@ function HeaderComponent({
   playgroundLoading,
   onRestart,
   onReset,
-  onOpenElectron,
   onPrimaryAction,
 }: HeaderProps) {
   const meta = sectionMeta[section];
@@ -175,32 +173,6 @@ function HeaderComponent({
           >
             <Icon icon="solar:trash-bin-trash-bold-duotone" style={{ fontSize: '18px', flexShrink: 0 }} />
             <span style={{ position: 'relative', top: '0px' }}>Reset Data</span>
-          </Button>
-        )}
-
-        {isOverview && (
-          <Button
-            variant="ghost"
-            style={{
-              height: '44px',
-              padding: '0 20px',
-              borderRadius: '12px',
-              border: '1px solid rgba(244, 180, 0, 0.22)',
-              color: '#f4b400',
-              fontWeight: '800',
-              fontSize: '13px',
-              background: 'rgba(244, 180, 0, 0.06)',
-              display: 'flex',
-              flexDirection: 'row',
-              alignItems: 'center',
-              justifyContent: 'center',
-              gap: '8px'
-            }}
-            onPress={onOpenElectron}
-            disabled={saving || !onOpenElectron}
-          >
-            <Icon icon="solar:monitor-bold-duotone" style={{ fontSize: '18px', flexShrink: 0 }} />
-            <span>Open Desktop</span>
           </Button>
         )}
 

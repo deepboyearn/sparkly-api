@@ -2,21 +2,36 @@
 // Tauri app setup — all command signatures, state management, bridge lifecycle.
 // config.rs and bridge.rs provide the implementations.
 
-pub mod types;
-pub mod config;
 pub mod bridge;
-pub mod tools;
-pub mod trust_store;
+pub mod config;
 pub mod mitm_server;
 pub mod model_mapper;
+pub mod tools;
+pub mod trust_store;
+pub mod types;
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::Manager;
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+};
 use tokio::sync::{Mutex, RwLock};
 use types::*;
-use std::collections::HashMap;
 
-// ─── Cross-Platform Elevation ────────────────────────────────────────────────
+static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+// ─── Privilege Detection ─────────────────────────────────────────────────────
 
 /// Check if the current process has admin/root privileges.
 pub fn is_elevated() -> bool {
@@ -38,33 +53,6 @@ pub fn is_elevated() -> bool {
     }
 }
 
-/// Request elevation: re-launch with admin/root privileges.
-/// Returns Ok(true) if elevated instance launched, Ok(false) if user declined.
-pub fn request_elevation() -> Result<bool, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let exe_str = exe.to_str().ok_or("exe path not valid UTF-8")?;
-
-    #[cfg(target_os = "windows")]
-    {
-        windows_request_elevation(exe_str)
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        linux_request_elevation(exe_str)
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        macos_request_elevation(exe_str)
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-    {
-        Err("Elevation not supported on this platform".into())
-    }
-}
-
 // ── Windows ──────────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
@@ -77,106 +65,6 @@ fn windows_check_admin() -> bool {
     }
 
     unsafe { IsUserAnAdmin() != 0 }
-}
-
-#[cfg(target_os = "windows")]
-fn windows_request_elevation(exe: &str) -> Result<bool, String> {
-    use std::ffi::c_void;
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-
-    type HANDLE = *mut c_void;
-
-    #[link(name = "user32")]
-    extern "system" {
-        fn ShellExecuteW(hwnd: HANDLE, lpOperation: *const u16, lpFile: *const u16,
-                         lpParameters: *const u16, lpDirectory: *const u16, nShowCmd: i32) -> HANDLE;
-    }
-
-    let to_wide = |s: &str| -> Vec<u16> {
-        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
-    };
-
-    unsafe {
-        let verb = to_wide("runas");
-        let file = to_wide(exe);
-        let empty = to_wide("");
-        let result = ShellExecuteW(
-            std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(),
-            empty.as_ptr(), empty.as_ptr(), 1,
-        );
-        if (result as usize) > 32 { Ok(true) } else { Ok(false) }
-    }
-}
-
-// ── Linux ────────────────────────────────────────────────────────────────────
-
-#[cfg(target_os = "linux")]
-fn linux_request_elevation(exe: &str) -> Result<bool, String> {
-    // Try pkexec first (standard Polkit prompt — GNOME/KDE/XFCE)
-    if command_exists("pkexec") {
-        std::process::Command::new("pkexec")
-            .arg(exe)
-            .spawn()
-            .map_err(|e| format!("pkexec failed: {e}"))?;
-        return Ok(true);
-    }
-
-    // Fallback: gksudo (GNOME2 / some XFCE)
-    if command_exists("gksudo") {
-        std::process::Command::new("gksudo")
-            .args(["--", exe])
-            .spawn()
-            .map_err(|e| format!("gksudo failed: {e}"))?;
-        return Ok(true);
-    }
-
-    // Fallback: kdesudo (KDE)
-    if command_exists("kdesudo") {
-        std::process::Command::new("kdesudo")
-            .args(["-c", exe])
-            .spawn()
-            .map_err(|e| format!("kdesudo failed: {e}"))?;
-        return Ok(true);
-    }
-
-    Err("No elevation tool found (pkexec/gksudo/kdesudo). Run with: sudo ./sparkly-api".into())
-}
-
-#[cfg(target_os = "linux")]
-fn command_exists(cmd: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(cmd)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-// ── macOS ────────────────────────────────────────────────────────────────────
-
-#[cfg(target_os = "macos")]
-fn macos_request_elevation(exe: &str) -> Result<bool, String> {
-    // osascript shows the native macOS "Password" dialog
-    let script = format!(
-        "do shell script \"\\\"{}\\\"\" with administrator privileges",
-        exe.replace('\\', "\\\\").replace('"', "\\\"")
-    );
-
-    let output = std::process::Command::new("osascript")
-        .args(["-e", &script])
-        .output()
-        .map_err(|e| format!("osascript failed: {e}"))?;
-
-    if output.status.success() {
-        Ok(true)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("User canceled") || stderr.contains("(-128)") {
-            Ok(false) // User clicked Cancel
-        } else {
-            Err(format!("macOS elevation failed: {stderr}"))
-        }
-    }
 }
 
 /// Shared application state.
@@ -193,7 +81,8 @@ pub struct AppState {
     pub data_dir: std::path::PathBuf,
     pub mitm_running: RwLock<bool>,
     pub mitm_shutdown_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    pub model_mappings: RwLock<HashMap<String, String>>,
+    pub mitm_generation: AtomicU64,
+    pub model_mappings: Arc<RwLock<HashMap<String, String>>>,
 }
 
 pub fn run() {
@@ -213,9 +102,53 @@ pub fn run() {
     tracing_subscriber::fmt::init();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
+        // Must be registered first so a duplicate launch cannot start another
+        // bridge listener. A second launch focuses the existing desktop window.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .setup(|app| {
-            let data_dir = app.path().app_data_dir().expect("failed to get app data dir");
+            let show_item = MenuItem::with_id(app, "show", "Open Sparkly API", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit Sparkly API", true, None::<&str>)?;
+            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            TrayIconBuilder::new()
+                .icon(
+                    app.default_window_icon()
+                        .expect("application icon is configured")
+                        .clone(),
+                )
+                .tooltip("Sparkly API - local bridge running")
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => show_main_window(app),
+                    "quit" => {
+                        QUIT_REQUESTED.store(true, Ordering::Release);
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if matches!(
+                        event,
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } | TrayIconEvent::DoubleClick {
+                            button: MouseButton::Left,
+                            ..
+                        }
+                    ) {
+                        show_main_window(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+
+            let data_dir = app
+                .path()
+                .app_data_dir()
+                .expect("failed to get app data dir");
             std::fs::create_dir_all(&data_dir).ok();
 
             let conf = config::load_config(&data_dir);
@@ -232,28 +165,38 @@ pub fn run() {
                     active_model_count: 0,
                     last_request_at: None,
                     uptime_ms: 0,
-                    local_base_url: String::new(),
+                    local_base_url: format!("http://localhost:{DEFAULT_LOCAL_PORT}"),
                     server_running: false,
                 }),
                 started_at: std::time::Instant::now(),
                 data_dir: data_dir.clone(),
                 mitm_running: RwLock::new(false),
                 mitm_shutdown_tx: Mutex::new(None),
-                model_mappings: RwLock::new(model_mapper::default_mappings()),
+                mitm_generation: AtomicU64::new(0),
+                model_mappings: Arc::new(RwLock::new(model_mapper::default_mappings())),
             };
 
             let state_arc = Arc::new(state);
 
-            // Supervise the bridge listener: `bridge::spawn_supervisor` keeps it
-            // alive across restarts, so a config change re-binds instead of
-            // killing the server for the rest of the session.
+            // Supervise the single fixed bridge listener for the process lifetime.
+            // Only explicit restart or listener-policy changes trigger a rebind.
             bridge::spawn_supervisor(state_arc.clone());
 
             app.manage(state_arc);
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if !QUIT_REQUESTED.load(Ordering::Acquire) {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
+            sparkly_runtime_identity,
             get_state,
+            get_runtime_snapshot,
             save_config,
             restart_server,
             create_client_key,
@@ -275,11 +218,24 @@ pub fn run() {
             update_mitm_model_mappings,
             get_mitm_model_mappings,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            if matches!(
+                event,
+                tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
+            ) {
+                bridge::shutdown_supervisor();
+            }
+        });
 }
 
 // ─── Tauri Commands ──────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn sparkly_runtime_identity() -> &'static str {
+    "sparkly-api:com.sparklyapi.sparklyapi:v1"
+}
 
 #[tauri::command]
 async fn get_state(state: tauri::State<'_, Arc<AppState>>) -> Result<BridgeState, String> {
@@ -287,30 +243,38 @@ async fn get_state(state: tauri::State<'_, Arc<AppState>>) -> Result<BridgeState
 }
 
 #[tauri::command]
+async fn get_runtime_snapshot(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<RuntimeSnapshot, String> {
+    Ok(bridge::build_runtime_snapshot(&state).await)
+}
+
+#[tauri::command]
 async fn save_config(
     config: BridgeConfig,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<BridgeState, String> {
-    {
+    let cors_changed = {
         let mut cfg = state.config.write().await;
+        let previous_cors = cfg.enable_cors;
         *cfg = config;
         config::save_config(&mut cfg, &state.data_dir).map_err(|e| e.to_string())?;
+        previous_cors != cfg.enable_cors
+    };
+    if cors_changed {
+        bridge::request_rebind().await?;
     }
-    // localPort / enableCors may have changed — re-bind the listener.
-    bridge::request_rebind().await;
     Ok(bridge::build_bridge_state(&state).await)
 }
 
 #[tauri::command]
-async fn restart_server(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<BridgeState, String> {
+async fn restart_server(state: tauri::State<'_, Arc<AppState>>) -> Result<BridgeState, String> {
     {
         let conf = config::load_config(&state.data_dir);
         let mut cfg = state.config.write().await;
         *cfg = conf;
     }
-    bridge::request_rebind().await;
+    bridge::request_rebind().await?;
     Ok(bridge::build_bridge_state(&state).await)
 }
 
@@ -363,7 +327,6 @@ async fn create_account(
         config::create_account(&mut cfg, &input);
         config::save_config(&mut cfg, &state.data_dir).map_err(|e| e.to_string())?;
     }
-    bridge::request_rebind().await;
     Ok(bridge::build_bridge_state(&state).await)
 }
 
@@ -377,7 +340,6 @@ async fn update_account(
         config::update_account(&mut cfg, &input);
         config::save_config(&mut cfg, &state.data_dir).map_err(|e| e.to_string())?;
     }
-    bridge::request_rebind().await;
     Ok(bridge::build_bridge_state(&state).await)
 }
 
@@ -391,7 +353,6 @@ async fn delete_account(
         config::delete_account(&mut cfg, &input.id);
         config::save_config(&mut cfg, &state.data_dir).map_err(|e| e.to_string())?;
     }
-    bridge::request_rebind().await;
     Ok(bridge::build_bridge_state(&state).await)
 }
 
@@ -405,7 +366,6 @@ async fn select_account(
         config::select_account(&mut cfg, &input.id);
         config::save_config(&mut cfg, &state.data_dir).map_err(|e| e.to_string())?;
     }
-    bridge::request_rebind().await;
     Ok(bridge::build_bridge_state(&state).await)
 }
 
@@ -413,8 +373,8 @@ async fn select_account(
 async fn refresh_active_account_models(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<BridgeState, String> {
-    // Mirrors `syncActiveAccountModels` (src/main/main.ts:93-122): v0 has a
-    // fixed catalog, everything else is fetched from the provider.
+    // v0 uses a fixed catalog; every other provider is queried dynamically.
+    // Provider model lists are refreshed without restarting the local listener.
     let (provider, base_url, api_key) = {
         let cfg = state.config.read().await;
         match config::get_active_account(&cfg) {
@@ -423,21 +383,53 @@ async fn refresh_active_account_models(
         }
     };
 
-    if base_url.is_empty() || api_key.is_empty() {
-        return Err("The active account needs a base URL and an API key.".into());
+    if base_url.is_empty() {
+        return Err("The active account needs a base URL.".into());
+    }
+    if api_key.is_empty() && !matches!(provider, AccountProvider::Auto | AccountProvider::Ollama) {
+        return Err("The active account needs an API key for this protocol.".into());
     }
 
-    let models = if provider == AccountProvider::V0 {
-        V0_MODELS.iter().map(|m| (*m).to_string()).collect()
+    let (models, detected_protocol) = if provider == AccountProvider::V0 {
+        (
+            V0_MODELS.iter().map(|m| (*m).to_string()).collect(),
+            AccountProvider::V0,
+        )
     } else {
-        bridge::fetch_models_from_provider(&base_url, &api_key).await?
+        bridge::fetch_models_from_provider(&base_url, &api_key, provider).await?
     };
+
+    if models.is_empty() {
+        return Err("The provider returned an empty model catalog.".into());
+    }
 
     {
         let mut cfg = state.config.write().await;
-        cfg.models = models;
-        // save_config re-normalizes, so selectedModel stays valid against the
-        // new list.
+        let active_id = cfg.active_account_id.clone();
+        let account_index = cfg
+            .accounts
+            .iter()
+            .position(|account| account.id == active_id)
+            .or_else(|| (!cfg.accounts.is_empty()).then_some(0))
+            .ok_or_else(|| "No active account is configured.".to_string())?;
+        let account = &mut cfg.accounts[account_index];
+        account.models = models;
+        account.detected_protocol = Some(detected_protocol);
+        if !account
+            .models
+            .iter()
+            .any(|model| model == &account.selected_model)
+        {
+            let previous_selection = account.selected_model.clone();
+            account.selected_model = account
+                .models
+                .iter()
+                .find(|model| model.rsplit('/').next() == Some(previous_selection.as_str()))
+                .cloned()
+                .or_else(|| account.models.first().cloned())
+                .unwrap_or_default();
+        }
+        account.models_last_refreshed_at = Some(chrono::Utc::now().to_rfc3339());
         config::save_config(&mut cfg, &state.data_dir).map_err(|e| e.to_string())?;
     }
     Ok(bridge::build_bridge_state(&state).await)
@@ -466,13 +458,11 @@ async fn reset_usage(
 async fn playground_load_models(
     input: PlaygroundModelsInput,
 ) -> Result<PlaygroundModelsResult, String> {
-    bridge::fetch_playground_models(&input.base_url, &input.api_key).await
+    bridge::fetch_playground_models(&input.base_url, &input.api_key, input.protocol).await
 }
 
 #[tauri::command]
-async fn playground_test(
-    input: PlaygroundTestInput,
-) -> Result<PlaygroundTestResult, String> {
+async fn playground_test(input: PlaygroundTestInput) -> Result<PlaygroundTestResult, String> {
     bridge::playground_test(input).await
 }
 
@@ -488,16 +478,13 @@ async fn trust_mitm_cert(state: tauri::State<'_, Arc<AppState>>) -> Result<bool,
         Ok(result) => return Ok(result),
         Err(e) => {
             let msg = e.to_string();
-            // Permission denied → request elevation
-            if msg.contains("Permission denied") || msg.contains("Operation not permitted")
-                || msg.contains("EACCES") || msg.contains("access denied")
+            // Do not relaunch the full application: that could create a second listener.
+            if msg.contains("Permission denied")
+                || msg.contains("Operation not permitted")
+                || msg.contains("EACCES")
+                || msg.contains("access denied")
             {
-                tracing::info!("Trust requires elevation: {msg}");
-                match request_elevation() {
-                    Ok(true) => return Err("ADMIN_ELEVATION_REQUESTED".into()),
-                    Ok(false) => return Err("User declined elevation. Certificate trust requires administrator.".into()),
-                    Err(elev_err) => return Err(format!("Elevation failed: {elev_err}\n\nAlternatively, run:\nsudo update-ca-certificates")),
-                }
+                return Err("Certificate trust requires administrator privileges. Close Sparkly API, relaunch it as administrator/root, and try again.".into());
             }
             return Err(msg);
         }
@@ -510,14 +497,12 @@ async fn untrust_mitm_cert(state: tauri::State<'_, Arc<AppState>>) -> Result<boo
         Ok(result) => return Ok(result),
         Err(e) => {
             let msg = e.to_string();
-            if msg.contains("Permission denied") || msg.contains("Operation not permitted")
-                || msg.contains("EACCES") || msg.contains("access denied")
+            if msg.contains("Permission denied")
+                || msg.contains("Operation not permitted")
+                || msg.contains("EACCES")
+                || msg.contains("access denied")
             {
-                match request_elevation() {
-                    Ok(true) => return Err("ADMIN_ELEVATION_REQUESTED".into()),
-                    Ok(false) => return Err("User declined elevation.".into()),
-                    Err(elev_err) => return Err(format!("Elevation failed: {elev_err}")),
-                }
+                return Err("Removing certificate trust requires administrator privileges. Close Sparkly API, relaunch it as administrator/root, and try again.".into());
             }
             return Err(msg);
         }
@@ -525,105 +510,79 @@ async fn untrust_mitm_cert(state: tauri::State<'_, Arc<AppState>>) -> Result<boo
 }
 
 #[tauri::command]
-async fn get_mitm_cert_status(state: tauri::State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+async fn get_mitm_cert_status(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
     let exists = trust_store::cert_exists(&state.data_dir);
     let trusted = trust_store::is_trusted(&state.data_dir);
+    let running = *state.mitm_running.read().await;
     Ok(serde_json::json!({
         "exists": exists,
         "trusted": trusted,
+        "running": running,
     }))
 }
 
 // ─── MITM Server Commands ────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn start_mitm_server_cmd(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<bool, String> {
+async fn start_mitm_server_cmd(state: tauri::State<'_, Arc<AppState>>) -> Result<bool, String> {
     let running = *state.mitm_running.read().await;
     if running {
         return Ok(true);
     }
 
-    // ── Cross-platform: check elevation, request if needed ──
     if !is_elevated() {
-        tracing::info!("Requesting elevation for MITM server (port 443 requires root/admin)...");
-        match request_elevation() {
-            Ok(true) => {
-                return Err("ADMIN_ELEVATION_REQUESTED".into());
-            }
-            Ok(false) => {
-                return Err("User declined elevation. Port 443 requires administrator/root.".into());
-            }
-            Err(e) => {
-                return Err(format!("Elevation failed: {e}\n\nAlternatively, run the app as root:\nsudo ./sparkly-api"));
-            }
-        }
+        return Err(
+            "The MITM listener on port 443 requires administrator privileges. Close Sparkly API and relaunch it as administrator/root; Sparkly will not spawn a second privileged application instance."
+                .into(),
+        );
     }
 
-    // Ensure CA cert exists
     trust_store::get_or_generate_ca(&state.data_dir).map_err(|e| e.to_string())?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
     let data_dir = state.data_dir.clone();
+    let mappings = state.model_mappings.clone();
+    let upstream_url = format!("http://localhost:{DEFAULT_LOCAL_PORT}");
+    let state_arc = state.inner().clone();
+    let generation = state.mitm_generation.fetch_add(1, Ordering::AcqRel) + 1;
 
     {
         let mut tx = state.mitm_shutdown_tx.lock().await;
         *tx = Some(shutdown_tx);
     }
-    {
-        let mut running = state.mitm_running.write().await;
-        *running = true;
-    }
 
-    let running_flag = Arc::new(tokio::sync::RwLock::new(true));
-    let flag_clone = running_flag.clone();
-
-    let mappings_clone = {
-        let mappings = state.model_mappings.read().await;
-        Arc::new(tokio::sync::RwLock::new(mappings.clone()))
-    };
-    // Forward to the bridge's actual listening URL (client base URL), not a
-    // hardcoded port — keeps local dev and the client on the same base URL.
-    let upstream_url = {
-        let stats = state.stats.read().await;
-        let base = stats.local_base_url.clone();
-        if base.is_empty() {
-            format!("http://localhost:{}", state.config.read().await.local_port)
-        } else {
-            base
-        }
-    };
     tokio::spawn(async move {
-        let result = mitm_server::start_mitm_server(data_dir, 443, shutdown_rx, mappings_clone, upstream_url).await;
-        if let Err(e) = result {
-            tracing::error!("MITM server failed: {e}");
+        let result = mitm_server::start_mitm_server(
+            data_dir,
+            443,
+            shutdown_rx,
+            ready_tx,
+            mappings,
+            upstream_url,
+        )
+        .await;
+        if let Err(error) = result {
+            tracing::error!("MITM server failed: {error}");
         }
-        let mut flag = flag_clone.write().await;
-        *flag = false;
+        if state_arc.mitm_generation.load(Ordering::Acquire) == generation {
+            *state_arc.mitm_running.write().await = false;
+            state_arc.mitm_shutdown_tx.lock().await.take();
+        }
     });
 
-    // Poll until the server is either started or failed
-    for _ in 0..20 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if !*running_flag.read().await {
-            let mut running = state.mitm_running.write().await;
-            *running = false;
-            return Err("MITM server failed to start — check port 443 permissions".into());
-        }
-        let running = *state.mitm_running.read().await;
-        if running {
-            return Ok(true);
-        }
-    }
-
+    tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx)
+        .await
+        .map_err(|_| "Timed out while binding the MITM listener on localhost:443.".to_string())?
+        .map_err(|_| "The MITM listener stopped before reporting startup status.".to_string())??;
+    *state.mitm_running.write().await = true;
     Ok(true)
 }
 
 #[tauri::command]
-async fn stop_mitm_server_cmd(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<bool, String> {
+async fn stop_mitm_server_cmd(state: tauri::State<'_, Arc<AppState>>) -> Result<bool, String> {
     let tx = {
         let mut tx = state.mitm_shutdown_tx.lock().await;
         tx.take()

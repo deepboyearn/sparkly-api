@@ -29,10 +29,7 @@ const CA_COMMON_NAME: &str = "Sparkly API MITM CA";
 pub fn ca_paths(data_dir: &Path) -> (PathBuf, PathBuf) {
     let certs_dir = data_dir.join("mitm-certs");
     fs::create_dir_all(&certs_dir).ok();
-    (
-        certs_dir.join("rootCA.key"),
-        certs_dir.join("rootCA.crt"),
-    )
+    (certs_dir.join("rootCA.key"), certs_dir.join("rootCA.crt"))
 }
 
 /// Check if the CA cert already exists on disk.
@@ -52,7 +49,9 @@ pub fn generate_ca(data_dir: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
     // Add SANs
     for d in MITM_DOMAINS {
         let name = d.replace("*.", ""); // strip wildcard prefix for basic SAN
-        params.subject_alt_names.push(SanType::DnsName(name.parse().unwrap()));
+        params
+            .subject_alt_names
+            .push(SanType::DnsName(name.parse().unwrap()));
     }
 
     // Make this a CA certificate
@@ -130,7 +129,9 @@ pub fn is_trusted(data_dir: &Path) -> bool {
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
                 stderr.contains("CmdResult: 0x0")
-                    || o.stdout.windows(b"CertUtil".len()).any(|w| w == b"CertUtil")
+                    || o.stdout
+                        .windows(b"CertUtil".len())
+                        .any(|w| w == b"CertUtil")
             }
             Err(_) => false,
         }

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -17,16 +17,42 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::trust_store;
 
+const MAX_MITM_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+const MAX_MITM_HEADER_BYTES: usize = 64 * 1024;
+const MAX_MITM_CONNECTIONS: usize = 64;
+const MITM_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+static MITM_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(8)
+        .build()
+        .expect("building the shared MITM HTTP client")
+});
+
 const MITM_DOMAINS: &[&str] = &[
-    "*.googleapis.com", "*.openai.com", "api.anthropic.com",
-    "api.openai.com", "api2.cursor.sh", "cloudcode-pa.googleapis.com",
-    "daily-cloudcode-pa.googleapis.com", "localhost", "runtime.us-east-1.kiro.dev",
+    "*.googleapis.com",
+    "*.openai.com",
+    "api.anthropic.com",
+    "api.openai.com",
+    "api2.cursor.sh",
+    "cloudcode-pa.googleapis.com",
+    "daily-cloudcode-pa.googleapis.com",
+    "localhost",
+    "runtime.us-east-1.kiro.dev",
 ];
 
 #[derive(Debug)]
 struct CertProvider {
     ca_key_der: Vec<u8>,
-    cache: HashMap<String, (rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>)>,
+    cache: HashMap<
+        String,
+        (
+            rustls::pki_types::CertificateDer<'static>,
+            rustls::pki_types::PrivateKeyDer<'static>,
+        ),
+    >,
 }
 
 /// Reconstruct the CA cert params (deterministic from known domain list + CN)
@@ -40,7 +66,8 @@ fn cert_der_for_domain(provider: &mut CertProvider, domain: &str) -> Vec<u8> {
     let ca_key_pair = rcgen::KeyPair::try_from(provider.ca_key_der.as_slice()).unwrap();
 
     // Reconstruct CA cert (deterministic params = same cert every time)
-    let mut ca_params = rcgen::CertificateParams::new(vec!["Sparkly API MITM CA".to_string()]).unwrap();
+    let mut ca_params =
+        rcgen::CertificateParams::new(vec!["Sparkly API MITM CA".to_string()]).unwrap();
     ca_params.subject_alt_names = MITM_DOMAINS
         .iter()
         .map(|d| rcgen::SanType::DnsName(d.replace("*.", "").parse().unwrap()))
@@ -83,7 +110,7 @@ fn build_tls_config(data_dir: &Path) -> Result<Arc<ServerConfig>> {
         .map_err(|e| anyhow::anyhow!("reading CA key: {e}"))?;
     let ca_key_der = pkcs8_key.secret_pkcs8_der().to_vec();
 
-    let provider = Arc::new(tokio::sync::Mutex::new(CertProvider {
+    let provider = Arc::new(parking_lot::Mutex::new(CertProvider {
         ca_key_der,
         cache: HashMap::new(),
     }));
@@ -94,15 +121,16 @@ fn build_tls_config(data_dir: &Path) -> Result<Arc<ServerConfig>> {
         .with_no_client_auth()
         .with_cert_resolver(resolver);
 
-    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    server_config.key_log = Arc::new(rustls::KeyLogFile::new());
+    // The current forwarding layer accepts HTTP/1.1 only. Never advertise h2
+    // until the connection handler is backed by Hyper's HTTP/2 implementation.
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     Ok(Arc::new(server_config))
 }
 
 #[derive(Debug)]
 struct SniCertResolver {
-    provider: Arc<tokio::sync::Mutex<CertProvider>>,
+    provider: Arc<parking_lot::Mutex<CertProvider>>,
 }
 
 impl rustls::server::ResolvesServerCert for SniCertResolver {
@@ -110,7 +138,7 @@ impl rustls::server::ResolvesServerCert for SniCertResolver {
         &self,
         client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        let mut provider = self.provider.try_lock().ok()?;
+        let mut provider = self.provider.lock();
         let domain = client_hello.server_name()?.to_string();
         cert_der_for_domain(&mut provider, &domain);
 
@@ -126,66 +154,114 @@ pub async fn start_mitm_server(
     data_dir: std::path::PathBuf,
     port: u16,
     shutdown_rx: oneshot::Receiver<()>,
+    ready_tx: oneshot::Sender<Result<(), String>>,
     model_mappings: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
     upstream_url: String,
 ) -> Result<()> {
-    let tls_config = build_tls_config(&data_dir)?;
+    let tls_config = match build_tls_config(&data_dir) {
+        Ok(config) => config,
+        Err(error) => {
+            let message = error.to_string();
+            let _ = ready_tx.send(Err(message.clone()));
+            return Err(error);
+        }
+    };
     let acceptor = TlsAcceptor::from(tls_config);
 
-    let addr: SocketAddr = ([0, 0, 0, 0], port).into();
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("binding MITM server on port {port}"))?;
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let listener = match TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            let message = format!("Cannot bind localhost:{port}: {error}");
+            let _ = ready_tx.send(Err(message.clone()));
+            return Err(error).with_context(|| format!("binding MITM server on localhost:{port}"));
+        }
+    };
 
-    tracing::info!("MITM server listening on port {port}, forwarding to {upstream_url}");
+    tracing::info!("MITM server listening on localhost:{port}, forwarding to {upstream_url}");
+    let _ = ready_tx.send(Ok(()));
 
-    tokio::spawn(async move {
-        let mut shutdown_rx = shutdown_rx;
-        loop {
-            tokio::select! {
-                accept_result = listener.accept() => {
-                    match accept_result {
-                        Ok((tcp_stream, peer_addr)) => {
-                            let acceptor = acceptor.clone();
-                            let mappings = model_mappings.clone();
-                            let upstream = upstream_url.clone();
-                            tokio::spawn(async move {
-                                match acceptor.accept(tcp_stream).await {
-                                    Ok(tls_stream) => {
-                                        handle_connection(tls_stream, &mappings, &upstream).await;
-                                    }
-                                    Err(e) => {
-                                        tracing::debug!("TLS accept error from {peer_addr}: {e}");
-                                    }
+    let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_MITM_CONNECTIONS));
+    let mut shutdown_rx = shutdown_rx;
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((tcp_stream, peer_addr)) => {
+                        let permit = match connection_limit.clone().try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                tracing::warn!("MITM connection limit reached; rejecting {peer_addr}");
+                                drop(tcp_stream);
+                                continue;
+                            }
+                        };
+                        let acceptor = acceptor.clone();
+                        let mappings = model_mappings.clone();
+                        let upstream = upstream_url.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                acceptor.accept(tcp_stream),
+                            ).await {
+                                Ok(Ok(tls_stream)) => {
+                                    handle_connection(tls_stream, &mappings, &upstream).await;
                                 }
-                            });
-                        }
-                        Err(e) => {
-                            tracing::error!("TCP accept error: {e}");
-                        }
+                                Ok(Err(error)) => {
+                                    tracing::debug!("TLS accept error from {peer_addr}: {error}");
+                                }
+                                Err(_) => {
+                                    tracing::debug!("TLS handshake timed out for {peer_addr}");
+                                }
+                            }
+                        });
                     }
-                }
-                _ = &mut shutdown_rx => {
-                    tracing::info!("MITM server shutting down");
-                    break;
+                    Err(error) => tracing::error!("TCP accept error: {error}"),
                 }
             }
+            _ = &mut shutdown_rx => {
+                tracing::info!("MITM server shutting down");
+                break;
+            }
         }
-    });
+    }
 
     Ok(())
 }
 
-async fn handle_connection<S>(mut stream: S, model_mappings: &tokio::sync::RwLock<HashMap<String, String>>, upstream_url: &str)
-where
+fn is_streaming_body(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(|stream| stream.as_bool()))
+        .unwrap_or(false)
+}
+
+async fn handle_connection<S>(
+    mut stream: S,
+    model_mappings: &tokio::sync::RwLock<HashMap<String, String>>,
+    upstream_url: &str,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let mut buf = Vec::with_capacity(4096);
-    if stream.read_buf(&mut buf).await.is_err() || buf.is_empty() {
-        return;
-    }
-
-    let request_str = String::from_utf8_lossy(&buf);
+    let mut buf = Vec::with_capacity(8192);
+    let header_end = loop {
+        if let Some(position) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position;
+        }
+        if buf.len() >= MAX_MITM_HEADER_BYTES {
+            let _ = stream.write_all(
+                b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            ).await;
+            let _ = stream.shutdown().await;
+            return;
+        }
+        match tokio::time::timeout(MITM_IO_TIMEOUT, stream.read_buf(&mut buf)).await {
+            Ok(Ok(read)) if read > 0 => {}
+            _ => return,
+        }
+    };
+    let request_str = String::from_utf8_lossy(&buf[..header_end]);
     let first_line = request_str.lines().next().unwrap_or("");
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or("GET");
@@ -198,20 +274,40 @@ where
         .and_then(|l| l.trim().parse::<usize>().ok())
         .unwrap_or(0);
 
-    let header_end = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .unwrap_or(buf.len());
-    let mut body = buf[header_end + 4..].to_vec();
-    while body.len() < content_length {
-        match stream.read_buf(&mut body).await {
-            Ok(0) | Err(_) => break,
-            _ => {}
-        }
+    if content_length > MAX_MITM_REQUEST_BYTES {
+        let _ = stream
+            .write_all(
+                b"HTTP/1.1 413 Payload Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await;
+        let _ = stream.shutdown().await;
+        return;
     }
 
-    let is_streaming = body.windows(10).position(|w| w == b"\"stream\":true").is_some()
-        || body.windows(11).position(|w| w == b"\"stream\": true").is_some();
+    let mut body = buf[header_end + 4..].to_vec();
+    while body.len() < content_length {
+        match tokio::time::timeout(MITM_IO_TIMEOUT, stream.read_buf(&mut body)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(_)) => {
+                if body.len() > MAX_MITM_REQUEST_BYTES {
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+            }
+        }
+    }
+    if body.len() != content_length {
+        let _ = stream
+            .write_all(
+                b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await;
+        let _ = stream.shutdown().await;
+        return;
+    }
+    body.truncate(content_length);
+
+    let is_streaming = is_streaming_body(&body);
 
     let mut headers: Vec<(String, String)> = Vec::new();
     for line in request_str.lines().skip(1) {
@@ -222,6 +318,7 @@ where
             let key = k.trim().to_string();
             let val = v.trim().to_string();
             if !key.eq_ignore_ascii_case("host")
+                && !key.eq_ignore_ascii_case("content-length")
                 && !key.eq_ignore_ascii_case("transfer-encoding")
                 && !key.eq_ignore_ascii_case("connection")
             {
@@ -233,7 +330,11 @@ where
     // Rewrite model name based on mappings
     let body = if !body.is_empty() {
         if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body) {
-            if let Some(model) = parsed.get("model").and_then(|v| v.as_str()).map(String::from) {
+            if let Some(model) = parsed
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+            {
                 let mappings = model_mappings.read().await;
                 if let Some(mapped) = mappings.get(&model) {
                     let mapped = mapped.clone();
@@ -253,10 +354,12 @@ where
     let upstream_url = format!("{upstream_url}{path}");
 
     let mut req_builder = match method {
-        "POST" => reqwest::Client::new().post(&upstream_url),
-        "PUT" => reqwest::Client::new().put(&upstream_url),
-        "DELETE" => reqwest::Client::new().delete(&upstream_url),
-        _ => reqwest::Client::new().get(&upstream_url),
+        "POST" => MITM_HTTP_CLIENT.post(&upstream_url),
+        "PUT" => MITM_HTTP_CLIENT.put(&upstream_url),
+        "PATCH" => MITM_HTTP_CLIENT.patch(&upstream_url),
+        "DELETE" => MITM_HTTP_CLIENT.delete(&upstream_url),
+        "HEAD" => MITM_HTTP_CLIENT.head(&upstream_url),
+        _ => MITM_HTTP_CLIENT.get(&upstream_url),
     };
 
     for (k, v) in &headers {
@@ -267,7 +370,7 @@ where
         req_builder = req_builder.body(body);
     }
 
-    let resp = match req_builder.send().await {
+    let mut resp = match req_builder.send().await {
         Ok(r) => r,
         Err(e) => {
             let err_body = format!(
@@ -290,47 +393,57 @@ where
         let val = v.to_str().unwrap_or("").to_string();
         if !key.eq_ignore_ascii_case("transfer-encoding")
             && !key.eq_ignore_ascii_case("connection")
+            && !(is_streaming && key.eq_ignore_ascii_case("content-length"))
         {
             resp_headers.push((key, val));
         }
     }
 
-    let status_line = format!("HTTP/1.1 {status} OK\r\n");
+    let reason = resp.status().canonical_reason().unwrap_or("");
+    let status_line = format!("HTTP/1.1 {status} {reason}\r\n");
     let _ = stream.write_all(status_line.as_bytes()).await;
 
     for (k, v) in &resp_headers {
         let header = format!("{k}: {v}\r\n");
         let _ = stream.write_all(header.as_bytes()).await;
     }
-    let _ = stream.write_all(b"\r\n").await;
+    let _ = stream.write_all(b"Connection: close\r\n\r\n").await;
 
     if is_streaming {
-        match resp.bytes().await {
-            Ok(raw) => {
-                let text = String::from_utf8_lossy(&raw);
-                for chunk in text.split("\n\n") {
-                    let chunk = chunk.trim();
-                    if chunk.is_empty() {
-                        continue;
-                    }
-                    if chunk.starts_with("data: ") {
-                        let _ = stream.write_all(b"data: ").await;
-                        let _ = stream.write_all(chunk[6..].as_bytes()).await;
-                        let _ = stream.write_all(b"\n\n").await;
-                    } else {
-                        let _ = stream.write_all(chunk.as_bytes()).await;
-                        let _ = stream.write_all(b"\n\n").await;
+        loop {
+            match tokio::time::timeout(MITM_IO_TIMEOUT, resp.chunk()).await {
+                Ok(Ok(Some(chunk))) => {
+                    if stream.write_all(&chunk).await.is_err() {
+                        break;
                     }
                 }
-                let _ = stream.write_all(b"data: [DONE]\n\n").await;
+                Ok(Ok(None)) => break,
+                Ok(Err(error)) => {
+                    tracing::debug!("MITM upstream stream failed: {error}");
+                    break;
+                }
+                Err(_) => {
+                    tracing::debug!("MITM upstream stream timed out");
+                    break;
+                }
             }
-            Err(_) => {}
         }
-    } else {
-        if let Ok(body_bytes) = resp.bytes().await {
-            let _ = stream.write_all(&body_bytes).await;
-        }
+    } else if let Ok(body_bytes) = resp.bytes().await {
+        let _ = stream.write_all(&body_bytes).await;
     }
 
     let _ = stream.shutdown().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_json_streaming_without_whitespace_assumptions() {
+        assert!(is_streaming_body(br#"{"stream" : true}"#));
+        assert!(!is_streaming_body(br#"{"stream":false}"#));
+        assert!(!is_streaming_body(br#"{"message":"stream:true"}"#));
+        assert!(!is_streaming_body(b"not-json"));
+    }
 }

@@ -57,6 +57,57 @@ fn write_all_synced(path: &Path, content: &[u8]) -> Result<()> {
 
 /// Replace `path` atomically. The caller serializes first, so a serialization
 /// failure never reaches this function and the existing file stays intact.
+#[cfg(not(target_os = "windows"))]
+fn replace_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
+    fs::rename(temp_path, path)
+}
+
+#[cfg(target_os = "windows")]
+fn replace_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    if !path.exists() {
+        return fs::rename(temp_path, path);
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn ReplaceFileW(
+            replaced: *const u16,
+            replacement: *const u16,
+            backup: *const u16,
+            flags: u32,
+            exclude: *mut std::ffi::c_void,
+            reserved: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let wide = |value: &Path| {
+        value
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+    };
+    let replaced = wide(path);
+    let replacement = wide(temp_path);
+    let result = unsafe {
+        ReplaceFileW(
+            replaced.as_ptr(),
+            replacement.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir).with_context(|| format!("creating dir {}", dir.display()))?;
@@ -70,8 +121,8 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     let temp_path = dir.join(format!(".{stem}.{}.tmp", Uuid::new_v4()));
 
     let result = write_all_synced(&temp_path, content).and_then(|()| {
-        fs::rename(&temp_path, path)
-            .with_context(|| format!("renaming {} → {}", temp_path.display(), path.display()))
+        replace_file(&temp_path, path)
+            .with_context(|| format!("replacing {} with {}", path.display(), temp_path.display()))
     });
 
     if result.is_err() {
@@ -102,18 +153,17 @@ fn mask_client_key(key: &str) -> String {
 // ─── Provider normalization ──────────────────────────────────────────────────
 
 fn normalize_provider(provider: &AccountProvider) -> AccountProvider {
-    match provider {
-        AccountProvider::V0 => AccountProvider::V0,
-        AccountProvider::OpenaiCompatible => AccountProvider::OpenaiCompatible,
-        AccountProvider::Anthropic => AccountProvider::Anthropic,
-    }
+    provider.clone()
 }
 
 fn default_base_url_for_provider(provider: &AccountProvider) -> &'static str {
     match provider {
         AccountProvider::V0 => V0_BASE_URL,
-        AccountProvider::OpenaiCompatible => DEFAULT_UPSTREAM_BASE_URL,
         AccountProvider::Anthropic => "https://api.anthropic.com",
+        AccountProvider::Gemini => "https://generativelanguage.googleapis.com/v1beta",
+        AccountProvider::Ollama => "http://localhost:11434",
+        AccountProvider::Cohere => "https://api.cohere.com",
+        AccountProvider::Auto | AccountProvider::OpenaiCompatible => DEFAULT_UPSTREAM_BASE_URL,
     }
 }
 
@@ -142,10 +192,13 @@ fn normalize_accounts(
                 if trimmed.is_empty() {
                     match provider {
                         AccountProvider::V0 => "v0".to_string(),
-                        AccountProvider::OpenaiCompatible => {
+                        AccountProvider::Anthropic => "Anthropic".to_string(),
+                        AccountProvider::Gemini => "Gemini".to_string(),
+                        AccountProvider::Ollama => "Ollama".to_string(),
+                        AccountProvider::Cohere => "Cohere".to_string(),
+                        AccountProvider::Auto | AccountProvider::OpenaiCompatible => {
                             format!("Account {}", index + 1)
                         }
-                        AccountProvider::Anthropic => "anthropic".to_string(),
                     }
                 } else {
                     trimmed.to_string()
@@ -160,18 +213,22 @@ fn normalize_accounts(
                 }
             };
             let api_key = account.api_key.trim().to_string();
-            let is_active = account.id == active_account_id
-                || (active_account_id.is_empty() && index == 0);
+            let is_active =
+                account.id == active_account_id || (active_account_id.is_empty() && index == 0);
 
             UpstreamAccount {
                 id,
                 name,
                 provider,
+                detected_protocol: account.detected_protocol.clone(),
                 base_url,
                 api_key,
                 usage_tags: vec!["coding".into()],
                 is_active,
                 last_used_at: account.last_used_at.clone(),
+                models: normalize_models(account.models.clone()),
+                selected_model: account.selected_model.trim().to_string(),
+                models_last_refreshed_at: account.models_last_refreshed_at.clone(),
             }
         })
         .collect();
@@ -300,14 +357,12 @@ pub fn load_client_keys(data_dir: &Path) -> Vec<ClientApiKey> {
 // ─── Public: persist ─────────────────────────────────────────────────────────
 
 pub fn persist_config(config: &BridgeConfig, data_dir: &Path) -> Result<()> {
-    let json = serde_json::to_string_pretty(config)
-        .context("serializing BridgeConfig")?;
+    let json = serde_json::to_string_pretty(config).context("serializing BridgeConfig")?;
     atomic_write(&config_path(data_dir), json.as_bytes())
 }
 
 pub fn persist_client_keys(keys: &[ClientApiKey], data_dir: &Path) -> Result<()> {
-    let json = serde_json::to_string_pretty(keys)
-        .context("serializing client keys")?;
+    let json = serde_json::to_string_pretty(keys).context("serializing client keys")?;
     atomic_write(&client_keys_path(data_dir), json.as_bytes())
 }
 
@@ -322,31 +377,22 @@ pub fn save_config(config: &mut BridgeConfig, data_dir: &Path) -> Result<()> {
 
 // ─── Public: normalize ───────────────────────────────────────────────────────
 
-pub fn normalize_config(config: BridgeConfig) -> BridgeConfig {
-    // Seed the catalog with the defaults, then append the caller's models,
-    // trimming, dropping blanks and anything matching /codex/i, and deduping.
-    // JS dedups with a `Set` of the trimmed strings, so the comparison is
-    // case-SENSITIVE while the codex filter is case-insensitive.
-    let mut seen: std::collections::HashSet<String> =
-        std::collections::HashSet::with_capacity(DEFAULT_MODELS.len() + config.models.len());
-    let mut models: Vec<String> = Vec::with_capacity(seen.capacity());
+fn normalize_models(models: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::with_capacity(models.len());
+    models
+        .into_iter()
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty() && seen.insert(model.clone()))
+        .collect()
+}
 
-    for model in DEFAULT_MODELS
-        .iter()
-        .map(|m| (*m).to_string())
-        .chain(config.models.into_iter())
-    {
-        let trimmed = model.trim();
-        if trimmed.is_empty() || trimmed.to_ascii_lowercase().contains("codex") {
-            continue;
-        }
-        if seen.insert(trimmed.to_string()) {
-            models.push(trimmed.to_string());
-        }
-    }
+pub fn normalize_config(config: BridgeConfig) -> BridgeConfig {
+    // Catalogs are provider data. Preserve exact ordering and identifiers; do
+    // not inject application defaults or remove legitimate model names.
+    let legacy_models = normalize_models(config.models);
 
     // Normalize accounts and resolve activeAccountId.
-    let accounts = normalize_accounts(&config.accounts, &config.active_account_id);
+    let mut accounts = normalize_accounts(&config.accounts, &config.active_account_id);
     let active_account_id = accounts
         .iter()
         .find(|a| a.id == config.active_account_id)
@@ -354,27 +400,55 @@ pub fn normalize_config(config: BridgeConfig) -> BridgeConfig {
         .or_else(|| accounts.first().map(|a| a.id.clone()))
         .unwrap_or_default();
 
+    // Migrate the former top-level catalog into the active account once. A
+    // successful provider scan subsequently replaces the account catalog exactly.
+    let active_index = accounts
+        .iter()
+        .position(|account| account.id == active_account_id)
+        .or_else(|| (!accounts.is_empty()).then_some(0));
+    if let Some(active) = active_index.and_then(|index| accounts.get_mut(index)) {
+        if active.models.is_empty() && !legacy_models.is_empty() {
+            active.models = legacy_models;
+        }
+        if active
+            .models
+            .iter()
+            .any(|model| model == &config.selected_model)
+        {
+            active.selected_model = config.selected_model.trim().to_string();
+        }
+        if !active
+            .models
+            .iter()
+            .any(|model| model == &active.selected_model)
+        {
+            active.selected_model = active.models.first().cloned().unwrap_or_default();
+        }
+    }
+
     let active_account = accounts
         .iter()
-        .find(|a| a.id == active_account_id)
+        .find(|account| account.id == active_account_id)
         .or_else(|| accounts.first());
+    let models = active_account
+        .map(|account| account.models.clone())
+        .unwrap_or_default();
+    let selected_model = active_account
+        .map(|account| account.selected_model.clone())
+        .unwrap_or_default();
 
-    // Derive selectedModel: keep the caller's choice when it survived the
-    // filter, else the default, else the first model.
-    let selected_model = if models.iter().any(|m| m == &config.selected_model) {
-        config.selected_model
-    } else if models.iter().any(|m| m == DEFAULT_SELECTED_MODEL) {
-        DEFAULT_SELECTED_MODEL.to_string()
-    } else {
-        models.first().cloned().unwrap_or_default()
-    };
-
-    let local_port = config.local_port.clamp(MIN_LOCAL_PORT, MAX_LOCAL_PORT);
+    let local_port = DEFAULT_LOCAL_PORT;
 
     // Derive upstreamBaseUrl and apiKey from the active account.
     let upstream_base_url = active_account
         .map(|a| a.base_url.clone())
-        .unwrap_or_else(|| config.upstream_base_url.trim().trim_end_matches('/').to_string());
+        .unwrap_or_else(|| {
+            config
+                .upstream_base_url
+                .trim()
+                .trim_end_matches('/')
+                .to_string()
+        });
     let api_key = active_account
         .map(|a| a.api_key.clone())
         .unwrap_or_else(|| config.api_key.trim().to_string());
@@ -401,10 +475,13 @@ pub fn create_account(config: &mut BridgeConfig, input: &CreateAccountInput) {
         if trimmed.is_empty() {
             match provider {
                 AccountProvider::V0 => "v0".to_string(),
-                AccountProvider::OpenaiCompatible => {
+                AccountProvider::Anthropic => "Anthropic".to_string(),
+                AccountProvider::Gemini => "Gemini".to_string(),
+                AccountProvider::Ollama => "Ollama".to_string(),
+                AccountProvider::Cohere => "Cohere".to_string(),
+                AccountProvider::Auto | AccountProvider::OpenaiCompatible => {
                     format!("Account {}", config.accounts.len() + 1)
                 }
-                AccountProvider::Anthropic => "anthropic".to_string(),
             }
         } else {
             trimmed.to_string()
@@ -419,7 +496,7 @@ pub fn create_account(config: &mut BridgeConfig, input: &CreateAccountInput) {
                 AccountProvider::V0 => V0_BASE_URL.to_string(),
                 // JS falls back to the current top-level upstream, which
                 // normalize_config keeps in sync with the active account.
-                AccountProvider::OpenaiCompatible => {
+                AccountProvider::Auto | AccountProvider::OpenaiCompatible => {
                     let current = config.upstream_base_url.trim().trim_end_matches('/');
                     if current.is_empty() {
                         DEFAULT_UPSTREAM_BASE_URL.to_string()
@@ -427,7 +504,10 @@ pub fn create_account(config: &mut BridgeConfig, input: &CreateAccountInput) {
                         current.to_string()
                     }
                 }
-                AccountProvider::Anthropic => "https://api.anthropic.com".to_string(),
+                AccountProvider::Anthropic
+                | AccountProvider::Gemini
+                | AccountProvider::Ollama
+                | AccountProvider::Cohere => default_base_url_for_provider(&provider).to_string(),
             }
         }
     };
@@ -448,15 +528,33 @@ pub fn create_account(config: &mut BridgeConfig, input: &CreateAccountInput) {
         }
     }
 
+    let models = if provider == AccountProvider::V0 {
+        V0_MODELS.iter().map(|model| (*model).to_string()).collect()
+    } else {
+        Vec::new()
+    };
+    let selected_model = if provider == AccountProvider::V0 {
+        V0_MODELS[0].into()
+    } else {
+        String::new()
+    };
     config.accounts.push(UpstreamAccount {
         id: id.clone(),
         name,
         provider,
+        detected_protocol: if provider == AccountProvider::Auto {
+            None
+        } else {
+            Some(provider)
+        },
         base_url,
         api_key,
         usage_tags: vec!["coding".into()],
         is_active,
         last_used_at: None,
+        models,
+        selected_model,
+        models_last_refreshed_at: None,
     });
 
     if is_active || config.active_account_id.is_empty() {
@@ -480,6 +578,8 @@ pub fn update_account(config: &mut BridgeConfig, input: &UpdateAccountInput) {
         if !trimmed_name.is_empty() {
             account.name = trimmed_name.to_string();
         }
+        let provider_changed = account.provider != provider;
+        let previous_url = account.base_url.clone();
         account.provider = provider.clone();
 
         let trimmed_url = input.base_url.trim().trim_end_matches('/');
@@ -494,6 +594,20 @@ pub fn update_account(config: &mut BridgeConfig, input: &UpdateAccountInput) {
             account.api_key = trimmed_key.to_string();
         }
 
+        if provider_changed || account.base_url != previous_url {
+            account.detected_protocol = if provider == AccountProvider::Auto {
+                None
+            } else {
+                Some(provider)
+            };
+            account.models = if provider == AccountProvider::V0 {
+                V0_MODELS.iter().map(|model| (*model).to_string()).collect()
+            } else {
+                Vec::new()
+            };
+            account.selected_model = account.models.first().cloned().unwrap_or_default();
+            account.models_last_refreshed_at = None;
+        }
         account.usage_tags = vec!["coding".into()];
         account.is_active = input.is_active;
     }
@@ -530,7 +644,12 @@ pub fn delete_account(config: &mut BridgeConfig, account_id: &str) {
     let was_active = config.active_account_id == account_id;
     config.accounts.retain(|a| a.id != account_id);
 
-    if was_active || !config.accounts.iter().any(|a| a.id == config.active_account_id) {
+    if was_active
+        || !config
+            .accounts
+            .iter()
+            .any(|a| a.id == config.active_account_id)
+    {
         config.active_account_id = config
             .accounts
             .iter()
@@ -565,7 +684,15 @@ pub fn select_account(config: &mut BridgeConfig, account_id: &str) {
     for account in &mut config.accounts {
         account.is_active = account.id == resolved;
     }
-    config.active_account_id = resolved;
+    config.active_account_id = resolved.clone();
+    if let Some(account) = config
+        .accounts
+        .iter()
+        .find(|account| account.id == resolved)
+    {
+        config.models = account.models.clone();
+        config.selected_model = account.selected_model.clone();
+    }
 }
 
 /// The account requests are forwarded to: `activeAccountId` if it resolves,
@@ -636,4 +763,86 @@ pub fn update_client_key(keys: &mut [ClientApiKey], id: &str, name: &str) {
 
 pub fn delete_client_key(keys: &mut Vec<ClientApiKey>, id: &str) {
     keys.retain(|k| k.id != id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("sparkly-config-test-{}", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn normalization_enforces_the_permanent_local_port() {
+        let mut config = BridgeConfig::default();
+        config.local_port = 65_000;
+        assert_eq!(normalize_config(config).local_port, DEFAULT_LOCAL_PORT);
+    }
+
+    fn account(id: &str, models: &[&str], selected_model: &str) -> UpstreamAccount {
+        UpstreamAccount {
+            id: id.into(),
+            name: id.into(),
+            provider: AccountProvider::OpenaiCompatible,
+            detected_protocol: Some(AccountProvider::OpenaiCompatible),
+            base_url: format!("https://{id}.example/v1"),
+            api_key: format!("key-{id}"),
+            usage_tags: vec!["coding".into()],
+            is_active: false,
+            last_used_at: None,
+            models: models.iter().map(|model| (*model).to_string()).collect(),
+            selected_model: selected_model.into(),
+            models_last_refreshed_at: None,
+        }
+    }
+
+    #[test]
+    fn provider_catalog_is_preserved_exactly_without_default_injection_or_filtering() {
+        let mut config = BridgeConfig::default();
+        config.active_account_id = "router".into();
+        config.accounts = vec![account(
+            "router",
+            &["provider/codex", " model-b ", "provider/codex"],
+            "provider/codex",
+        )];
+
+        let normalized = normalize_config(config);
+        assert_eq!(normalized.models, vec!["provider/codex", "model-b"]);
+        assert_eq!(normalized.selected_model, "provider/codex");
+    }
+
+    #[test]
+    fn selecting_an_account_switches_its_catalog_and_credentials() {
+        let mut config = BridgeConfig::default();
+        config.active_account_id = "first".into();
+        config.accounts = vec![
+            account("first", &["first-model"], "first-model"),
+            account("second", &["second-model"], "second-model"),
+        ];
+
+        select_account(&mut config, "second");
+        let normalized = normalize_config(config);
+        assert_eq!(normalized.active_account_id, "second");
+        assert_eq!(normalized.models, vec!["second-model"]);
+        assert_eq!(normalized.selected_model, "second-model");
+        assert_eq!(normalized.api_key, "key-second");
+    }
+
+    #[test]
+    fn persistence_replaces_an_existing_config() {
+        let dir = test_dir();
+        let mut first = BridgeConfig::default();
+        first.selected_model = "first-model".into();
+        persist_config(&first, &dir).expect("first write");
+
+        let mut second = first;
+        second.selected_model = "second-model".into();
+        persist_config(&second, &dir).expect("replacement write");
+
+        let stored = fs::read_to_string(config_path(&dir)).expect("read stored config");
+        assert!(stored.contains("second-model"));
+        assert!(!stored.contains("first-model"));
+        let _ = fs::remove_dir_all(dir);
+    }
 }

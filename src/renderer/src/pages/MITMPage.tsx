@@ -1,7 +1,9 @@
-import { useState, useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Icon } from "@iconify/react";
+import type { UpstreamAccount } from "../../../shared/types";
 import logo from "../../../logo/logp.png";
-import type { BridgeState } from "../../../shared/types";
+import { AccountPicker } from "../components/AccountPicker";
+import { ModelPicker } from "../components/ModelPicker";
 
 const AG_MODELS = [
   "Gemini 3.6 Flash (High)",
@@ -18,517 +20,357 @@ const AG_MODELS = [
   "Gemini 3 Flash (Command)",
 ];
 
-export default function MITMPage({ state }: { state: BridgeState }) {
-  const mainApiBaseUrl = useMemo(() => {
-    const raw = import.meta.env.DEV
-      ? `${window.location.origin}/v1`
-      : state.stats.localBaseUrl || "";
-    return raw.endsWith("/v1") ? raw : raw ? `${raw}/v1` : "";
-  }, [state.stats.localBaseUrl]);
+type MitmApi = Record<string, (...args: unknown[]) => Promise<unknown>>;
 
-  const [baseUrl, setBaseUrl] = useState(() => mainApiBaseUrl);
+type MITMPageProps = {
+  accounts: UpstreamAccount[];
+  activeAccountId: string;
+  onSelectAccount: (accountId: string) => Promise<void>;
+};
 
-  useEffect(() => {
-    if (mainApiBaseUrl) {
-      setBaseUrl(mainApiBaseUrl);
-    }
-  }, [mainApiBaseUrl]);
+function getMitmApi() {
+  return (window as unknown as { bridgeApi?: MitmApi }).bridgeApi;
+}
 
+function comparableMappings(mappings: Record<string, string>) {
+  return AG_MODELS.map((source) => [source, mappings[source] ?? ""] as const);
+}
+
+export default function MITMPage({ accounts, activeAccountId, onSelectAccount }: MITMPageProps) {
   const [isRunning, setIsRunning] = useState(false);
   const [isCertTrusted, setIsCertTrusted] = useState(false);
-  const [isCertGenerated, setIsCertGenerated] = useState(true);
+  const [isCertGenerated, setIsCertGenerated] = useState(false);
   const [certLoading, setCertLoading] = useState(false);
-
-  // Antigravity Card State
-  const [isAgExpanded, setIsAgExpanded] = useState(true);
-  const [isDnsStarted, setIsDnsStarted] = useState(false);
+  const [serverLoading, setServerLoading] = useState(false);
+  const [routeLoading, setRouteLoading] = useState(false);
+  const [mappingsLoading, setMappingsLoading] = useState(false);
+  const [showHosts, setShowHosts] = useState(false);
+  const [selectedAccountId, setSelectedAccountId] = useState(activeAccountId);
+  const [savedMappings, setSavedMappings] = useState<Record<string, string>>({});
   const [modelMappings, setModelMappings] = useState<Record<string, string>>({});
+  const [mappingQueries, setMappingQueries] = useState<Record<string, string>>({});
+  const [statusMessage, setStatusMessage] = useState("Loading interception status...");
+  const [statusKind, setStatusKind] = useState<"info" | "success" | "error">("info");
 
-  // Check cert status and load model mappings on mount
   useEffect(() => {
-    const init = async () => {
+    if (accounts.some((account) => account.id === selectedAccountId)) return;
+    setSelectedAccountId(activeAccountId || accounts[0]?.id || "");
+  }, [accounts, activeAccountId, selectedAccountId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const initialize = async () => {
       try {
-        const api = (window as unknown as Record<string, unknown>).bridgeApi as Record<string, (...args: unknown[]) => Promise<unknown>>;
-        // Check cert status
-        if (api?.getMitmCertStatus) {
-          const status = (await api.getMitmCertStatus()) as { exists: boolean; trusted: boolean };
-          setIsCertGenerated(status.exists);
-          setIsCertTrusted(status.trusted);
+        const api = getMitmApi();
+        if (!api) throw new Error("Native MITM API is unavailable");
+        const [status, mappings] = await Promise.all([
+          api.getMitmCertStatus() as Promise<{ exists: boolean; trusted: boolean; running: boolean }>,
+          api.getMitmModelMappings() as Promise<Record<string, string>>,
+        ]);
+        if (cancelled) return;
+        setIsCertGenerated(status.exists);
+        setIsCertTrusted(status.trusted);
+        setIsRunning(status.running);
+        setSavedMappings(mappings);
+        setModelMappings(mappings);
+        setMappingQueries(mappings);
+        setStatusKind("info");
+        setStatusMessage(status.running ? "Interception is active on localhost:443." : "Interception is ready to configure.");
+      } catch (error) {
+        if (!cancelled) {
+          setStatusKind("error");
+          setStatusMessage(`Failed to load interception status: ${String(error)}`);
         }
-        // Load model mappings
-        if (api?.getMitmModelMappings) {
-          const mappings = (await api.getMitmModelMappings()) as Record<string, string>;
-          setModelMappings(mappings);
-        }
-      } catch (err) {
-        console.error("Failed to initialize MITM page:", err);
       }
     };
-    init();
+    void initialize();
+    return () => { cancelled = true; };
   }, []);
 
-  const [serverLoading, setServerLoading] = useState(false);
+  const selectedAccount = useMemo(
+    () => accounts.find((account) => account.id === selectedAccountId)
+      ?? accounts.find((account) => account.id === activeAccountId)
+      ?? accounts[0],
+    [accounts, activeAccountId, selectedAccountId],
+  );
+  const accountModels = useMemo(() => selectedAccount?.models ?? [], [selectedAccount]);
+  const validMappings = useMemo(() => Object.fromEntries(
+    comparableMappings(modelMappings).filter(([, target]) => target && accountModels.includes(target)),
+  ), [accountModels, modelMappings]);
+  const mappedCount = Object.keys(validMappings).length;
+  const staleCount = comparableMappings(modelMappings).filter(([, target]) => target && !accountModels.includes(target)).length;
+  const emptyCount = AG_MODELS.length - mappedCount - staleCount;
+  const hasChanges = JSON.stringify(comparableMappings(modelMappings)) !== JSON.stringify(comparableMappings(savedMappings));
+  const routeReady = Boolean(selectedAccount && accountModels.length > 0);
 
   const toggleServer = async () => {
     setServerLoading(true);
+    setStatusKind("info");
+    setStatusMessage(isRunning ? "Stopping the loopback listener..." : "Starting the loopback listener...");
     try {
-      const api = (window as unknown as Record<string, unknown>).bridgeApi as Record<string, (...args: unknown[]) => Promise<unknown>>;
+      const api = getMitmApi();
+      if (!api) throw new Error("Native MITM API is unavailable");
       if (isRunning) {
         await api.stopMitmServer();
         setIsRunning(false);
+        setStatusKind("success");
+        setStatusMessage("Interception stopped. Hosts-file changes remain under your control.");
       } else {
         await api.startMitmServer();
         setIsRunning(true);
+        setStatusKind("success");
+        setStatusMessage("Interception is active on localhost:443.");
       }
-    } catch (err: unknown) {
-      console.error("Failed to toggle MITM server:", err);
-      const msg = String(err);
-      if (msg.includes("ADMIN_ELEVATION_REQUESTED")) {
-        // Windows UAC popup was shown — the elevated instance will take over
-        alert("Admin elevation requested. A new elevated window will open. Close this one.");
-      } else if (msg.includes("root")) {
-        alert(msg); // Linux: "Port 443 requires root. Run with: sudo ./sparkly-api"
-      } else {
-        alert(`MITM server error: ${msg}`);
-      }
+    } catch (error) {
+      setStatusKind("error");
+      setStatusMessage(`Listener error: ${String(error)}`);
     } finally {
       setServerLoading(false);
     }
   };
 
-  const handleTrustCert = async () => {
+  const trustCertificate = async () => {
     setCertLoading(true);
+    setStatusKind("info");
+    setStatusMessage("Installing and trusting the local certificate...");
     try {
-      const api = (window as unknown as Record<string, unknown>).bridgeApi as Record<string, (...args: unknown[]) => Promise<unknown>>;
-      if (api?.trustMitmCert) {
-        await api.trustMitmCert();
-        setIsCertTrusted(true);
-        setIsCertGenerated(true);
-      } else {
-        // Fallback for browser mode
-        setIsCertTrusted(true);
-      }
-    } catch (err: unknown) {
-      console.error("Failed to trust cert:", err);
-      const msg = String(err);
-      if (msg.includes("ADMIN_ELEVATION_REQUESTED")) {
-        alert("Admin elevation requested. A new elevated window will open. Close this one.");
-      } else {
-        alert(`Certificate trust failed: ${msg}`);
-      }
+      const api = getMitmApi();
+      if (!api) throw new Error("Native MITM API is unavailable");
+      await api.trustMitmCert();
+      setIsCertTrusted(true);
+      setIsCertGenerated(true);
+      setStatusKind("success");
+      setStatusMessage("Local interception certificate is trusted.");
+    } catch (error) {
+      setStatusKind("error");
+      setStatusMessage(`Certificate trust failed: ${String(error)}`);
     } finally {
       setCertLoading(false);
     }
   };
 
-  const handleModelChange = async (name: string, val: string) => {
-    const updated = { ...modelMappings, [name]: val };
-    setModelMappings(updated);
+  const switchRoutingAccount = async (accountId: string) => {
+    const account = accounts.find((candidate) => candidate.id === accountId);
+    setSelectedAccountId(accountId);
+    setRouteLoading(true);
+    setStatusKind("info");
+    setStatusMessage(account ? `Switching the active route to ${account.name}...` : "Switching routing account...");
     try {
-      const api = (window as unknown as Record<string, unknown>).bridgeApi as Record<string, (...args: unknown[]) => Promise<unknown>>;
-      if (api?.updateMitmModelMappings) {
-        await api.updateMitmModelMappings(updated);
-      }
-    } catch (err) {
-      console.error("Failed to save model mapping:", err);
+      await onSelectAccount(accountId);
+      setMappingQueries(modelMappings);
+      setStatusKind("success");
+      setStatusMessage(account ? `${account.name} is now the active MITM route.` : "Routing account changed.");
+    } catch (error) {
+      setSelectedAccountId(activeAccountId);
+      setStatusKind("error");
+      setStatusMessage(`Could not switch routing account: ${String(error)}`);
+    } finally {
+      setRouteLoading(false);
+    }
+  };
+
+  const selectMapping = (sourceModel: string, targetModel: string) => {
+    setModelMappings((current) => ({ ...current, [sourceModel]: targetModel }));
+    setMappingQueries((current) => ({ ...current, [sourceModel]: targetModel }));
+  };
+
+  const resetMappingChanges = () => {
+    setModelMappings(savedMappings);
+    setMappingQueries(savedMappings);
+    setStatusKind("info");
+    setStatusMessage("Unsaved mapping changes were discarded.");
+  };
+
+  const saveMappings = async () => {
+    if (!selectedAccount || accountModels.length === 0) {
+      setStatusKind("error");
+      setStatusMessage("Scan a provider account catalog before saving mappings.");
+      return;
+    }
+    setMappingsLoading(true);
+    setStatusKind("info");
+    setStatusMessage("Saving validated model mappings...");
+    try {
+      const api = getMitmApi();
+      if (!api) throw new Error("Native MITM API is unavailable");
+      await api.updateMitmModelMappings(validMappings);
+      setSavedMappings(validMappings);
+      setModelMappings(validMappings);
+      setMappingQueries(validMappings);
+      setStatusKind("success");
+      setStatusMessage(`Saved ${mappedCount} mappings for ${selectedAccount.name}${staleCount ? ` and removed ${staleCount} stale target${staleCount === 1 ? "" : "s"}` : ""}.`);
+    } catch (error) {
+      setStatusKind("error");
+      setStatusMessage(`Failed to save mappings: ${String(error)}`);
+    } finally {
+      setMappingsLoading(false);
     }
   };
 
   return (
-    <div style={{ padding: "8px 0", display: "flex", flexDirection: "column", gap: "20px" }}>
-      {/* MITM Server Card */}
-      <div
-        style={{
-          background: "rgba(244, 180, 0, 0.03)",
-          border: "1px solid rgba(244, 180, 0, 0.2)",
-          borderRadius: "14px",
-          padding: "20px",
-          boxShadow: "0 4px 20px rgba(0,0,0,0.2)",
-          display: "flex",
-          flexDirection: "column",
-          gap: "16px",
-        }}
-      >
-        {/* Header */}
-        <div
-          style={{
-            display: "flex",
-            flexDirection: "row",
-            alignItems: "center",
-            justifyContent: "space-between",
-            flexWrap: "wrap",
-            gap: "12px",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-            <span
-              style={{
-                fontSize: "11px",
-                fontWeight: "800",
-                textTransform: "uppercase",
-                letterSpacing: "0.1em",
-                padding: "2px 8px",
-                borderRadius: "6px",
-                background: "rgba(244, 180, 0, 0.15)",
-                color: "#f4b400",
-              }}
-            >
-              security
-            </span>
-            <span style={{ fontSize: "16px", fontWeight: "800", color: "var(--text)" }}>
-              MITM Server
-            </span>
-            <span
-              style={{
-                fontSize: "11px",
-                fontWeight: "700",
-                padding: "2px 10px",
-                borderRadius: "12px",
-                background: isRunning ? "rgba(34, 197, 94, 0.15)" : "rgba(239, 68, 68, 0.15)",
-                color: isRunning ? "#22c55e" : "#ef4444",
-                border: `1px solid ${isRunning ? "rgba(34, 197, 94, 0.3)" : "rgba(239, 68, 68, 0.3)"}`,
-              }}
-            >
-              {isRunning ? "Running" : "Stopped"}
-            </span>
-          </div>
-
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "16px",
-              fontSize: "12px",
-              color: "var(--muted)",
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-              <Icon
-                icon={isCertGenerated ? "solar:check-circle-bold-duotone" : "solar:close-circle-bold-duotone"}
-                style={{ color: isCertGenerated ? "#22c55e" : "#ef4444", fontSize: "16px" }}
-              />
-              <span>Cert</span>
-            </div>
-            <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-              <Icon
-                icon={isCertTrusted ? "solar:check-circle-bold-duotone" : "solar:close-circle-bold-duotone"}
-                style={{ color: isCertTrusted ? "#22c55e" : "#ef4444", fontSize: "16px" }}
-              />
-              <span>Trusted</span>
-            </div>
-            <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-              <Icon
-                icon={isRunning ? "solar:check-circle-bold-duotone" : "solar:close-circle-bold-duotone"}
-                style={{ color: isRunning ? "#22c55e" : "#ef4444", fontSize: "16px" }}
-              />
-              <span>Server</span>
+    <div className="mitm-page mitm-sparkly-page">
+      <section className="api-keys-summary admin-panel mitm-page-summary">
+        <div className="section-heading mitm-summary-heading">
+          <div className="summary-title-row">
+            <span className="metric-chip yellow"><Icon icon="solar:shield-keyhole-bold-duotone" /></span>
+            <div className="mitm-heading-copy">
+              <h3>Antigravity interception</h3>
+              <p>Route supported traffic through Sparkly using a trusted local certificate and account-backed model mappings.</p>
             </div>
           </div>
+          <span className={`premium-badge ${isRunning ? "success" : ""}`}>
+            <span className={`pulse-dot ${isRunning ? "success" : "muted"}`} />
+            {isRunning ? "Listener active" : "Listener stopped"}
+          </span>
         </div>
+      </section>
 
-        {/* Purpose / How it works Box */}
-        <div
-          style={{
-            padding: "12px 16px",
-            borderRadius: "10px",
-            background: "rgba(0, 0, 0, 0.3)",
-            border: "1px solid var(--line)",
-            display: "flex",
-            flexDirection: "column",
-            gap: "6px",
-            fontSize: "13px",
-            lineHeight: "1.6",
-            color: "var(--muted)",
-          }}
-        >
-          <div>
-            <strong style={{ color: "var(--text)" }}>Purpose:</strong> Use Antigravity IDE &amp; GitHub Copilot → with ANY provider/model from Sparkly API
-          </div>
-          <div>
-            <strong style={{ color: "var(--text)" }}>How it works:</strong> Antigravity/Copilot IDE request → DNS redirect to localhost:443 → MITM proxy intercepts → Sparkly API → response to Antigravity/Copilot
-          </div>
-        </div>
-
-        {/* Inputs */}
-        <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "140px 24px 1fr",
-              alignItems: "center",
-              gap: "8px",
-            }}
-          >
-            <span style={{ fontSize: "13px", fontWeight: "600", color: "var(--text)" }}>
-              Sparkly API Base URL
-            </span>
-            <Icon icon="solar:alt-arrow-right-bold" style={{ color: "var(--muted)", fontSize: "14px" }} />
-            <input
-              type="text"
-              placeholder={mainApiBaseUrl}
-              value={baseUrl}
-              onChange={(e) => setBaseUrl(e.target.value)}
-              style={{
-                width: "100%",
-                padding: "8px 12px",
-                background: "rgba(0, 0, 0, 0.4)",
-                border: "1px solid var(--line)",
-                borderRadius: "8px",
-                color: "var(--text)",
-                fontSize: "13px",
-                outline: "none",
-              }}
-            />
-          </div>
-        </div>
-
-        {/* Action Buttons */}
-        <div style={{ display: "flex", gap: "12px", flexWrap: "wrap", marginTop: "4px" }}>
-          <button
-            onClick={handleTrustCert}
-            disabled={isCertTrusted || certLoading}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "6px",
-              padding: "8px 16px",
-              borderRadius: "8px",
-              background: isCertTrusted ? "rgba(244, 180, 0, 0.05)" : "rgba(244, 180, 0, 0.15)",
-              border: "1px solid rgba(244, 180, 0, 0.3)",
-              color: "#f4b400",
-              fontSize: "13px",
-              fontWeight: "600",
-              cursor: isCertTrusted || certLoading ? "default" : "pointer",
-              opacity: isCertTrusted || certLoading ? 0.6 : 1,
-              transition: "all 0.2s ease",
-            }}
-          >
-            <Icon icon="solar:verified-check-bold-duotone" style={{ fontSize: "16px" }} />
-            {certLoading ? "Installing..." : isCertTrusted ? "Cert Trusted" : "Trust Cert"}
-          </button>
-
-          <button
-            onClick={toggleServer}
-            disabled={serverLoading}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "6px",
-              padding: "8px 16px",
-              borderRadius: "8px",
-              background: isRunning ? "rgba(239, 68, 68, 0.15)" : "rgba(244, 180, 0, 0.2)",
-              border: `1px solid ${isRunning ? "rgba(239, 68, 68, 0.3)" : "rgba(244, 180, 0, 0.4)"}`,
-              color: isRunning ? "#ef4444" : "#f4b400",
-              fontSize: "13px",
-              fontWeight: "700",
-              cursor: serverLoading ? "wait" : "pointer",
-              opacity: serverLoading ? 0.6 : 1,
-              transition: "all 0.2s ease",
-            }}
-          >
-            <Icon
-              icon={isRunning ? "solar:stop-circle-bold-duotone" : "solar:play-circle-bold-duotone"}
-              style={{ fontSize: "16px" }}
-            />
-            {serverLoading ? "Starting..." : isRunning ? "Stop Server" : "Start Server"}
-          </button>
-        </div>
+      <div className={`interaction-status-alert mitm-status-banner ${statusKind}`} role="status" aria-live="polite" aria-atomic="true">
+        <Icon icon={statusKind === "error" ? "solar:danger-triangle-bold-duotone" : statusKind === "success" ? "solar:check-circle-bold-duotone" : "solar:info-circle-bold-duotone"} />
+        <span>{statusMessage}</span>
       </div>
 
-      {/* Antigravity Provider Card */}
-      <div
-        style={{
-          background: "rgba(255, 255, 255, 0.03)",
-          border: "1px solid var(--line)",
-          borderRadius: "14px",
-          padding: "20px",
-          boxShadow: "0 4px 20px rgba(0, 0, 0, 0.2)",
-        }}
-      >
-        {/* Card Header (Collapsible) */}
-        <div
-          onClick={() => setIsAgExpanded((prev) => !prev)}
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: "12px",
-            cursor: "pointer",
-            userSelect: "none",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: "12px", minWidth: 0 }}>
-            <div
-              style={{
-                width: "36px",
-                height: "36px",
-                borderRadius: "10px",
-                background: "rgba(244, 180, 0, 0.15)",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                flexShrink: 0,
-              }}
-            >
-              <img src={logo} alt="Antigravity Logo" style={{ width: "22px", height: "22px", objectFit: "contain" }} />
-            </div>
-            <div style={{ minWidth: 0 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-                <h3 style={{ fontSize: "15px", fontWeight: "700", color: "var(--text)" }}>Antigravity</h3>
-                <span
-                  style={{
-                    fontSize: "10px",
-                    fontWeight: "700",
-                    padding: "2px 8px",
-                    borderRadius: "10px",
-                    background: isDnsStarted ? "rgba(34, 197, 94, 0.15)" : "rgba(255, 255, 255, 0.06)",
-                    color: isDnsStarted ? "#22c55e" : "var(--muted)",
-                  }}
-                >
-                  {isDnsStarted ? "Server active" : "Server off"}
-                </span>
+      <section className="mitm-setup-grid" aria-label="Interception setup">
+        <article className="admin-panel mitm-setup-card">
+          <div className="heroui-card-head">
+            <div className="title-group">
+              <div className="title-row">
+                <Icon icon="solar:key-square-2-bold-duotone" className="head-icon" />
+                <h3>Certificate</h3>
               </div>
-              <p style={{ fontSize: "12px", color: "var(--muted)", margin: 0 }}>
-                Intercept Antigravity requests via MITM proxy
-              </p>
+              <p className="muted-copy">Trust Sparkly&apos;s local CA for TLS interception.</p>
+            </div>
+            <span className={`premium-badge ${isCertTrusted ? "success" : "warning"}`}>{isCertTrusted ? "Trusted" : isCertGenerated ? "Trust required" : "Not installed"}</span>
+          </div>
+          <button type="button" className={`premium-button ${isCertTrusted ? "ghost" : "primary"}`} onClick={() => void trustCertificate()} disabled={isCertTrusted || certLoading}>
+            <Icon icon={certLoading ? "solar:refresh-bold-duotone" : isCertTrusted ? "solar:check-circle-bold-duotone" : "solar:verified-check-bold-duotone"} className={`btn-icon ${certLoading ? "animate-spin" : ""}`} />
+            {certLoading ? "Installing certificate..." : isCertTrusted ? "Certificate trusted" : "Trust certificate"}
+          </button>
+        </article>
+
+        <article className="admin-panel mitm-setup-card">
+          <div className="heroui-card-head">
+            <div className="title-group">
+              <div className="title-row">
+                <Icon icon="solar:user-id-bold-duotone" className="head-icon" />
+                <h3>Routing account</h3>
+              </div>
+              <p className="muted-copy">Mappings use the active account&apos;s scanned catalog.</p>
+            </div>
+            <span className={`premium-badge ${routeReady ? "success" : "warning"}`}>{routeReady ? `${accountModels.length.toLocaleString()} models` : "Scan required"}</span>
+          </div>
+          <AccountPicker accounts={accounts} selectedAccountId={selectedAccount?.id ?? ""} onSelectAccount={(accountId) => void switchRoutingAccount(accountId)} />
+        </article>
+
+        <article className="admin-panel mitm-setup-card">
+          <div className="heroui-card-head">
+            <div className="title-group">
+              <div className="title-row">
+                <Icon icon="solar:server-square-cloud-bold-duotone" className="head-icon" />
+                <h3>Loopback listener</h3>
+              </div>
+              <p className="muted-copy">127.0.0.1:443 · HTTP/1.1 over TLS</p>
+            </div>
+            <span className={`premium-badge ${isRunning ? "success" : ""}`}>{isRunning ? "Running" : "Stopped"}</span>
+          </div>
+          <button type="button" className={`premium-button ${isRunning ? "danger" : "primary"}`} onClick={() => void toggleServer()} disabled={serverLoading}>
+            <Icon icon={serverLoading ? "solar:refresh-bold-duotone" : isRunning ? "solar:stop-circle-bold-duotone" : "solar:play-circle-bold-duotone"} className={`btn-icon ${serverLoading ? "animate-spin" : ""}`} />
+            {serverLoading ? "Updating listener..." : isRunning ? "Stop listener" : "Start listener"}
+          </button>
+        </article>
+      </section>
+
+      <section className="admin-panel mitm-mappings-panel">
+        <div className="heroui-card-head mitm-mappings-heading">
+          <div className="title-group">
+            <div className="title-row">
+              <img className="mitm-app-logo" src={logo} alt="" />
+              <div>
+                <h3>Antigravity model mappings</h3>
+                <p className="muted-copy">Choose target models from {selectedAccount?.name ?? "the active account"}. Free-text targets are disabled.</p>
+              </div>
             </div>
           </div>
-
-          <Icon
-            icon="solar:alt-arrow-down-bold"
-            style={{
-              fontSize: "20px",
-              color: "var(--muted)",
-              transform: isAgExpanded ? "rotate(180deg)" : "rotate(0deg)",
-              transition: "transform 0.2s ease",
-            }}
-          />
+          <div className="mitm-count-badges" aria-label="Mapping totals">
+            <span className="premium-badge success">{mappedCount} mapped</span>
+            {staleCount > 0 ? <span className="premium-badge warning">{staleCount} stale</span> : null}
+            <span className="premium-badge">{emptyCount} empty</span>
+          </div>
         </div>
 
-        {/* Collapsible Content */}
-        {isAgExpanded && (
-          <div
-            style={{
-              marginTop: "16px",
-              paddingTop: "16px",
-              borderTop: "1px solid var(--line)",
-              display: "flex",
-              flexDirection: "column",
-              gap: "16px",
-            }}
-          >
-            {/* Hosts file manual instructions */}
-            <div
-              style={{
-                borderRadius: "8px",
-                border: "1px solid var(--line)",
-                background: "rgba(0, 0, 0, 0.3)",
-                padding: "10px 14px",
-              }}
-            >
-              <p style={{ fontSize: "11px", fontWeight: "600", color: "var(--text)", marginBottom: "6px" }}>
-                Edit hosts file manually to add the following entries:
-              </p>
-              <ul style={{ listStyle: "none", margin: 0, padding: 0, fontFamily: "monospace", fontSize: "11px", color: "#e4e4e7", display: "flex", flexDirection: "column", gap: "3px" }}>
-                <li>127.0.0.1 daily-cloudcode-pa.googleapis.com</li>
-                <li>127.0.0.1 cloudcode-pa.googleapis.com</li>
-              </ul>
-            </div>
+        <div className="card-divider" />
 
-            {/* DNS Note */}
-            <div style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px", color: "var(--muted)" }}>
-              <p style={{ margin: 0 }}>Toggle DNS to redirect Antigravity traffic through Sparkly API via MITM.</p>
-              {!isDnsStarted && (
-                <p style={{ margin: "2px 0 0 0", color: "#d97706", fontSize: "11px", fontWeight: "600" }}>
-                  ⚠️ Enable DNS to edit model mappings
-                </p>
-              )}
-            </div>
-
-            {/* Model Mappings List */}
-            <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-              {AG_MODELS.map((modelName) => (
-                <div
-                  key={modelName}
-                  style={{
-                    display: "grid",
-                    gridTemplateColumns: "minmax(180px, 1fr) 20px 2fr 80px",
-                    alignItems: "center",
-                    gap: "8px",
-                  }}
-                >
-                  <span style={{ fontSize: "12px", fontWeight: "600", color: "var(--text)", textAlign: "right" }}>
-                    {modelName}
-                  </span>
-                  <Icon icon="solar:alt-arrow-right-bold" style={{ color: "var(--muted)", fontSize: "14px" }} />
-                  <input
-                    type="text"
-                    placeholder="provider/model-id"
-                    disabled={!isDnsStarted}
-                    value={modelMappings[modelName] || ""}
-                    onChange={(e) => handleModelChange(modelName, e.target.value)}
-                    style={{
-                      width: "100%",
-                      padding: "6px 10px",
-                      background: "rgba(0, 0, 0, 0.4)",
-                      border: "1px solid var(--line)",
-                      borderRadius: "6px",
-                      color: "var(--text)",
-                      fontSize: "12px",
-                      outline: "none",
-                      opacity: isDnsStarted ? 1 : 0.5,
-                      cursor: isDnsStarted ? "text" : "not-allowed",
-                    }}
-                  />
-                  <button
-                    disabled={!isDnsStarted}
-                    style={{
-                      padding: "6px 12px",
-                      fontSize: "12px",
-                      fontWeight: "600",
-                      borderRadius: "6px",
-                      border: "1px solid var(--line)",
-                      background: "rgba(255, 255, 255, 0.05)",
-                      color: "var(--text)",
-                      cursor: isDnsStarted ? "pointer" : "not-allowed",
-                      opacity: isDnsStarted ? 1 : 0.5,
-                    }}
-                  >
-                    Select
-                  </button>
-                </div>
-              ))}
-            </div>
-
-            {/* Start/Stop DNS Button */}
-            <div style={{ display: "flex", marginTop: "4px" }}>
-              <button
-                onClick={() => setIsDnsStarted((prev) => !prev)}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "6px",
-                  padding: "8px 16px",
-                  borderRadius: "8px",
-                  background: isDnsStarted ? "rgba(239, 68, 68, 0.15)" : "rgba(244, 180, 0, 0.2)",
-                  border: `1px solid ${isDnsStarted ? "rgba(239, 68, 68, 0.3)" : "rgba(244, 180, 0, 0.4)"}`,
-                  color: isDnsStarted ? "#ef4444" : "#f4b400",
-                  fontSize: "12px",
-                  fontWeight: "700",
-                  cursor: "pointer",
-                  transition: "all 0.2s ease",
-                }}
-              >
-                <Icon
-                  icon={isDnsStarted ? "solar:stop-circle-bold-duotone" : "solar:play-circle-bold-duotone"}
-                  style={{ fontSize: "16px" }}
-                />
-                {isDnsStarted ? "Stop DNS" : "Start DNS"}
-              </button>
+        <div className="mitm-mapping-toolbar">
+          <div className="mitm-catalog-copy">
+            <Icon icon={routeReady ? "solar:database-bold-duotone" : "solar:danger-triangle-bold-duotone"} />
+            <div>
+              <strong>{routeReady ? `${accountModels.length.toLocaleString()} provider models available` : "No selectable model catalog"}</strong>
+              <span>{routeReady ? "Search the complete catalog in every mapping field." : selectedAccount ? `Scan ${selectedAccount.name} from Accounts first.` : "Create and scan a provider account first."}</span>
             </div>
           </div>
-        )}
-      </div>
+          <button type="button" className="premium-button ghost sm" onClick={() => setShowHosts((current) => !current)} aria-expanded={showHosts}>
+            <Icon icon="solar:document-text-bold-duotone" className="btn-icon" />
+            Hosts setup
+            <Icon icon={showHosts ? "solar:alt-arrow-up-bold" : "solar:alt-arrow-down-bold"} />
+          </button>
+        </div>
+
+        {showHosts ? (
+          <div className="mitm-hosts-panel-sparkly">
+            <div className="mitm-hosts-warning">
+              <Icon icon="solar:shield-warning-bold-duotone" />
+              <div><strong>Manual system change</strong><span>Administrator privileges are required. Remove these entries when interception is no longer needed.</span></div>
+            </div>
+            <code>127.0.0.1 daily-cloudcode-pa.googleapis.com</code>
+            <code>127.0.0.1 cloudcode-pa.googleapis.com</code>
+          </div>
+        ) : null}
+
+        <div className="mitm-mapping-list" aria-label="Antigravity model mappings" aria-busy={routeLoading || mappingsLoading}>
+          {AG_MODELS.map((sourceModel) => {
+            const targetModel = modelMappings[sourceModel] ?? "";
+            const validTarget = Boolean(targetModel && accountModels.includes(targetModel));
+            const staleTarget = Boolean(targetModel && !validTarget);
+            return (
+              <article className={`mitm-mapping-card ${staleTarget ? "invalid" : validTarget ? "mapped" : ""}`} key={sourceModel}>
+                <div className="mitm-source-model-sparkly">
+                  <span className="metric-chip yellow"><Icon icon="solar:cpu-bolt-bold-duotone" /></span>
+                  <div><strong>{sourceModel}</strong><span>Intercepted source model</span></div>
+                </div>
+                <div className="mitm-target-model-sparkly">
+                  <ModelPicker
+                    popover
+                    label="Provider target model"
+                    value={validTarget ? targetModel : ""}
+                    models={accountModels}
+                    query={mappingQueries[sourceModel] ?? targetModel}
+                    onQueryChange={(query) => setMappingQueries((current) => ({ ...current, [sourceModel]: query }))}
+                    onSelect={(model) => selectMapping(sourceModel, model)}
+                  />
+                </div>
+                <span className={`premium-badge ${staleTarget ? "warning" : validTarget ? "success" : ""}`}>
+                  <Icon icon={staleTarget ? "solar:danger-triangle-bold-duotone" : validTarget ? "solar:check-circle-bold-duotone" : "solar:minus-circle-bold-duotone"} />
+                  {staleTarget ? "Replace target" : validTarget ? "Mapped" : "Unmapped"}
+                </span>
+              </article>
+            );
+          })}
+        </div>
+
+        <div className="mitm-save-row">
+          <div>
+            <strong>{hasChanges ? "Unsaved mapping changes" : "Mappings are up to date"}</strong>
+            <span>{staleCount ? `${staleCount} stale target${staleCount === 1 ? " will" : "s will"} be removed on save.` : "Only exact models from the selected account catalog can be saved."}</span>
+          </div>
+          <div className="actions-row">
+            <button type="button" className="premium-button ghost" onClick={resetMappingChanges} disabled={!hasChanges || mappingsLoading}>Discard</button>
+            <button type="button" className="premium-button primary" onClick={() => void saveMappings()} disabled={!routeReady || !hasChanges || mappingsLoading || routeLoading}>
+              <Icon icon={mappingsLoading ? "solar:refresh-bold-duotone" : "solar:diskette-bold-duotone"} className={`btn-icon ${mappingsLoading ? "animate-spin" : ""}`} />
+              {mappingsLoading ? "Saving mappings..." : "Save mappings"}
+            </button>
+          </div>
+        </div>
+      </section>
     </div>
   );
 }

@@ -1,9 +1,75 @@
-import { memo, useState, useEffect } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { Icon } from "@iconify/react";
-import type { PlaygroundModelsResult, PlaygroundTestResult, UpstreamAccount } from "../../../shared/types";
-import { getPlaygroundErrorSummary, normalizeOpenAiBaseUrl } from "../appState";
-import { ModelPicker } from "../components/ModelPicker";
+import type {
+  AccountProvider,
+  PlaygroundModelsResult,
+  PlaygroundResponseFormat,
+  PlaygroundTestInput,
+  PlaygroundTestResult,
+  PlaygroundThinkingMode,
+  UpstreamAccount,
+} from "../../../shared/types";
+import { getPlaygroundErrorSummary } from "../appState";
 import { AccountPicker } from "../components/AccountPicker";
+import { ModelPicker } from "../components/ModelPicker";
+import { Select } from "../components/ui";
+
+type RunnableProtocol = Exclude<AccountProvider, "auto" | "v0">;
+type ReasoningEffort = NonNullable<PlaygroundTestInput["reasoningEffort"]>;
+
+const protocolOptions: Array<{ value: RunnableProtocol; label: string; description: string }> = [
+  { value: "openai-compatible", label: "OpenAI compatible", description: "Chat Completions and compatible gateways" },
+  { value: "anthropic", label: "Anthropic Messages", description: "Native Claude Messages API" },
+  { value: "gemini", label: "Google Gemini", description: "Native generateContent API" },
+  { value: "ollama", label: "Ollama", description: "Local Ollama chat API" },
+  { value: "cohere", label: "Cohere v2", description: "Native Cohere Chat API" },
+];
+
+const thinkingOptions: Array<{ value: PlaygroundThinkingMode; label: string; description: string }> = [
+  { value: "auto", label: "Auto", description: "Omit the parameter" },
+  { value: "disabled", label: "Disabled", description: "No extended thinking" },
+  { value: "adaptive", label: "Adaptive", description: "Newer Claude models" },
+  { value: "enabled", label: "Manual budget", description: "Claude 4.5 and earlier" },
+];
+
+const reasoningOptions: Array<{ value: ReasoningEffort | ""; label: string }> = [
+  { value: "", label: "Provider default" },
+  { value: "none", label: "None" },
+  { value: "minimal", label: "Minimal" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "Extra high" },
+  { value: "max", label: "Maximum" },
+];
+
+const responseFormatOptions: Array<{ value: PlaygroundResponseFormat; label: string }> = [
+  { value: "text", label: "Text" },
+  { value: "json_object", label: "JSON object" },
+];
+
+function modelDisplayName(model: string): string {
+  const segments = model.split("/").filter(Boolean);
+  return segments.at(-1) || model;
+}
+
+function runnableProtocol(account?: UpstreamAccount): RunnableProtocol {
+  const candidate = account?.detectedProtocol ?? account?.provider;
+  return candidate && candidate !== "auto" && candidate !== "v0" ? candidate : "openai-compatible";
+}
+
+function parseAdvancedJson(value: string): { value: Record<string, unknown>; error: string | null } {
+  if (!value.trim()) return { value: {}, error: null };
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+      return { value: {}, error: "Advanced JSON must be an object." };
+    }
+    return { value: parsed as Record<string, unknown>, error: null };
+  } catch (error) {
+    return { value: {}, error: error instanceof Error ? error.message : "Invalid JSON" };
+  }
+}
 
 function PlaygroundPageComponent({
   accounts,
@@ -47,250 +113,276 @@ function PlaygroundPageComponent({
   playgroundResult: PlaygroundTestResult | null;
   setPlaygroundResult: (value: PlaygroundTestResult | null) => void;
   playgroundLoading: boolean;
-  onLoadPlaygroundModels: () => void;
-  onRunPlayground: () => void;
+  onLoadPlaygroundModels: (protocol: RunnableProtocol) => void;
+  onRunPlayground: (input: PlaygroundTestInput) => void;
 }) {
-  const [selectedAccountId, setSelectedAccountId] = useState<string>("");
-  const [isModelsExpanded, setIsModelsExpanded] = useState(true);
+  const [selectedAccountId, setSelectedAccountId] = useState("");
+  const [protocol, setProtocol] = useState<RunnableProtocol>("openai-compatible");
+  const [maxTokens, setMaxTokens] = useState(2048);
+  const [temperature, setTemperature] = useState("0.7");
+  const [topP, setTopP] = useState("");
+  const [seed, setSeed] = useState("");
+  const [stopSequences, setStopSequences] = useState("");
+  const [thinkingMode, setThinkingMode] = useState<PlaygroundThinkingMode>("auto");
+  const [thinkingBudget, setThinkingBudget] = useState(1024);
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">("");
+  const [responseFormat, setResponseFormat] = useState<PlaygroundResponseFormat>("text");
+  const [advancedJson, setAdvancedJson] = useState("{}");
+  const [showConnection, setShowConnection] = useState(false);
+  const [showSystemPrompt, setShowSystemPrompt] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [isModelsExpanded, setIsModelsExpanded] = useState(false);
+  const [validationError, setValidationError] = useState<string | null>(null);
 
-  // Sync selected account when accounts or URLs change
   useEffect(() => {
-    if (accounts && accounts.length > 0 && !selectedAccountId) {
-      const active = accounts.find((a) => a.isActive) || accounts[0];
-      if (active) {
-        setSelectedAccountId(active.id);
-        setPlaygroundBaseUrl(active.baseUrl);
-        setPlaygroundApiKey(active.apiKey);
-      }
-    }
-  }, [accounts]);
+    if (!accounts?.length || accounts.some((account) => account.id === selectedAccountId)) return;
+    const active = accounts.find((account) => account.isActive) ?? accounts[0];
+    const initialModel = playgroundModel || active.selectedModel || active.models[0] || "";
+    setSelectedAccountId(active.id);
+    setProtocol(runnableProtocol(active));
+    setPlaygroundBaseUrl(active.baseUrl);
+    setPlaygroundApiKey(active.apiKey);
+    setPlaygroundModel(initialModel);
+    setPlaygroundModelQuery(initialModel);
+  }, [accounts, playgroundModel, selectedAccountId, setPlaygroundApiKey, setPlaygroundBaseUrl, setPlaygroundModel, setPlaygroundModelQuery]);
 
-  const handleSelectAccount = (accId: string) => {
-    setSelectedAccountId(accId);
-    if (accounts) {
-      const found = accounts.find((a) => a.id === accId);
-      if (found) {
-        setPlaygroundBaseUrl(found.baseUrl);
-        setPlaygroundApiKey(found.apiKey);
-      }
-    }
-  };
-
-  const normalizedPlaygroundBaseUrl = normalizeOpenAiBaseUrl(playgroundBaseUrl);
+  const selectedAccount = accounts?.find((account) => account.id === selectedAccountId);
+  const availableModels = selectedAccount?.models.length ? selectedAccount.models : models;
+  const advanced = useMemo(() => parseAdvancedJson(advancedJson), [advancedJson]);
   const playgroundErrorSummary = getPlaygroundErrorSummary(playgroundResult);
-  const runDisabled = playgroundLoading || !normalizedPlaygroundBaseUrl || !playgroundApiKey.trim() || !playgroundModel.trim() || !playgroundMessage.trim();
-  const loadModelsDisabled = playgroundModelsLoading || !normalizedPlaygroundBaseUrl || !playgroundApiKey.trim();
+  const keyRequired = protocol !== "ollama";
+  const baseReady = Boolean(playgroundBaseUrl.trim());
+  const credentialsReady = !keyRequired || Boolean(playgroundApiKey.trim());
+  const runDisabled = playgroundLoading || !baseReady || !credentialsReady || !playgroundModel.trim() || !playgroundMessage.trim();
+  const loadModelsDisabled = playgroundModelsLoading || !baseReady || !credentialsReady;
+
+  function handleSelectAccount(accountId: string) {
+    setSelectedAccountId(accountId);
+    const account = accounts?.find((candidate) => candidate.id === accountId);
+    if (!account) return;
+    const nextModel = account.selectedModel || account.models[0] || "";
+    setProtocol(runnableProtocol(account));
+    setPlaygroundBaseUrl(account.baseUrl);
+    setPlaygroundApiKey(account.apiKey);
+    setPlaygroundModel(nextModel);
+    setPlaygroundModelQuery(nextModel);
+    setPlaygroundResult(null);
+  }
+
+  function execute() {
+    setValidationError(null);
+    if (advanced.error) {
+      setValidationError(`Advanced JSON: ${advanced.error}`);
+      return;
+    }
+    if (maxTokens < 1 || maxTokens > 1_000_000) {
+      setValidationError("Max output tokens must be between 1 and 1,000,000.");
+      return;
+    }
+    if (thinkingMode === "enabled" && (thinkingBudget < 1024 || thinkingBudget >= maxTokens)) {
+      setValidationError("Manual thinking requires at least 1,024 tokens and must stay below max output tokens.");
+      return;
+    }
+    const parsedTemperature = temperature.trim() ? Number(temperature) : undefined;
+    const parsedTopP = topP.trim() ? Number(topP) : undefined;
+    const parsedSeed = seed.trim() ? Number(seed) : undefined;
+    if (parsedTemperature !== undefined && (!Number.isFinite(parsedTemperature) || parsedTemperature < 0 || parsedTemperature > 2)) {
+      setValidationError("Temperature must be between 0 and 2.");
+      return;
+    }
+    if (parsedTopP !== undefined && (!Number.isFinite(parsedTopP) || parsedTopP <= 0 || parsedTopP > 1)) {
+      setValidationError("Top P must be greater than 0 and at most 1.");
+      return;
+    }
+    if (parsedSeed !== undefined && !Number.isSafeInteger(parsedSeed)) {
+      setValidationError("Seed must be a safe integer.");
+      return;
+    }
+
+    onRunPlayground({
+      baseUrl: playgroundBaseUrl.trim().replace(/\/+$/, ""),
+      apiKey: playgroundApiKey.trim(),
+      protocol,
+      model: playgroundModel.trim(),
+      message: playgroundMessage,
+      systemPrompt: playgroundSystemPrompt.trim() || undefined,
+      maxTokens,
+      temperature: parsedTemperature,
+      topP: parsedTopP,
+      seed: parsedSeed,
+      stopSequences: stopSequences.split(/\r?\n|,/).map((item) => item.trim()).filter(Boolean),
+      reasoningEffort: reasoningEffort || undefined,
+      thinkingMode,
+      thinkingBudget: thinkingMode === "enabled" ? thinkingBudget : undefined,
+      responseFormat,
+      advancedBody: advanced.value,
+    });
+  }
 
   return (
-    <section className="playground-page-container">
-      {/* TOP ROW: CONFIGURATION & QUERY SIDE-BY-SIDE */}
-      <div className="playground-top-row">
-        {/* LEFT PANEL: PARAMETERS */}
-        <article className="playground-panel-card">
-          <div className="lab-title-mini">
-            <Icon icon="solar:settings-bold-duotone" className="text-accent" width={20} height={20} />
-            <h3>Parameters</h3>
+    <section className="playground-page-container playground-studio">
+      <header className="playground-studio-toolbar">
+        <div className="playground-toolbar-field account-field">
+          <span>Account</span>
+          <AccountPicker accounts={accounts || []} selectedAccountId={selectedAccountId} onSelectAccount={handleSelectAccount} />
+        </div>
+        <div className="playground-toolbar-field protocol-field">
+          <span>Protocol</span>
+          <Select options={protocolOptions} value={protocol} onChange={setProtocol} />
+        </div>
+        <div className="playground-toolbar-field model-field">
+          <div className="playground-toolbar-label">
+            <span>Model</span>
+            <small>{availableModels.length.toLocaleString()} available</small>
           </div>
+          <ModelPicker
+            popover
+            label=""
+            value={playgroundModel}
+            models={availableModels}
+            query={playgroundModelQuery}
+            onQueryChange={setPlaygroundModelQuery}
+            onSelect={(model) => {
+              setPlaygroundModel(model);
+              setPlaygroundModelQuery(model);
+            }}
+          />
+        </div>
+        <div className="playground-toolbar-actions">
+          <button type="button" className="playground-icon-action" onClick={() => onLoadPlaygroundModels(protocol)} disabled={loadModelsDisabled} title="Discover models" aria-label="Discover models">
+            <Icon icon="solar:refresh-bold-duotone" className={playgroundModelsLoading ? "animate-spin" : ""} />
+          </button>
+          <button type="button" className={`playground-toolbar-button ${showConnection ? "active" : ""}`} onClick={() => setShowConnection((current) => !current)} aria-expanded={showConnection}>
+            <Icon icon="solar:server-square-cloud-bold-duotone" /> Connection
+          </button>
+          <button type="button" className={`playground-toolbar-button ${showSettings ? "active" : ""}`} onClick={() => setShowSettings((current) => !current)} aria-expanded={showSettings}>
+            <Icon icon="solar:tuning-square-2-bold-duotone" /> Settings
+          </button>
+        </div>
+      </header>
 
-          <div className="premium-input-stack">
-            <div className="compact-input-group">
-              <label>Account Title</label>
-              <AccountPicker
-                accounts={accounts || []}
-                selectedAccountId={selectedAccountId}
-                onSelectAccount={handleSelectAccount}
-              />
-            </div>
+      {showConnection ? (
+        <div className="playground-compact-drawer connection-drawer">
+          <label><span>Exact API base URL</span><input className="glass-input" value={playgroundBaseUrl} onChange={(event) => setPlaygroundBaseUrl(event.target.value)} placeholder="https://api.example.com/v1" /></label>
+          <label><span>API key {keyRequired ? "" : "(optional)"}</span><input className="glass-input" type="password" value={playgroundApiKey} onChange={(event) => setPlaygroundApiKey(event.target.value)} placeholder={keyRequired ? "Provider API key" : "Optional for Ollama"} /></label>
+        </div>
+      ) : null}
 
-            <div className="compact-input-group">
-              <label>Base URL</label>
-              <input
-                className="glass-input"
-                value={playgroundBaseUrl}
-                onChange={(e) => setPlaygroundBaseUrl(e.target.value)}
-                placeholder="Base URL"
-              />
-            </div>
-
-            <div className="compact-input-group">
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
-                <label style={{ margin: 0 }}>Target Model</label>
-                <button 
-                  className="premium-button ghost sm h-8 py-0 px-3 text-[10px]"
-                  onClick={onLoadPlaygroundModels}
-                  disabled={loadModelsDisabled}
-                >
-                  <Icon icon={playgroundModelsLoading ? "solar:refresh-bold-duotone" : "solar:refresh-bold-duotone"} className={`btn-icon ${playgroundModelsLoading ? "animate-spin" : ""}`} />
-                  {playgroundModelsLoading ? "Loading..." : "Load Models"}
-                </button>
-              </div>
-              <ModelPicker
-                label=""
-                value={playgroundModel}
-                models={models}
-                query={playgroundModelQuery}
-                onQueryChange={setPlaygroundModelQuery}
-                onSelect={(model) => {
-                  setPlaygroundModel(model);
-                  setPlaygroundModelQuery(model);
-                }}
-              />
-            </div>
-
-            <div className="compact-input-group">
-              <label>System Context</label>
-              <textarea
-                className="glass-input"
-                rows={1}
-                value={playgroundSystemPrompt}
-                onChange={(e) => setPlaygroundSystemPrompt(e.target.value)}
-                placeholder="System instructions..."
-              />
-            </div>
+      {showSettings ? (
+        <div className="playground-compact-drawer settings-drawer">
+          <label><span>Max tokens</span><input className="glass-input" type="number" min={1} max={1_000_000} value={maxTokens} onChange={(event) => setMaxTokens(Number(event.target.value))} /></label>
+          <label><span>Temperature</span><input className="glass-input" inputMode="decimal" value={temperature} onChange={(event) => setTemperature(event.target.value)} placeholder="Default" /></label>
+          <div><span>Format</span><Select options={responseFormatOptions} value={responseFormat} onChange={setResponseFormat} /></div>
+          <label><span>Top P</span><input className="glass-input" inputMode="decimal" value={topP} onChange={(event) => setTopP(event.target.value)} placeholder="Default" /></label>
+          <label><span>Seed</span><input className="glass-input" inputMode="numeric" value={seed} onChange={(event) => setSeed(event.target.value)} placeholder="Optional" /></label>
+          <div><span>Thinking</span><Select options={thinkingOptions} value={thinkingMode} onChange={setThinkingMode} /></div>
+          <div>
+            <span>{thinkingMode === "enabled" ? "Thinking budget" : "Reasoning"}</span>
+            {thinkingMode === "enabled" ? <input className="glass-input" type="number" min={1024} value={thinkingBudget} onChange={(event) => setThinkingBudget(Number(event.target.value))} /> : <Select options={reasoningOptions} value={reasoningEffort} onChange={setReasoningEffort} />}
           </div>
+          <label className="stop-field"><span>Stop sequences</span><input className="glass-input" value={stopSequences} onChange={(event) => setStopSequences(event.target.value)} placeholder="Comma or newline separated" /></label>
+          <button type="button" className={`playground-toolbar-button advanced-button ${showAdvanced ? "active" : ""}`} onClick={() => setShowAdvanced((current) => !current)} aria-expanded={showAdvanced}>
+            <Icon icon="solar:code-square-bold-duotone" /> Advanced JSON
+          </button>
+          {showAdvanced ? (
+            <label className="advanced-json-field">
+              <span>Request body overrides</span>
+              <textarea className={`glass-input playground-json-editor ${advanced.error ? "invalid" : ""}`} rows={7} value={advancedJson} onChange={(event) => setAdvancedJson(event.target.value)} spellCheck={false} />
+              {advanced.error ? <small className="playground-validation-error">{advanced.error}</small> : null}
+            </label>
+          ) : null}
+        </div>
+      ) : null}
+
+      <div className="playground-studio-grid">
+        <article className="playground-studio-pane prompt-pane">
+          <header className="playground-pane-header">
+            <div><Icon icon="solar:pen-new-square-bold-duotone" /><strong>Prompt</strong></div>
+            <button type="button" className={`playground-pane-action ${showSystemPrompt ? "active" : ""}`} onClick={() => setShowSystemPrompt((current) => !current)}>
+              <Icon icon="solar:shield-user-bold-duotone" /> System {playgroundSystemPrompt.trim() ? "set" : "prompt"}
+            </button>
+          </header>
+          {showSystemPrompt ? (
+            <textarea className="playground-system-editor" rows={4} value={playgroundSystemPrompt} onChange={(event) => setPlaygroundSystemPrompt(event.target.value)} placeholder="Optional system or developer instructions..." />
+          ) : null}
+          <textarea
+            className="playground-main-editor"
+            value={playgroundMessage}
+            onChange={(event) => setPlaygroundMessage(event.target.value)}
+            onKeyDown={(event) => {
+              if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && !runDisabled) {
+                event.preventDefault();
+                execute();
+              }
+            }}
+            placeholder="Type a prompt, paste content, or test an instruction..."
+          />
+          {validationError ? <div className="playground-validation-error studio-error" role="alert">{validationError}</div> : null}
+          <footer className="playground-prompt-footer">
+            <span><Icon icon="solar:shield-check-bold-duotone" /> No hidden context or request replay</span>
+            <div>
+              <small>Ctrl + Enter</small>
+              <button type="button" className="premium-button primary playground-run-button" onClick={execute} disabled={runDisabled}>
+                <Icon icon={playgroundLoading ? "solar:refresh-bold-duotone" : "solar:play-bold-duotone"} className={playgroundLoading ? "animate-spin" : ""} />
+                {playgroundLoading ? "Running..." : "Run"}
+              </button>
+            </div>
+          </footer>
         </article>
 
-        {/* RIGHT PANEL: USER QUERY */}
-        <article className="playground-panel-card">
-          <div className="lab-title-mini">
-            <Icon icon="solar:chat-line-bold-duotone" className="text-accent" width={20} height={20} />
-            <h3>User Query</h3>
-          </div>
-          <textarea
-            className="glass-input w-full"
-            style={{ height: 'calc(100% - 140px)', minHeight: '180px' }}
-            value={playgroundMessage}
-            onChange={(e) => setPlaygroundMessage(e.target.value)}
-            placeholder="Type your prompt here..."
-          />
-          <div className="button-row-spacious mt-8">
-            <button className="premium-button primary flex-[2.5] justify-center" onClick={onRunPlayground} disabled={runDisabled}>
-              <Icon icon={playgroundLoading ? "solar:refresh-bold-duotone" : "solar:play-bold-duotone"} className={`btn-icon ${playgroundLoading ? "animate-spin" : ""}`} />
-              {playgroundLoading ? "Running..." : "Execute Test"}
-            </button>
-            
-            <button className="premium-button ghost flex-1 justify-center" onClick={onLoadPlaygroundModels} disabled={loadModelsDisabled}>
-              <Icon icon="solar:refresh-bold-duotone" className="btn-icon" />
-              Models
-            </button>
-
-            <button 
-              className="premium-button ghost w-14 justify-center text-red-500 border-red-500/10 hover:bg-red-500/10" 
-              onClick={() => setPlaygroundResult(null)} 
-              disabled={playgroundLoading || !playgroundResult}
-              title="Clear Result"
-            >
-              <Icon icon="solar:trash-bin-trash-bold-duotone" width={20} height={20} />
-            </button>
+        <article className="playground-studio-pane response-pane">
+          <header className="playground-pane-header">
+            <div><Icon icon="solar:stars-minimalistic-bold-duotone" /><strong>Response</strong></div>
+            <div className="playground-response-actions">
+              {playgroundResult ? <span className={`lab-status-badge ${playgroundResult.ok ? "success" : "error"}`}>{playgroundResult.status}</span> : null}
+              <button type="button" className="playground-pane-action" onClick={() => setPlaygroundResult(null)} disabled={playgroundLoading || !playgroundResult}><Icon icon="solar:trash-bin-trash-bold-duotone" /> Clear</button>
+            </div>
+          </header>
+          <div className="playground-response-body">
+            {playgroundResult ? (
+              <>
+                {playgroundErrorSummary ? <div className="playground-provider-error" role="alert"><strong>Provider rejected the request</strong><span>{playgroundErrorSummary}</span>{/clear_thinking/i.test(playgroundErrorSummary) ? <small>Use Adaptive or Disabled thinking. The rejected strategy came from the upstream gateway or model policy.</small> : null}</div> : null}
+                {playgroundResult.content || playgroundResult.ok ? (
+                  <div className="playground-response-copy">{playgroundResult.content || "Empty response received."}</div>
+                ) : null}
+                {playgroundResult.resolvedUrl ? <div className="playground-resolved-url">Endpoint: <code>{playgroundResult.resolvedUrl}</code></div> : null}
+                <div className="playground-inspector-row">
+                  <details className="playground-inspector-detail">
+                    <summary>Normalized request</summary>
+                    <div className="inspector-header"><span>Request JSON</span><button type="button" onClick={() => void navigator.clipboard.writeText(JSON.stringify(playgroundResult.request, null, 2))}>Copy</button></div>
+                    <pre>{JSON.stringify(playgroundResult.request, null, 2)}</pre>
+                  </details>
+                  <details className="playground-inspector-detail">
+                    <summary>Raw provider response</summary>
+                    <div className="inspector-header"><span>Raw response</span><button type="button" onClick={() => void navigator.clipboard.writeText(JSON.stringify(playgroundResult.raw, null, 2))}>Copy</button></div>
+                    <pre>{typeof playgroundResult.raw === "string" ? playgroundResult.raw : JSON.stringify(playgroundResult.raw, null, 2)}</pre>
+                  </details>
+                </div>
+              </>
+            ) : (
+              <div className="playground-response-empty">
+                <Icon icon="solar:chat-round-dots-bold-duotone" />
+                <strong>Response appears here</strong>
+                <span>Run the prompt to inspect model output, normalized request, and raw provider data.</span>
+              </div>
+            )}
           </div>
         </article>
       </div>
 
-      {/* BOTTOM AREA: FULL WIDTH OUTPUT */}
-      <main className="output-lab-panel">
-        <header className="output-lab-header">
-          <div className="title">
-            <Icon icon="solar:ghost-bold-duotone" />
-            <span>INTELLIGENCE OUTPUT</span>
-          </div>
-          {playgroundResult && (
-            <div className={`lab-status-badge ${playgroundResult.ok ? "success" : "error"}`}>
-              {playgroundResult.status} {playgroundResult.ok ? "OK" : "ERR"}
-            </div>
-          )}
-        </header>
-
-        <div className="lab-main-display">
-          {playgroundResult ? (
-            <div className="response-scroll-area">
-              {playgroundErrorSummary && (
-                <div className="p-4 mb-6 rounded-2xl bg-red-500/10 border border-red-500/20 text-red-400 text-xs font-mono">
-                  [SYSTEM_ERROR]: {playgroundErrorSummary}
-                </div>
-              )}
-
-              <div className="ai-bubble-new">
-                {playgroundResult.content || "Empty response received from the model."}
-              </div>
-
-              <div className="code-inspector">
-                <div className="inspector-header">
-                  <span>Raw JSON Payload</span>
-                  <button className="text-[9px] hover:text-white" onClick={() => navigator.clipboard.writeText(JSON.stringify(playgroundResult.raw, null, 2))}>Copy</button>
-                </div>
-                <div className="inspector-body">
-                  <pre>{typeof playgroundResult.raw === "string" ? playgroundResult.raw : JSON.stringify(playgroundResult.raw, null, 2)}</pre>
-                </div>
-              </div>
-            </div>
-          ) : (
-            <div className="empty-lab-state">
-              <Icon icon="solar:atom-bold-duotone" width={80} height={80} className="mb-4 opacity-20" />
-              <p className="text-lg font-bold tracking-tight">System Idle</p>
-              <p className="text-sm mt-2">Awaiting configuration & execution parameters from the panels above.</p>
-            </div>
-          )}
+      {playgroundModelsResult?.models.length ? (
+        <div className="playground-model-inventory compact-inventory">
+          <button type="button" className="playground-inventory-heading" onClick={() => setIsModelsExpanded((current) => !current)}>
+            <span>Last discovery: {playgroundModelsResult.models.length.toLocaleString()} models</span>
+            <Icon icon={isModelsExpanded ? "solar:alt-arrow-up-bold-duotone" : "solar:alt-arrow-down-bold-duotone"} />
+          </button>
+          {isModelsExpanded ? <div className="playground-inventory-list">{playgroundModelsResult.models.slice(0, 100).map((model) => <span className="playground-model-chip" key={model}><strong>{modelDisplayName(model)}</strong><small>{model}</small></span>)}</div> : null}
         </div>
-
-        {/* BOTTOM DRAWER FOR MODELS */}
-        {playgroundModelsResult?.models.length ? (
-          <div style={{ borderTop: '1px solid rgba(255,255,255,0.05)', padding: '16px', background: 'rgba(0,0,0,0.2)' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: isModelsExpanded ? '12px' : '0', padding: '0 8px' }}>
-              <span style={{ fontSize: '10px', fontWeight: 'bold', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>
-                Provider Models Inventory ({playgroundModelsResult.models.length} models)
-              </span>
-              <button 
-                style={{ fontSize: '10px', color: 'var(--primary)', cursor: 'pointer', background: 'transparent', border: 'none', display: 'flex', alignItems: 'center', gap: '4px' }} 
-                onClick={() => setIsModelsExpanded(!isModelsExpanded)}
-              >
-                {isModelsExpanded ? "Hide" : "Show"}
-                <Icon icon={isModelsExpanded ? "solar:alt-arrow-up-bold-duotone" : "solar:alt-arrow-down-bold-duotone"} />
-              </button>
-            </div>
-            {isModelsExpanded && (
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
-                {playgroundModelsResult.models.slice(0, 20).map(m => (
-                  <span 
-                    key={m} 
-                    style={{ 
-                      padding: '4px 8px', 
-                      borderRadius: '4px', 
-                      background: 'rgba(255,255,255,0.05)', 
-                      fontSize: '10px', 
-                      border: '1px solid rgba(255,255,255,0.05)', 
-                      color: 'var(--muted)' 
-                    }}
-                  >
-                    {m}
-                  </span>
-                ))}
-                {playgroundModelsResult.models.length > 20 && (
-                  <span style={{ fontSize: '10px', color: 'var(--muted)', alignSelf: 'center' }}>
-                    +{playgroundModelsResult.models.length - 20} more
-                  </span>
-                )}
-              </div>
-            )}
-          </div>
-        ) : null}
-      </main>
+      ) : null}
     </section>
   );
 }
 
-export const PlaygroundPage = memo(PlaygroundPageComponent, (prev, next) => {
-  return prev.accounts === next.accounts
-    && prev.models === next.models
-    && prev.playgroundModelQuery === next.playgroundModelQuery
-    && prev.playgroundBaseUrl === next.playgroundBaseUrl
-    && prev.playgroundApiKey === next.playgroundApiKey
-    && prev.playgroundModel === next.playgroundModel
-    && prev.playgroundSystemPrompt === next.playgroundSystemPrompt
-    && prev.playgroundMessage === next.playgroundMessage
-    && prev.playgroundModelsResult === next.playgroundModelsResult
-    && prev.playgroundModelsLoading === next.playgroundModelsLoading
-    && prev.playgroundResult === next.playgroundResult
-    && prev.playgroundLoading === next.playgroundLoading;
-});
-
+export const PlaygroundPage = memo(PlaygroundPageComponent);
 export default PlaygroundPage;

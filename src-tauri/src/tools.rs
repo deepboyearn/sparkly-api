@@ -108,14 +108,10 @@ pub fn resolve_workspace_path(input: &str, workspace_root: &str) -> Result<PathB
     };
 
     // Canonicalize both sides so symlinks cannot escape the workspace.
-    let canon_root = std::fs::canonicalize(root)
-        .context("Failed to canonicalize workspace root")?;
-    let canon_candidate = std::fs::canonicalize(&candidate).with_context(|| {
-        format!(
-            "Failed to resolve path: {}",
-            candidate.display(),
-        )
-    })?;
+    let canon_root =
+        std::fs::canonicalize(root).context("Failed to canonicalize workspace root")?;
+    let canon_candidate = std::fs::canonicalize(&candidate)
+        .with_context(|| format!("Failed to resolve path: {}", candidate.display(),))?;
 
     if !canon_candidate.starts_with(&canon_root) {
         bail!(
@@ -133,10 +129,7 @@ pub fn resolve_workspace_path(input: &str, workspace_root: &str) -> Result<PathB
 ///
 /// Uses `sh -c` on Unix and `cmd /c` on Windows.  Retries up to
 /// [`MAX_TOOL_CALL_RETRIES`] times on timeout or buffer overflow.
-pub async fn execute_shell_command(
-    command: &str,
-    workspace_root: &str,
-) -> ToolCallResult {
+pub async fn execute_shell_command(command: &str, workspace_root: &str) -> ToolCallResult {
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return tool_result("NO_COMMAND", "No shell command provided.", 1, "");
@@ -182,7 +175,11 @@ pub async fn execute_shell_command(
 
     // Should never be reached (loop always returns), but be defensive.
     let fallback = last_error.unwrap_or_else(|| {
-        error_result("UNKNOWN_SHELL_ERROR", "Shell command failed after retries.", 1)
+        error_result(
+            "UNKNOWN_SHELL_ERROR",
+            "Shell command failed after retries.",
+            1,
+        )
     });
     let is_fatal = fallback["fatal"].as_bool().unwrap_or(false);
     ToolCallResult {
@@ -245,9 +242,7 @@ async fn run_shell_once(
 
         // Check for buffer overflow signal in stderr text.
         let combined = format!("{stdout}{stderr}");
-        let detected = if combined.contains("maxbuffer")
-            || combined.contains("E2BIG")
-        {
+        let detected = if combined.contains("maxbuffer") || combined.contains("E2BIG") {
             "EMAXBUFFER".to_string()
         } else {
             code
@@ -255,7 +250,11 @@ async fn run_shell_once(
 
         Err(error_result(
             &detected,
-            if stderr.is_empty() { "Command produced no output." } else { &stderr },
+            if stderr.is_empty() {
+                "Command produced no output."
+            } else {
+                &stderr
+            },
             exit_code,
         ))
     }
@@ -429,11 +428,7 @@ async fn handle_edit_file(arguments: &Value, path: &Path) -> serde_json::Value {
         .unwrap_or("");
 
     if search.is_empty() {
-        return error_result(
-            "MISSING_SEARCH",
-            "Missing search text for edit_file.",
-            1,
-        );
+        return error_result("MISSING_SEARCH", "Missing search text for edit_file.", 1);
     }
 
     let content = match fs::read_to_string(path).await {
@@ -448,11 +443,7 @@ async fn handle_edit_file(arguments: &Value, path: &Path) -> serde_json::Value {
     };
 
     if !content.contains(search) {
-        return error_result(
-            "SEARCH_NOT_FOUND",
-            "Search text not found in file.",
-            1,
-        );
+        return error_result("SEARCH_NOT_FOUND", "Search text not found in file.", 1);
     }
 
     let new_content = content.replace(search, replace);

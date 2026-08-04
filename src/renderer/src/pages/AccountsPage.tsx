@@ -1,11 +1,20 @@
 import { memo } from "react";
 import { Icon } from "@iconify/react";
-import type { BridgeConfig, BridgeState, UpstreamAccount } from "../../../shared/types";
+import type { AccountProvider, BridgeState, UpstreamAccount } from "../../../shared/types";
 import { maskKey } from "../appState";
+
+const providerLabels: Record<AccountProvider, string> = {
+  auto: "Auto detect",
+  "openai-compatible": "OpenAI compatible",
+  anthropic: "Anthropic",
+  gemini: "Google Gemini",
+  ollama: "Ollama",
+  cohere: "Cohere",
+  v0: "v0 Platform API",
+};
 
 function AccountsPageComponent({
   state,
-  form,
   saving,
   onRefreshActiveAccountModels,
   openEditAccountModal,
@@ -13,7 +22,6 @@ function AccountsPageComponent({
   onDeleteAccount,
 }: {
   state: BridgeState;
-  form: BridgeConfig;
   saving: boolean;
   onRefreshActiveAccountModels: () => void;
   openEditAccountModal: (account: UpstreamAccount) => void;
@@ -40,8 +48,8 @@ function AccountsPageComponent({
               onClick={onRefreshActiveAccountModels} 
               disabled={saving || accounts.length === 0}
             >
-              <Icon icon="solar:refresh-circle-bold-duotone" className="btn-icon" />
-              Sync active models
+              <Icon icon="solar:refresh-circle-bold-duotone" className={`btn-icon ${saving ? "animate-spin" : ""}`} />
+              {saving ? "Scanning provider..." : "Sync active models"}
             </button>
           </div>
         </div>
@@ -98,7 +106,8 @@ function AccountsPageComponent({
                   <div className="meta-icon"><Icon icon="solar:server-square-cloud-bold-duotone" /></div>
                   <div className="meta-content">
                     <label>Provider</label>
-                    <strong>{account.provider === "v0" ? "v0 Platform API" : account.provider === "anthropic" ? "Anthropic" : "OpenAI Compatible"}</strong>
+                    <strong>{providerLabels[account.provider]}</strong>
+                    {account.provider === "auto" && account.detectedProtocol ? <small>Detected: {providerLabels[account.detectedProtocol]}</small> : null}
                   </div>
                 </div>
                 <div className="meta-item">
@@ -136,10 +145,17 @@ function AccountsPageComponent({
                 <div className="meta-item">
                   <div className="meta-icon"><Icon icon="solar:cpu-bolt-bold-duotone" /></div>
                   <div className="meta-content">
-                    <label>Target Model</label>
-                    <strong>{form.selectedModel || "Default Bridge"}</strong>
+                    <label>Model catalog</label>
+                    <strong>{account.models.length.toLocaleString()} models</strong>
+                    <small>{account.selectedModel || "Scan required"}</small>
                   </div>
                 </div>
+              </div>
+
+              <div className="account-catalog-status" role="status">
+                {account.modelsLastRefreshedAt
+                  ? `Last scanned ${new Date(account.modelsLastRefreshedAt).toLocaleString()}`
+                  : "Model catalog has not been scanned yet"}
               </div>
 
               <div className="account-card-footer">
@@ -165,7 +181,6 @@ function AccountsPageComponent({
 
 export const AccountsPage = memo(AccountsPageComponent, (prev, next) => {
   return prev.state === next.state
-    && prev.form === next.form
     && prev.saving === next.saving;
 });
 

@@ -13,6 +13,8 @@ src-tauri/gen/
 .vite/
 coverage/
 *.tsbuildinfo
+.sparkly-dev.lock
+.sparkly-run/
 
 # Local environment files
 .env

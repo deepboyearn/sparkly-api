@@ -11,15 +11,27 @@ use std::collections::HashMap;
 pub fn default_mappings() -> HashMap<String, String> {
     let mut m = HashMap::new();
     m.insert("Gemini 3.6 Flash (High)".into(), "gemini-3.6-flash".into());
-    m.insert("Gemini 3.6 Flash (Medium)".into(), "gemini-3.6-flash".into());
+    m.insert(
+        "Gemini 3.6 Flash (Medium)".into(),
+        "gemini-3.6-flash".into(),
+    );
     m.insert("Gemini 3.6 Flash (Low)".into(), "gemini-3.6-flash".into());
-    m.insert("Gemini 3.5 Flash (Medium) / Default".into(), "gemini-3.5-flash".into());
+    m.insert(
+        "Gemini 3.5 Flash (Medium) / Default".into(),
+        "gemini-3.5-flash".into(),
+    );
     m.insert("Gemini 3.5 Flash (High)".into(), "gemini-3.5-flash".into());
     m.insert("Gemini 3.5 Flash (Low)".into(), "gemini-3.5-flash".into());
     m.insert("Gemini 3.1 Pro (Low)".into(), "gemini-3.1-pro".into());
     m.insert("Gemini 3.1 Pro (High)".into(), "gemini-3.1-pro".into());
-    m.insert("Claude Sonnet 4.6 (Thinking)".into(), "claude-sonnet-4-5".into());
-    m.insert("Claude Opus 4.6 (Thinking)".into(), "claude-opus-4-5".into());
+    m.insert(
+        "Claude Sonnet 4.6 (Thinking)".into(),
+        "claude-sonnet-4-5".into(),
+    );
+    m.insert(
+        "Claude Opus 4.6 (Thinking)".into(),
+        "claude-opus-4-5".into(),
+    );
     m.insert("GPT-OSS 120B (Medium)".into(), "gpt-4o".into());
     m.insert("Gemini 3 Flash (Command)".into(), "gemini-3-flash".into());
     m
@@ -27,7 +39,10 @@ pub fn default_mappings() -> HashMap<String, String> {
 
 /// Rewrite the model field in a request body based on the mapping.
 /// Handles both OpenAI format (`model` field) and Anthropic format.
-pub fn rewrite_model(body: &serde_json::Value, mappings: &HashMap<String, String>) -> serde_json::Value {
+pub fn rewrite_model(
+    body: &serde_json::Value,
+    mappings: &HashMap<String, String>,
+) -> serde_json::Value {
     let mut body = body.clone();
     if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
         if let Some(mapped) = mappings.get(model) {
