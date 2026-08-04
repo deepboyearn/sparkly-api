@@ -1,0 +1,5 @@
+# Keep local development builds responsive and predictable. The guarded Node
+# launcher also exports CARGO_BUILD_JOBS=1 so direct Cargo invocations and the
+# Tauri development path share the same conservative ceiling.
+[build]
+jobs = 1

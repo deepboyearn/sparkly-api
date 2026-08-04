@@ -2,21 +2,26 @@
   "name": "sparkly-api",
   "version": "1.2.0",
   "private": true,
-  "description": "Tauri + React local OpenAI-compatible bridge proxy and API dashboard.",
+  "description": "Tauri + React local OpenAI-compatible bridge proxy, dashboard, and automation CLI.",
+  "bin": {
+    "sparkly": "scripts/sparkly-cli.mjs"
+  },
   "type": "module",
   "scripts": {
-    "dev": "tauri dev",
+    "dev": "node scripts/dev.mjs",
+    "cli": "node scripts/sparkly-cli.mjs",
+    "cli:test": "node --test scripts/sparkly-cli.test.mjs",
+    "dev:test": "node --test scripts/dev.test.mjs",
     "build:renderer": "vite build",
     "build": "vite build",
     "lint": "oxlint",
     "lint:fix": "oxlint --fix",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "tauri": "tauri",
-    "tauri:dev": "tauri dev",
+    "tauri:dev": "node scripts/dev.mjs",
     "tauri:build": "tauri build"
   },
   "dependencies": {
-    "@iconify-json/material-symbols": "^1.2.88",
     "@iconify-json/solar": "^1.2.5",
     "@iconify/react": "^6.0.2",
     "@tauri-apps/api": "^2",

@@ -20,12 +20,32 @@ export interface ConsoleLogEntry {
 type Listener = (logs: ConsoleLogEntry[]) => void;
 
 const MAX_LOGS = 500;
+const REDACTED = "[REDACTED]";
+const SENSITIVE_KEY = /^(apiKey|key|authorization|x-api-key|token|secret|password)$/i;
 const listeners = new Set<Listener>();
 let logs: ConsoleLogEntry[] = [];
 let idCounter = 0;
 
 function notify() {
   for (const fn of listeners) fn(logs);
+}
+
+function redactSensitive(value: unknown, seen = new WeakSet<object>(), depth = 0): unknown {
+  if (value === null || value === undefined || typeof value !== "object") return value;
+  if (depth >= 8) return "[TRUNCATED]";
+  if (seen.has(value)) return "[CIRCULAR]";
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    return value.map((item) => redactSensitive(item, seen, depth + 1));
+  }
+
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, nested]) => [
+      key,
+      SENSITIVE_KEY.test(key) ? REDACTED : redactSensitive(nested, seen, depth + 1),
+    ]),
+  );
 }
 
 function addEntry(entry: ConsoleLogEntry) {
@@ -80,8 +100,8 @@ export function logIpcCall(
     statusCode: error ? 1 : 0,
     durationMs,
     errorMessage: error,
-    requestData: args,
-    responseData: result,
+    requestData: redactSensitive(args),
+    responseData: redactSensitive(result),
     source: "ipc",
   });
 }
@@ -96,7 +116,7 @@ export function logUserAction(action: string, data?: unknown) {
     url: action,
     statusCode: null,
     durationMs: 0,
-    responseData: data,
+    responseData: redactSensitive(data),
     source: "system",
   });
 }
@@ -111,7 +131,7 @@ export function logSystem(message: string, data?: unknown) {
     url: message,
     statusCode: null,
     durationMs: 0,
-    responseData: data,
+    responseData: redactSensitive(data),
     source: "system",
   });
 }
@@ -140,8 +160,8 @@ export function logHttp(
     statusCode: status,
     durationMs,
     errorMessage: error,
-    requestData,
-    responseData,
+    requestData: redactSensitive(requestData),
+    responseData: redactSensitive(responseData),
     source: "http",
   });
 }

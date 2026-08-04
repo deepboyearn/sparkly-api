@@ -17,23 +17,23 @@ const GREETINGS = [
 ];
 
 export function Onboarding({ onComplete }: OnboardingProps) {
-  const [isElectronReady, setIsElectronReady] = useState(false);
+  const [isDesktopReady, setIsDesktopReady] = useState(false);
   const [step, setStep] = useState<"greeting" | "intro">(() => {
     const hasSeen = localStorage.getItem("hasSeenGreeting");
     return hasSeen === "true" ? "intro" : "greeting";
   });
   const [greetingIndex, setGreetingIndex] = useState(0);
 
-  // Initial delay to ensure Electron window is fully visible and stable
+  // Briefly wait for the native desktop window to become visible and stable.
   useEffect(() => {
     const timer = setTimeout(() => {
-      setIsElectronReady(true);
+      setIsDesktopReady(true);
     }, 1500); // 1.5 seconds wait
     return () => clearTimeout(timer);
   }, []);
 
   useEffect(() => {
-    if (isElectronReady && step === "greeting") {
+    if (isDesktopReady && step === "greeting") {
       const timer = setInterval(() => {
         setGreetingIndex((prev) => {
           if (prev === GREETINGS.length - 1) {
@@ -49,7 +49,7 @@ export function Onboarding({ onComplete }: OnboardingProps) {
       }, 750);
       return () => clearInterval(timer);
     }
-  }, [isElectronReady, step]);
+  }, [isDesktopReady, step]);
 
   const containerVariants: Variants = {
     hidden: { opacity: 0, scale: 0.95 },
@@ -78,7 +78,7 @@ export function Onboarding({ onComplete }: OnboardingProps) {
   return (
     <div className="onboarding-overlay">
       <AnimatePresence mode="wait">
-        {!isElectronReady ? (
+        {!isDesktopReady ? (
           <motion.div
             key="pre-loader"
             initial={{ opacity: 0 }}

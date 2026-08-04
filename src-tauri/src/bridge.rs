@@ -2,8 +2,9 @@
 // Axum HTTP bridge server — forwards OpenAI-compatible requests to upstream accounts.
 // Port of bridgeServer.ts with failover, agent loop, and Responses API translation.
 
-use std::collections::{HashMap, VecDeque};
 use parking_lot::Mutex;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use axum::extract::rejection::JsonRejection;
@@ -29,12 +30,17 @@ const MAX_LOGS: usize = 200;
 const MAX_AGENT_TURNS: usize = 5;
 const UPSTREAM_TIMEOUT_SECS: u64 = 120;
 const PLAYGROUND_TIMEOUT_SECS: u64 = 30;
-const MODEL_FETCH_TIMEOUT_SECS: u64 = 8;
+const AUTHORITATIVE_MODEL_FETCH_TIMEOUT_SECS: u64 = 20;
+const FALLBACK_MODEL_FETCH_TIMEOUT_SECS: u64 = 8;
 const RESPONSES_SESSION_LIMIT: usize = 50;
 
 // ─── Module-level singletons ────────────────────────────────────────────────
 
 static SHUTDOWN_TX: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
+static SERVER_GENERATION: AtomicU64 = AtomicU64::new(0);
+static SERVER_STOPPING: AtomicBool = AtomicBool::new(false);
+static UPSTREAM_ROUTE_CACHE: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Conversation items for `/v1/responses`, keyed by response id.
 static SESSIONS: LazyLock<RwLock<ResponsesSessions>> =
@@ -84,7 +90,6 @@ impl ResponsesSessions {
         }
     }
 }
-
 
 /// Flatten a chat/Responses `content` value to plain text.
 ///
@@ -147,38 +152,139 @@ fn summarize_playground_failure(status: u16, raw: &Value, text: &str) -> String 
     format!("HTTP {status} request failed")
 }
 
-/// Extract model IDs from a `/v1/models` response body.
+/// Extract model IDs from common provider catalog shapes.
+///
+/// OpenAI-compatible servers return `{data:[{id}]}`. Provider routers such as
+/// 9router expose `{models:[{alias,fullModel,model}]}` from `/api/models`.
 fn extract_models_from_response(raw: &Value) -> Vec<String> {
-    raw.pointer("/data")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| item.get("id").and_then(|v| v.as_str()).map(String::from))
-                .collect()
+    let items = raw
+        .as_array()
+        .or_else(|| raw.get("data").and_then(Value::as_array))
+        .or_else(|| raw.get("models").and_then(Value::as_array));
+
+    let mut seen = std::collections::HashSet::new();
+    items
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            if let Some(model) = item.as_str() {
+                return Some(model);
+            }
+            item.get("id")
+                // Routers may expose aliases, while Gemini, Cohere, and Ollama
+                // use `name` or `model`. Persist the exact routable identifier.
+                .or_else(|| item.get("fullModel"))
+                .or_else(|| item.get("name"))
+                .or_else(|| item.get("model"))
+                .or_else(|| item.get("alias"))
+                .and_then(Value::as_str)
         })
-        .unwrap_or_default()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(String::from)
+        .filter(|model| seen.insert(model.clone()))
+        .collect()
 }
 
-/// Normalize a base URL by stripping trailing slashes and `/v1` suffix.
+/// Normalize a base URL by stripping trailing slashes and a terminal API
+/// version. A custom prefix such as `/openai/v1` remains `/openai`.
 fn normalize_base_url(value: &str) -> String {
     let trimmed = value.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return String::new();
     }
-    if let Some(stripped) = trimmed.strip_suffix("/v1") {
-        stripped.to_string()
-    } else {
-        trimmed.to_string()
+    trimmed
+        .strip_suffix("/v1")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !value.is_empty() && !values.iter().any(|existing| existing == &value) {
+        values.push(value);
     }
+}
+
+/// Derive bounded route candidates from a user-supplied provider URL.
+fn upstream_url_candidates(base_url: &str, path: &str) -> Vec<String> {
+    let supplied = base_url.trim().trim_end_matches('/');
+    let suffix = path.strip_prefix("/v1").unwrap_or(path);
+    let mut candidates = Vec::new();
+
+    if supplied.ends_with("/v1") || supplied.ends_with("/api/v1") {
+        push_unique(&mut candidates, format!("{supplied}{suffix}"));
+    } else {
+        push_unique(&mut candidates, format!("{supplied}{path}"));
+    }
+    push_unique(
+        &mut candidates,
+        format!("{}{}", normalize_base_url(supplied), path),
+    );
+
+    if let Ok(mut origin) = reqwest::Url::parse(supplied) {
+        origin.set_path("");
+        origin.set_query(None);
+        origin.set_fragment(None);
+        let root = origin.as_str().trim_end_matches('/');
+        push_unique(&mut candidates, format!("{root}{path}"));
+        push_unique(&mut candidates, format!("{root}/api{path}"));
+    }
+
+    candidates
+}
+
+fn upstream_url(base_url: &str, path: &str) -> String {
+    upstream_url_candidates(base_url, path)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
+fn route_cache_key(base_url: &str, path: &str) -> String {
+    format!("{}|{path}", base_url.trim().trim_end_matches('/'))
+}
+
+fn route_is_missing(status: u16, body: &Value) -> bool {
+    if status == 405 {
+        return true;
+    }
+    if status != 404 {
+        return false;
+    }
+    let code = body
+        .pointer("/error/code")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if matches!(code, "model_not_found" | "authentication_error") {
+        return false;
+    }
+    let message = body
+        .pointer("/error/message")
+        .or_else(|| body.get("detail"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| body.as_str().unwrap_or(""))
+        .to_ascii_lowercase();
+    message.is_empty()
+        || message.contains("not found")
+        || message.contains("cannot get")
+        || message.contains("cannot post")
+        || message.contains("no route")
+        || message.contains("<!doctype html")
 }
 
 /// Check whether the config has at least one configured upstream account.
 fn has_configured_upstream(config: &BridgeConfig) -> bool {
     !config.api_key.is_empty()
-        || config
-            .accounts
-            .iter()
-            .any(|a| !a.base_url.is_empty() && !a.api_key.is_empty())
+        || config.accounts.iter().any(|account| {
+            let protocol = if account.provider == AccountProvider::Auto {
+                account.detected_protocol.unwrap_or(AccountProvider::Auto)
+            } else {
+                account.provider
+            };
+            !account.base_url.is_empty()
+                && (protocol == AccountProvider::Ollama || !account.api_key.is_empty())
+        })
 }
 
 /// Determine whether we should failover to the next account for this status/body.
@@ -273,9 +379,7 @@ fn json_error(status: StatusCode, message: &str, error_type: &str) -> Response {
 ///
 /// axum's own rejection is `text/plain`, which an OpenAI-compatible client
 /// cannot parse.
-fn json_body_or_error(
-    body: Result<Json<Value>, JsonRejection>,
-) -> Result<Value, Response> {
+fn json_body_or_error(body: Result<Json<Value>, JsonRejection>) -> Result<Value, Response> {
     match body {
         Ok(Json(value)) => Ok(value),
         Err(JsonRejection::MissingJsonContentType(_)) => Ok(json!({})),
@@ -311,9 +415,7 @@ fn get_active_account(config: &BridgeConfig) -> Option<&UpstreamAccount> {
 
 /// Extract the model name from a JSON request body.
 fn extract_model(body: &Value) -> Option<String> {
-    body.get("model")
-        .and_then(|v| v.as_str())
-        .map(String::from)
+    body.get("model").and_then(|v| v.as_str()).map(String::from)
 }
 
 /// JavaScript `Boolean(value)` for a JSON value: everything except `undefined`,
@@ -359,7 +461,10 @@ fn apply_model_defaults(body: &mut Value, config: &BridgeConfig) {
         .iter()
         .any(|m| m.get("role").and_then(|v| v.as_str()) == Some("system"));
     if !has_system {
-        messages.insert(0, json!({"role": "system", "content": config.system_prompt}));
+        messages.insert(
+            0,
+            json!({"role": "system", "content": config.system_prompt}),
+        );
     }
 }
 
@@ -498,8 +603,7 @@ async fn execute_tool_call(tool_name: &str, raw_arguments: &str) -> (Value, bool
             let command = crate::tools::extract_shell_command(raw_arguments);
             crate::tools::execute_shell_command(&command, &root).await
         } else {
-            let parsed: Value =
-                serde_json::from_str(raw_arguments).unwrap_or_else(|_| json!({}));
+            let parsed: Value = serde_json::from_str(raw_arguments).unwrap_or_else(|_| json!({}));
             crate::tools::execute_file_tool(tool_name, &parsed, &root).await
         };
 
@@ -522,10 +626,7 @@ fn merge_conversation_input(body: &Value, sessions: &ResponsesSessions) -> Value
         .unwrap_or("");
 
     if prev_id.is_empty() {
-        return body
-            .get("input")
-            .cloned()
-            .unwrap_or_else(|| json!([]));
+        return body.get("input").cloned().unwrap_or_else(|| json!([]));
     }
 
     let previous_items = sessions.get(prev_id).cloned().unwrap_or_default();
@@ -600,10 +701,7 @@ fn normalize_responses_input(input: &Value) -> Vec<Value> {
         // function_call → assistant with tool_calls
         if typ == "function_call" {
             if let Some(call_id) = obj.get("call_id").and_then(|v| v.as_str()) {
-                let name = obj
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("tool");
+                let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
                 messages.push(json!({
                     "role": "assistant",
                     "content": "",
@@ -826,10 +924,8 @@ fn map_responses_request_to_chat(
     let messages = normalize_responses_input(&merged_input);
     let chat_tools = map_responses_tools_to_chat(body.get("tools").unwrap_or(&Value::Null));
     let has_tools = !chat_tools.is_empty();
-    let tool_choice = map_responses_tool_choice(
-        body.get("tool_choice").unwrap_or(&Value::Null),
-        has_tools,
-    );
+    let tool_choice =
+        map_responses_tool_choice(body.get("tool_choice").unwrap_or(&Value::Null), has_tools);
 
     let mut chat_body = json!({
         "model": body.get("model")
@@ -864,7 +960,11 @@ fn map_responses_request_to_chat(
 }
 
 /// Map a chat completion response to the Responses format.
-fn map_chat_response_to_responses(body: &Value, request_body: &Value, fallback_model: Option<&str>) -> Value {
+fn map_chat_response_to_responses(
+    body: &Value,
+    request_body: &Value,
+    fallback_model: Option<&str>,
+) -> Value {
     let chat = if body.is_object() { body } else { &json!({}) };
 
     let assistant_message = chat
@@ -969,194 +1069,429 @@ fn map_chat_response_to_responses(body: &Value, request_body: &Value, fallback_m
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
-/// Build the BridgeState snapshot for the frontend.
+/// Build the full editable state used at startup and after explicit mutations.
 pub async fn build_bridge_state(state: &AppState) -> BridgeState {
     let config = state.config.read().await.clone();
-    let logs = state.logs.read().await.clone();
     let client_keys = state.client_keys.read().await.clone();
-    let mut stats = state.stats.read().await.clone();
-    // `uptimeMs` and `activeModelCount` are derived, never stored; the rest of
-    // the snapshot is already current.
-    stats.uptime_ms = state.started_at.elapsed().as_millis() as u64;
-    stats.active_model_count = config.models.len();
-    stats.last_request_at = logs.first().map(|entry| entry.timestamp.clone());
+    let runtime = build_runtime_snapshot(state).await;
 
     BridgeState {
         config,
-        stats,
-        logs,
+        stats: runtime.stats,
+        logs: runtime.logs,
         client_keys,
     }
 }
 
-/// Fetch models from a provider endpoint (used by refresh_active_account_models).
-pub async fn fetch_models_from_provider(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
-    let normalized = normalize_base_url(base_url);
-    let url = format!("{normalized}/v1/models");
-
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(MODEL_FETCH_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
-
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch models: {e}"))?;
-
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read models response: {e}"))?;
-
-    let raw: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-
-    Ok(extract_models_from_response(&raw))
+/// Build the lightweight live-refresh payload. It deliberately excludes
+/// configuration, provider credentials, account records, and client-key data.
+pub async fn build_runtime_snapshot(state: &AppState) -> RuntimeSnapshot {
+    let logs = state.logs.read().await.clone();
+    let mut stats = state.stats.read().await.clone();
+    stats.uptime_ms = state.started_at.elapsed().as_millis() as u64;
+    stats.active_model_count = state.config.read().await.models.len();
+    stats.last_request_at = logs.first().map(|entry| entry.timestamp.clone());
+    RuntimeSnapshot { stats, logs }
 }
 
-/// Fetch models for the playground UI.
+#[derive(Clone)]
+struct ModelCatalogProbe {
+    protocol: AccountProvider,
+    url: String,
+}
+
+fn model_catalog_probes(base_url: &str, requested: AccountProvider) -> Vec<ModelCatalogProbe> {
+    let supplied = base_url.trim().trim_end_matches('/');
+    let mut probes = Vec::new();
+    let mut add = |protocol: AccountProvider, url: String| {
+        if !url.is_empty()
+            && !probes
+                .iter()
+                .any(|probe: &ModelCatalogProbe| probe.protocol == protocol && probe.url == url)
+        {
+            probes.push(ModelCatalogProbe { protocol, url });
+        }
+    };
+
+    let protocols: Vec<AccountProvider> = if requested == AccountProvider::Auto {
+        vec![
+            AccountProvider::OpenaiCompatible,
+            AccountProvider::Anthropic,
+            AccountProvider::Gemini,
+            AccountProvider::Ollama,
+            AccountProvider::Cohere,
+        ]
+    } else {
+        vec![requested]
+    };
+
+    for protocol in protocols {
+        match protocol {
+            AccountProvider::OpenaiCompatible => {
+                for url in upstream_url_candidates(supplied, "/v1/models") {
+                    add(protocol, url);
+                }
+                if let Ok(mut origin) = reqwest::Url::parse(supplied) {
+                    origin.set_path("/api/models");
+                    origin.set_query(None);
+                    origin.set_fragment(None);
+                    add(protocol, origin.to_string());
+                }
+            }
+            AccountProvider::Anthropic => {
+                for url in upstream_url_candidates(supplied, "/v1/models") {
+                    add(protocol, url);
+                }
+            }
+            AccountProvider::Gemini => {
+                let root = supplied.trim_end_matches("/v1beta").trim_end_matches('/');
+                add(protocol, format!("{root}/v1beta/models"));
+            }
+            AccountProvider::Ollama => {
+                let root = supplied.trim_end_matches("/api").trim_end_matches('/');
+                add(protocol, format!("{root}/api/tags"));
+            }
+            AccountProvider::Cohere => {
+                add(protocol, upstream_url(supplied, "/v1/models"));
+            }
+            AccountProvider::V0 => {}
+            AccountProvider::Auto => unreachable!(),
+        }
+    }
+    probes
+}
+
+async fn fetch_model_catalog(
+    base_url: &str,
+    api_key: &str,
+    requested: AccountProvider,
+) -> Result<(u16, Value, Vec<String>, AccountProvider), String> {
+    let probes = model_catalog_probes(base_url, requested);
+    let mut failures = Vec::new();
+
+    // The exact configured-protocol route is authoritative. Auto detection is
+    // ordered and sequential; catalog GETs may fall back, generation never does.
+    for (index, probe) in probes.into_iter().enumerate() {
+        let timeout_secs = if index == 0 {
+            AUTHORITATIVE_MODEL_FETCH_TIMEOUT_SECS
+        } else {
+            FALLBACK_MODEL_FETCH_TIMEOUT_SECS
+        };
+        let mut request = UPSTREAM_CLIENT
+            .get(&probe.url)
+            .timeout(std::time::Duration::from_secs(timeout_secs));
+        request = match probe.protocol {
+            AccountProvider::Anthropic => request
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01"),
+            AccountProvider::Gemini => request.header("x-goog-api-key", api_key),
+            AccountProvider::Ollama => request,
+            _ => request
+                .header("Authorization", format!("Bearer {api_key}"))
+                .header("x-api-key", api_key),
+        };
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                failures.push(format!("{}: {error}", probe.url));
+                continue;
+            }
+        };
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        let raw = serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.clone()));
+        let models = extract_models_from_response(&raw);
+        if (200..300).contains(&status) && !models.is_empty() {
+            return Ok((status, raw, models, probe.protocol));
+        }
+        failures.push(format!(
+            "{}: {}",
+            probe.url,
+            summarize_playground_failure(status, &raw, &text),
+        ));
+    }
+    Err(format!(
+        "No usable model catalog found: {}",
+        failures.join("; ")
+    ))
+}
+
+/// Fetch models and the protocol that produced them for account persistence.
+pub async fn fetch_models_from_provider(
+    base_url: &str,
+    api_key: &str,
+    protocol: AccountProvider,
+) -> Result<(Vec<String>, AccountProvider), String> {
+    fetch_model_catalog(base_url, api_key, protocol)
+        .await
+        .map(|(_, _, models, detected)| (models, detected))
+}
+
+/// Fetch models for the playground UI without mutating account state.
 pub async fn fetch_playground_models(
     base_url: &str,
     api_key: &str,
+    protocol: AccountProvider,
 ) -> Result<PlaygroundModelsResult, String> {
-    let normalized = normalize_base_url(base_url);
-    let url = format!("{normalized}/v1/models");
-
-    let client = match Client::builder()
-        .timeout(std::time::Duration::from_secs(MODEL_FETCH_TIMEOUT_SECS))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return Ok(PlaygroundModelsResult {
-                ok: false,
-                status: 500,
-                models: vec![],
-                raw: None,
-                error: Some(format!("Failed to build HTTP client: {e}")),
-            });
-        }
-    };
-
-    match client
-        .get(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            let text = resp.text().await.unwrap_or_default();
-            let raw: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-            let ok = status >= 200 && status < 300;
-            let models = extract_models_from_response(&raw);
-            let error = if ok {
-                None
-            } else {
-                Some(summarize_playground_failure(status, &raw, &text))
-            };
-            Ok(PlaygroundModelsResult {
-                ok,
-                status,
-                models,
-                raw: Some(raw),
-                error,
-            })
-        }
-        Err(e) => Ok(PlaygroundModelsResult {
+    match fetch_model_catalog(base_url, api_key, protocol).await {
+        Ok((status, raw, models, detected_protocol)) => Ok(PlaygroundModelsResult {
+            ok: true,
+            status,
+            models,
+            detected_protocol: Some(detected_protocol),
+            raw: Some(raw),
+            error: None,
+        }),
+        Err(error) => Ok(PlaygroundModelsResult {
             ok: false,
-            status: 500,
+            status: 502,
             models: vec![],
+            detected_protocol: None,
             raw: None,
-            error: Some(e.to_string()),
+            error: Some(error),
         }),
     }
 }
 
-/// Run a playground test request.
+/// Run a protocol-aware Playground request. Catalog discovery may probe safe
+/// GET routes, but this function sends exactly one generation request.
 pub async fn playground_test(input: PlaygroundTestInput) -> Result<PlaygroundTestResult, String> {
-    let normalized = normalize_base_url(&input.base_url);
-    let url = format!("{normalized}/v1/chat/completions");
+    if input.max_tokens == 0 {
+        return Err("maxTokens must be greater than zero.".into());
+    }
+    if input.thinking_mode == "enabled" {
+        let budget = input.thinking_budget.unwrap_or(0);
+        if budget < 1024 || budget >= input.max_tokens {
+            return Err(
+                "Manual thinking requires thinkingBudget >= 1024 and less than maxTokens.".into(),
+            );
+        }
+    }
 
     let mut messages = Vec::new();
-    if let Some(sp) = &input.system_prompt {
-        if !sp.is_empty() {
-            messages.push(json!({"role": "system", "content": sp}));
-        }
+    if let Some(system) = input
+        .system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        messages.push(json!({"role": "system", "content": system}));
     }
     messages.push(json!({"role": "user", "content": input.message}));
 
-    let body = json!({
-        "model": input.model,
-        "messages": messages,
-        "max_tokens": 300,
-    });
-
-    let client = match Client::builder()
-        .timeout(std::time::Duration::from_secs(PLAYGROUND_TIMEOUT_SECS))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return Ok(PlaygroundTestResult {
-                ok: false,
-                status: 500,
-                model: Some(input.model),
-                content: None,
-                raw: None,
-                error: Some(format!("Failed to build HTTP client: {e}")),
+    let mut body = match input.protocol {
+        AccountProvider::Anthropic => {
+            let mut value = json!({
+                "model": input.model,
+                "max_tokens": input.max_tokens,
+                "messages": [{"role": "user", "content": input.message}],
             });
+            if let Some(system) = input
+                .system_prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                value["system"] = Value::String(system.to_string());
+            }
+            match input.thinking_mode.as_str() {
+                "disabled" => value["thinking"] = json!({"type": "disabled"}),
+                "adaptive" => value["thinking"] = json!({"type": "adaptive"}),
+                "enabled" => {
+                    value["thinking"] =
+                        json!({"type": "enabled", "budget_tokens": input.thinking_budget})
+                }
+                _ => {}
+            }
+            if let Some(effort) = &input.reasoning_effort {
+                value["output_config"] = json!({"effort": effort});
+            }
+            if input.response_format == "json_object" {
+                value["output_config"]["format"] =
+                    json!({"type": "json_schema", "schema": {"type": "object"}});
+            }
+            value
+        }
+        AccountProvider::Gemini => {
+            let contents: Vec<Value> = messages
+                .iter()
+                .filter(|message| message["role"] != "system")
+                .map(|message| {
+                    json!({
+                        "role": "user",
+                        "parts": [{"text": message["content"]}],
+                    })
+                })
+                .collect();
+            let mut value = json!({"contents": contents, "generationConfig": {"maxOutputTokens": input.max_tokens}});
+            if let Some(system) = input
+                .system_prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                value["systemInstruction"] = json!({"parts": [{"text": system}]});
+            }
+            if input.response_format == "json_object" {
+                value["generationConfig"]["responseMimeType"] =
+                    Value::String("application/json".into());
+            }
+            value
+        }
+        AccountProvider::Ollama => json!({
+            "model": input.model,
+            "messages": messages,
+            "stream": false,
+            "options": {"num_predict": input.max_tokens},
+            "format": if input.response_format == "json_object" { Value::String("json".into()) } else { Value::Null },
+        }),
+        AccountProvider::Cohere => json!({
+            "model": input.model,
+            "messages": messages,
+            "stream": false,
+            "max_tokens": input.max_tokens,
+            "response_format": if input.response_format == "json_object" { json!({"type": "json_object"}) } else { Value::Null },
+        }),
+        AccountProvider::OpenaiCompatible => {
+            let mut value = json!({"model": input.model, "messages": messages, "max_completion_tokens": input.max_tokens});
+            if let Some(effort) = &input.reasoning_effort {
+                value["reasoning_effort"] = Value::String(effort.clone());
+            }
+            if input.response_format == "json_object" {
+                value["response_format"] = json!({"type": "json_object"});
+            }
+            value
+        }
+        AccountProvider::Auto | AccountProvider::V0 => {
+            return Err("Select a resolved Playground protocol before generation.".into());
         }
     };
 
-    match client
+    if let Some(temperature) = input.temperature {
+        if input.protocol == AccountProvider::Anthropic && !(0.0..=1.0).contains(&temperature) {
+            return Err("Anthropic temperature must be between 0 and 1.".into());
+        }
+        match input.protocol {
+            AccountProvider::Gemini => body["generationConfig"]["temperature"] = json!(temperature),
+            AccountProvider::Ollama => body["options"]["temperature"] = json!(temperature),
+            _ => body["temperature"] = json!(temperature),
+        }
+    }
+    if let Some(top_p) = input.top_p {
+        match input.protocol {
+            AccountProvider::Gemini => body["generationConfig"]["topP"] = json!(top_p),
+            AccountProvider::Ollama => body["options"]["top_p"] = json!(top_p),
+            _ => body["top_p"] = json!(top_p),
+        }
+    }
+    if let Some(seed) = input.seed {
+        match input.protocol {
+            AccountProvider::Gemini => body["generationConfig"]["seed"] = json!(seed),
+            AccountProvider::Ollama => body["options"]["seed"] = json!(seed),
+            AccountProvider::Anthropic => {}
+            _ => body["seed"] = json!(seed),
+        }
+    }
+    if !input.stop_sequences.is_empty() {
+        match input.protocol {
+            AccountProvider::Anthropic | AccountProvider::Cohere => {
+                body["stop_sequences"] = json!(&input.stop_sequences)
+            }
+            AccountProvider::Gemini => {
+                body["generationConfig"]["stopSequences"] = json!(&input.stop_sequences)
+            }
+            AccountProvider::Ollama => body["options"]["stop"] = json!(&input.stop_sequences),
+            _ => body["stop"] = json!(&input.stop_sequences),
+        }
+    }
+    if let Some(object) = body.as_object_mut() {
+        for (key, value) in input.advanced_body {
+            object.insert(key, value);
+        }
+    }
+
+    let supplied = input.base_url.trim().trim_end_matches('/');
+    let url = match input.protocol {
+        AccountProvider::Anthropic => upstream_url(supplied, "/v1/messages"),
+        AccountProvider::Gemini => {
+            let root = supplied.trim_end_matches("/v1beta");
+            format!(
+                "{root}/v1beta/models/{}:generateContent",
+                input.model.trim_start_matches("models/")
+            )
+        }
+        AccountProvider::Ollama => format!("{supplied}/api/chat"),
+        AccountProvider::Cohere => format!("{supplied}/v2/chat"),
+        AccountProvider::OpenaiCompatible => upstream_url(supplied, "/v1/chat/completions"),
+        AccountProvider::Auto | AccountProvider::V0 => unreachable!(),
+    };
+
+    let mut request = UPSTREAM_CLIENT
         .post(&url)
-        .header("Authorization", format!("Bearer {}", input.api_key))
-        .header("Content-Type", "application/json")
+        .header("content-type", "application/json");
+    request = match input.protocol {
+        AccountProvider::Anthropic => request
+            .header("x-api-key", &input.api_key)
+            .header("anthropic-version", "2023-06-01"),
+        AccountProvider::Gemini => request.header("x-goog-api-key", &input.api_key),
+        AccountProvider::Ollama => request,
+        _ => request.header("Authorization", format!("Bearer {}", input.api_key)),
+    };
+    let response = request
+        .timeout(std::time::Duration::from_secs(PLAYGROUND_TIMEOUT_SECS))
         .json(&body)
         .send()
         .await
-    {
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            let text = resp.text().await.unwrap_or_default();
-            let raw: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-            let ok = status >= 200 && status < 300;
-
-            let content = if ok {
-                raw.pointer("/choices/0/message/content")
-                    .and_then(|c| c.as_str())
-                    .map(String::from)
-            } else {
-                Some(summarize_playground_failure(status, &raw, &text))
-            };
-
-            let error = if ok {
-                None
-            } else {
-                content.clone().or_else(|| Some("Request failed".to_string()))
-            };
-
-            Ok(PlaygroundTestResult {
-                ok,
-                status,
-                model: Some(input.model),
-                content,
-                raw: Some(raw),
-                error,
+        .map_err(|error| format!("Playground request failed at {url}: {error}"))?;
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap_or_default();
+    let raw = serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.clone()));
+    let ok = (200..300).contains(&status);
+    let content = match input.protocol {
+        AccountProvider::Anthropic => raw.get("content").and_then(Value::as_array).map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        }),
+        AccountProvider::Gemini => raw
+            .pointer("/candidates/0/content/parts/0/text")
+            .and_then(Value::as_str)
+            .map(String::from),
+        AccountProvider::Ollama | AccountProvider::Cohere => {
+            raw.pointer("/message/content").and_then(|value| {
+                value.as_str().map(String::from).or_else(|| {
+                    value.as_array().map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                })
             })
         }
-        Err(e) => Ok(PlaygroundTestResult {
-            ok: false,
-            status: 500,
-            model: Some(input.model),
-            content: None,
-            raw: None,
-            error: Some(e.to_string()),
-        }),
-    }
+        _ => raw
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .map(String::from),
+    };
+    let error = if ok {
+        None
+    } else {
+        Some(summarize_playground_failure(status, &raw, &text))
+    };
+    Ok(PlaygroundTestResult {
+        ok,
+        status,
+        model: Some(input.model),
+        content,
+        raw: Some(raw),
+        request: Some(body),
+        resolved_url: Some(url),
+        error,
+    })
 }
 
 // ─── Upstream forwarding with failover ──────────────────────────────────────
@@ -1179,7 +1514,14 @@ async fn forward_request(
     // second-to-last account would fall through to the generic "no accounts"
     // error and the real upstream status would be lost.
     let accounts: Vec<&UpstreamAccount> = {
-        let usable = |a: &&UpstreamAccount| !a.api_key.is_empty() && !a.base_url.is_empty();
+        let usable = |a: &&UpstreamAccount| {
+            let protocol = if a.provider == AccountProvider::Auto {
+                a.detected_protocol.unwrap_or(AccountProvider::Auto)
+            } else {
+                a.provider
+            };
+            !a.base_url.is_empty() && (protocol == AccountProvider::Ollama || !a.api_key.is_empty())
+        };
         match get_active_account(&config) {
             Some(active) => std::iter::once(active)
                 .chain(config.accounts.iter().filter(|a| a.id != active.id))
@@ -1195,7 +1537,12 @@ async fn forward_request(
     for (index, account) in accounts.iter().enumerate() {
         let is_last = index == last_index;
 
-        let result = match account.provider {
+        let protocol = if account.provider == AccountProvider::Auto {
+            account.detected_protocol.unwrap_or(AccountProvider::Auto)
+        } else {
+            account.provider
+        };
+        let result = match protocol {
             AccountProvider::V0 => forward_v0_request(account, upstream_path, method, body).await,
             AccountProvider::Anthropic => {
                 forward_anthropic_upstream(account, upstream_path, method, body).await
@@ -1203,6 +1550,14 @@ async fn forward_request(
             AccountProvider::OpenaiCompatible => {
                 forward_openai_compatible_request(account, upstream_path, method, body).await
             }
+            AccountProvider::Gemini | AccountProvider::Ollama | AccountProvider::Cohere => {
+                forward_native_chat_upstream(account, protocol, upstream_path, method, body).await
+            }
+            AccountProvider::Auto => Ok((
+                400,
+                "application/json".into(),
+                json!({"error": {"message": "Auto protocol is unresolved. Sync this account's model catalog before generation.", "type": "bridge_protocol_error"}}),
+            )),
         };
 
         match result {
@@ -1267,50 +1622,267 @@ async fn forward_request(
     )
 }
 
-/// Forward to an OpenAI-compatible provider.
+/// Forward to an OpenAI-compatible provider with bounded route detection.
 async fn forward_openai_compatible_request(
     account: &UpstreamAccount,
     upstream_path: &str,
     method: &str,
     body: Option<&Value>,
 ) -> Result<(u16, String, Value), String> {
-    let url = format!("{}{upstream_path}", account.base_url);
-    let client = &*UPSTREAM_CLIENT;
-
-    let mut req = match method {
-        "POST" => client.post(&url),
-        "DELETE" => client.delete(&url),
-        _ => client.get(&url),
-    };
-
-    req = req
-        .header("Authorization", format!("Bearer {}", account.api_key))
-        .header("Content-Type", "application/json");
-
-    if let Some(b) = body {
-        req = req.json(b);
+    let cache_key = route_cache_key(&account.base_url, upstream_path);
+    let cached = UPSTREAM_ROUTE_CACHE.lock().get(&cache_key).cloned();
+    let mut urls = upstream_url_candidates(&account.base_url, upstream_path);
+    if let Some(url) = cached {
+        urls.retain(|candidate| candidate != &url);
+        urls.insert(0, url);
     }
 
-    let resp = req.send().await.map_err(|e| format!("Upstream request failed: {e}"))?;
-    let status = resp.status().as_u16();
-    let content_type = resp
+    let client = &*UPSTREAM_CLIENT;
+    let mut last_missing = None;
+    for url in urls {
+        let mut req = match method {
+            "POST" => client.post(&url),
+            "DELETE" => client.delete(&url),
+            _ => client.get(&url),
+        };
+        req = req
+            .header("Authorization", format!("Bearer {}", account.api_key))
+            .header("Content-Type", "application/json");
+        if let Some(value) = body {
+            req = req.json(value);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|error| format!("Upstream request failed at {url}: {error}"))?;
+        let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/json")
+            .to_string();
+        let text = resp
+            .text()
+            .await
+            .map_err(|error| format!("Failed to read response from {url}: {error}"))?;
+        let parsed = serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text));
+
+        if route_is_missing(status, &parsed) {
+            UPSTREAM_ROUTE_CACHE.lock().remove(&cache_key);
+            last_missing = Some((status, content_type, parsed));
+            continue;
+        }
+        UPSTREAM_ROUTE_CACHE.lock().insert(cache_key.clone(), url);
+        return Ok((status, content_type, parsed));
+    }
+
+    Ok(last_missing.unwrap_or_else(|| {
+        (
+            404,
+            "application/json".into(),
+            json!({"error": {
+                "message": "No compatible OpenAI route was found for the configured provider URL.",
+                "type": "bridge_route_error"
+            }}),
+        )
+    }))
+}
+
+fn openai_messages_to_gemini(body: &Value) -> (Vec<Value>, Option<Value>) {
+    let mut contents = Vec::new();
+    let mut system_parts = Vec::new();
+    for message in body
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        let text = stringify_content(message.get("content").unwrap_or(&Value::Null));
+        if text.is_empty() {
+            continue;
+        }
+        if role == "system" || role == "developer" {
+            system_parts.push(json!({"text": text}));
+        } else {
+            contents.push(json!({
+                "role": if role == "assistant" { "model" } else { "user" },
+                "parts": [{"text": text}],
+            }));
+        }
+    }
+    let system = (!system_parts.is_empty()).then(|| json!({"parts": system_parts}));
+    (contents, system)
+}
+
+fn native_chat_request(protocol: AccountProvider, body: &Value) -> Value {
+    let model = body
+        .get("model")
+        .cloned()
+        .unwrap_or(Value::String(String::new()));
+    match protocol {
+        AccountProvider::Gemini => {
+            let (contents, system) = openai_messages_to_gemini(body);
+            let mut generation = serde_json::Map::new();
+            if let Some(value) = body
+                .get("max_completion_tokens")
+                .or_else(|| body.get("max_tokens"))
+            {
+                generation.insert("maxOutputTokens".into(), value.clone());
+            }
+            if let Some(value) = body.get("temperature") {
+                generation.insert("temperature".into(), value.clone());
+            }
+            if let Some(value) = body.get("top_p") {
+                generation.insert("topP".into(), value.clone());
+            }
+            if let Some(value) = body.get("stop") {
+                generation.insert("stopSequences".into(), value.clone());
+            }
+            let mut request = json!({"contents": contents, "generationConfig": generation});
+            if let Some(system) = system {
+                request["systemInstruction"] = system;
+            }
+            request
+        }
+        AccountProvider::Ollama => {
+            let mut options = serde_json::Map::new();
+            if let Some(value) = body
+                .get("max_completion_tokens")
+                .or_else(|| body.get("max_tokens"))
+            {
+                options.insert("num_predict".into(), value.clone());
+            }
+            if let Some(value) = body.get("temperature") {
+                options.insert("temperature".into(), value.clone());
+            }
+            if let Some(value) = body.get("top_p") {
+                options.insert("top_p".into(), value.clone());
+            }
+            if let Some(value) = body.get("seed") {
+                options.insert("seed".into(), value.clone());
+            }
+            if let Some(value) = body.get("stop") {
+                options.insert("stop".into(), value.clone());
+            }
+            json!({"model": model, "messages": body.get("messages").cloned().unwrap_or_else(|| json!([])), "stream": false, "options": options})
+        }
+        AccountProvider::Cohere => json!({
+            "model": model,
+            "messages": body.get("messages").cloned().unwrap_or_else(|| json!([])),
+            "stream": false,
+            "max_tokens": body.get("max_completion_tokens").or_else(|| body.get("max_tokens")).cloned(),
+            "temperature": body.get("temperature").cloned(),
+            "p": body.get("top_p").cloned(),
+            "seed": body.get("seed").cloned(),
+            "stop_sequences": body.get("stop").cloned(),
+        }),
+        _ => body.clone(),
+    }
+}
+
+fn native_chat_response(protocol: AccountProvider, raw: Value, model: &str) -> Value {
+    let content = match protocol {
+        AccountProvider::Gemini => raw
+            .pointer("/candidates/0/content/parts/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        AccountProvider::Ollama | AccountProvider::Cohere => raw
+            .pointer("/message/content")
+            .map(stringify_content)
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    json!({
+        "id": format!("chatcmpl_{}", Uuid::new_v4().as_simple()),
+        "object": "chat.completion",
+        "created": Utc::now().timestamp(),
+        "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "provider_response": raw,
+    })
+}
+
+async fn forward_native_chat_upstream(
+    account: &UpstreamAccount,
+    protocol: AccountProvider,
+    upstream_path: &str,
+    method: &str,
+    body: Option<&Value>,
+) -> Result<(u16, String, Value), String> {
+    if method != "POST" || upstream_path != "/v1/chat/completions" {
+        return Ok((
+            400,
+            "application/json".into(),
+            json!({"error": {
+                "message": "This native protocol adapter currently accepts OpenAI-compatible POST /v1/chat/completions requests.",
+                "type": "bridge_protocol_error"
+            }}),
+        ));
+    }
+    let incoming = body.unwrap_or(&Value::Null);
+    if is_truthy(incoming.get("stream")) {
+        return Ok((
+            400,
+            "application/json".into(),
+            json!({"error": {
+                "message": "Streaming through this native protocol adapter is not yet available; use the provider-native Playground or disable stream.",
+                "type": "bridge_protocol_error"
+            }}),
+        ));
+    }
+    let model = incoming.get("model").and_then(Value::as_str).unwrap_or("");
+    let request_body = native_chat_request(protocol, incoming);
+    let supplied = account.base_url.trim().trim_end_matches('/');
+    let url = match protocol {
+        AccountProvider::Gemini => {
+            let root = supplied.trim_end_matches("/v1beta");
+            format!(
+                "{root}/v1beta/models/{}:generateContent",
+                model.trim_start_matches("models/")
+            )
+        }
+        AccountProvider::Ollama => format!("{}/api/chat", supplied.trim_end_matches("/api")),
+        AccountProvider::Cohere => upstream_url(supplied, "/v2/chat"),
+        _ => return Err("Unsupported native protocol adapter".into()),
+    };
+    let mut request = UPSTREAM_CLIENT
+        .post(&url)
+        .header("content-type", "application/json");
+    request = match protocol {
+        AccountProvider::Gemini => request.header("x-goog-api-key", &account.api_key),
+        AccountProvider::Ollama => request,
+        _ => request.header("Authorization", format!("Bearer {}", account.api_key)),
+    };
+    let response = request
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|error| format!("Native upstream request failed at {url}: {error}"))?;
+    let status = response.status().as_u16();
+    let content_type = response
         .headers()
         .get("content-type")
-        .and_then(|v| v.to_str().ok())
+        .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
-
-    let text = resp.text().await.map_err(|e| format!("Failed to read response: {e}"))?;
-
-    // Non-JSON (or empty) upstream payloads stay raw text, exactly as the JS
-    // kept `text` when the content-type wasn't JSON.
-    let parsed: Value = if content_type.contains("application/json") && !text.is_empty() {
-        serde_json::from_str(&text).unwrap_or(Value::String(text))
-    } else {
-        Value::String(text)
-    };
-
-    Ok((status, content_type, parsed))
+    let text = response.text().await.unwrap_or_default();
+    let raw = serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text));
+    if !(200..300).contains(&status) {
+        return Ok((status, content_type, raw));
+    }
+    Ok((
+        status,
+        "application/json".into(),
+        native_chat_response(protocol, raw, model),
+    ))
 }
 
 /// Forward to a v0 provider.
@@ -1432,7 +2004,10 @@ async fn forward_v0_request(
             lines.push(format!("\nChat URL: {}", url.trim()));
         }
     }
-    if let Some(files) = raw.pointer("/latestVersion/files").and_then(|f| f.as_array()) {
+    if let Some(files) = raw
+        .pointer("/latestVersion/files")
+        .and_then(|f| f.as_array())
+    {
         let names: Vec<&str> = files
             .iter()
             .filter_map(|f| f.get("name").and_then(|n| n.as_str()))
@@ -1520,34 +2095,49 @@ async fn forward_anthropic_upstream(
         body.cloned().unwrap_or(json!({}))
     };
 
-    let url = format!("{}/v1/messages", account.base_url.trim_end_matches('/'));
+    let cache_key = route_cache_key(&account.base_url, "/v1/messages");
+    let cached = UPSTREAM_ROUTE_CACHE.lock().get(&cache_key).cloned();
+    let mut urls = upstream_url_candidates(&account.base_url, "/v1/messages");
+    if let Some(url) = cached {
+        urls.retain(|candidate| candidate != &url);
+        urls.insert(0, url);
+    }
+
     let client = &*UPSTREAM_CLIENT;
+    let mut last_missing = None;
+    for url in urls {
+        let resp = client
+            .post(&url)
+            .header("x-api-key", &account.api_key)
+            .header("Authorization", format!("Bearer {}", account.api_key))
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&forward_body)
+            .send()
+            .await
+            .map_err(|error| format!("Anthropic upstream request failed at {url}: {error}"))?;
+        let status = resp.status().as_u16();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/json")
+            .to_string();
+        let text = resp.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text));
+        if route_is_missing(status, &parsed) {
+            UPSTREAM_ROUTE_CACHE.lock().remove(&cache_key);
+            last_missing = Some((status, ct, parsed));
+            continue;
+        }
+        UPSTREAM_ROUTE_CACHE.lock().insert(cache_key.clone(), url);
+        return Ok((status, ct, parsed));
+    }
 
-    let resp = client
-        .post(&url)
-        .header("x-api-key", &account.api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&forward_body)
-        .send()
-        .await
-        .map_err(|e| format!("Anthropic upstream request failed: {e}"))?;
-
-    let status = resp.status().as_u16();
-    let ct = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
-    let text = resp.text().await.unwrap_or_default();
-    let parsed: Value = if ct.contains("application/json") && !text.is_empty() {
-        serde_json::from_str(&text).unwrap_or(Value::String(text))
-    } else {
-        Value::String(text)
-    };
-
-    Ok((status, ct, parsed))
+    Ok(last_missing.unwrap_or_else(|| (404, "application/json".into(), json!({"type": "error", "error": {
+        "type": "not_found_error",
+        "message": "No compatible Anthropic Messages route was found for the configured provider URL."
+    }}))))
 }
 
 /// Convert an OpenAI chat-completions request body into an Anthropic Messages
@@ -1578,7 +2168,8 @@ fn openai_to_anthropic_request(body: &Value, model: &str) -> Value {
                             for part in arr {
                                 if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                     system_parts.push(json!({"type": "text", "text": text}));
-                                } else if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                } else if part.get("type").and_then(|t| t.as_str()) == Some("text")
+                                {
                                     system_parts.push(part.clone());
                                 }
                             }
@@ -1615,9 +2206,14 @@ fn openai_to_anthropic_request(body: &Value, model: &str) -> Value {
                                 })),
                                 "image_url" => {
                                     // OpenAI image_url → Anthropic image source
-                                    let url = part.pointer("/image_url/url").and_then(|u| u.as_str())?;
-                                    if let Some(b64) = url.strip_prefix("data:").and_then(|d| d.split(',').nth(1)) {
-                                        let media_type = url.split(';').nth(1)
+                                    let url =
+                                        part.pointer("/image_url/url").and_then(|u| u.as_str())?;
+                                    if let Some(b64) =
+                                        url.strip_prefix("data:").and_then(|d| d.split(',').nth(1))
+                                    {
+                                        let media_type = url
+                                            .split(';')
+                                            .nth(1)
                                             .and_then(|s| {
                                                 let slash = s.find('/')?;
                                                 Some(s[slash + 1..].to_string())
@@ -1642,10 +2238,20 @@ fn openai_to_anthropic_request(body: &Value, model: &str) -> Value {
                                     }
                                 }
                                 "tool_call" => {
-                                    let call_id = part.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                                    let name = part.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
-                                    let args_str = part.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()).unwrap_or("{}");
-                                    let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                                    let call_id =
+                                        part.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                                    let name = part
+                                        .get("function")
+                                        .and_then(|f| f.get("name"))
+                                        .and_then(|n| n.as_str())
+                                        .unwrap_or("");
+                                    let args_str = part
+                                        .get("function")
+                                        .and_then(|f| f.get("arguments"))
+                                        .and_then(|a| a.as_str())
+                                        .unwrap_or("{}");
+                                    let input: Value =
+                                        serde_json::from_str(args_str).unwrap_or(json!({}));
                                     Some(json!({
                                         "type": "tool_use",
                                         "id": call_id,
@@ -1654,8 +2260,14 @@ fn openai_to_anthropic_request(body: &Value, model: &str) -> Value {
                                     }))
                                 }
                                 "tool_result" => {
-                                    let call_id = part.get("tool_call_id").and_then(|i| i.as_str()).unwrap_or("");
-                                    let content_val = part.get("content").cloned().unwrap_or(Value::String(String::new()));
+                                    let call_id = part
+                                        .get("tool_call_id")
+                                        .and_then(|i| i.as_str())
+                                        .unwrap_or("");
+                                    let content_val = part
+                                        .get("content")
+                                        .cloned()
+                                        .unwrap_or(Value::String(String::new()));
                                     Some(json!({
                                         "type": "tool_result",
                                         "tool_use_id": call_id,
@@ -1760,8 +2372,14 @@ async fn run_responses_agent_loop(
     let mut stream_tool_items: Vec<StreamToolItem> = Vec::new();
 
     for _turn in 0..MAX_AGENT_TURNS {
-        let (status, ct, resp_body) =
-            forward_request(state, "/v1/responses", "/v1/chat/completions", "POST", Some(&chat_body)).await;
+        let (status, ct, resp_body) = forward_request(
+            state,
+            "/v1/responses",
+            "/v1/chat/completions",
+            "POST",
+            Some(&chat_body),
+        )
+        .await;
 
         let is_json = ct.contains("application/json");
         let is_success = (200..300).contains(&status);
@@ -1817,7 +2435,10 @@ async fn run_responses_agent_loop(
                 .pointer("/function/name")
                 .and_then(|n| n.as_str())
                 .unwrap_or("");
-            let Some(tc_id) = tc.get("id").and_then(|i| i.as_str()).filter(|id| !id.is_empty())
+            let Some(tc_id) = tc
+                .get("id")
+                .and_then(|i| i.as_str())
+                .filter(|id| !id.is_empty())
             else {
                 continue;
             };
@@ -1904,38 +2525,45 @@ fn sanitize_item_id(id: &str) -> String {
 type ServerState = Arc<AppState>;
 
 async fn health_handler(AxumState(state): AxumState<ServerState>) -> Json<Value> {
-    let config = state.config.read().await;
-    let stats = state.stats.read().await;
     Json(json!({
         "ok": true,
-        "upstreamBaseUrl": config.upstream_base_url,
-        "localBaseUrl": stats.local_base_url,
-        "modelCount": config.models.len(),
+        "service": "sparkly-api",
+        "endpoint": format!("http://localhost:{DEFAULT_LOCAL_PORT}"),
+        "uptimeMs": state.started_at.elapsed().as_millis() as u64,
     }))
 }
 
-async fn stats_handler(AxumState(state): AxumState<ServerState>) -> Json<BridgeStats> {
+async fn stats_handler(
+    AxumState(state): AxumState<ServerState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Err((status, message, error_type)) = check_auth(&state, &headers).await {
+        return json_error(status, &message, &error_type);
+    }
     let mut stats = state.stats.read().await.clone();
     stats.uptime_ms = state.started_at.elapsed().as_millis() as u64;
     stats.active_model_count = state.config.read().await.models.len();
-    // `getStats` reads `logs[0].timestamp` (bridgeServer.ts:97) — the newest
-    // entry, since logs are stored newest-first.
     stats.last_request_at = state
         .logs
         .read()
         .await
         .first()
         .map(|entry| entry.timestamp.clone());
-    Json(stats)
+    Json(stats).into_response()
 }
 
-async fn logs_handler(AxumState(state): AxumState<ServerState>) -> Json<Value> {
+async fn logs_handler(
+    AxumState(state): AxumState<ServerState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Err((status, message, error_type)) = check_auth(&state, &headers).await {
+        return json_error(status, &message, &error_type);
+    }
     let logs = state.logs.read().await.clone();
-    Json(json!({"data": logs}))
+    Json(json!({"data": logs})).into_response()
 }
 
-/// `/v1` is a 404 with express's default `{ detail }` body, not the OpenAI
-/// error envelope (bridgeServer.ts:145-147).
+/// `/v1` intentionally returns a compact not-found response.
 async fn v1_index_handler() -> Response {
     (StatusCode::NOT_FOUND, Json(json!({"detail": "Not Found"}))).into_response()
 }
@@ -2095,8 +2723,14 @@ async fn chat_completions_handler(
         );
     }
 
-    let (status, ct, resp_body) =
-        forward_request(&state, "/v1/chat/completions", "/v1/chat/completions", "POST", Some(&body)).await;
+    let (status, ct, resp_body) = forward_request(
+        &state,
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+        "POST",
+        Some(&body),
+    )
+    .await;
 
     if status >= 400 {
         if let Some(m) = model {
@@ -2182,7 +2816,10 @@ fn anthropic_to_openai(body: &Value, config: &BridgeConfig) -> Value {
             // role:"user" message so they are not silently dropped.
             if role == "user" {
                 if let Some(Value::Array(blocks)) = content {
-                    if blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result")) {
+                    if blocks
+                        .iter()
+                        .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                    {
                         // H2: extract text from tool_result content (string or array of blocks).
                         fn tool_result_text(block: &Value) -> String {
                             match block.get("content") {
@@ -2190,7 +2827,9 @@ fn anthropic_to_openai(body: &Value, config: &BridgeConfig) -> Value {
                                 Some(Value::Array(parts)) => parts
                                     .iter()
                                     .map(|p| match p.get("type").and_then(|t| t.as_str()) {
-                                        Some("text") => p.get("text").and_then(|v| v.as_str()).unwrap_or(""),
+                                        Some("text") => {
+                                            p.get("text").and_then(|v| v.as_str()).unwrap_or("")
+                                        }
                                         Some("image") => "[Image]",
                                         _ => p.get("text").and_then(|v| v.as_str()).unwrap_or(""),
                                     })
@@ -2204,8 +2843,14 @@ fn anthropic_to_openai(body: &Value, config: &BridgeConfig) -> Value {
                         let mut user_parts: Vec<&Value> = Vec::new();
                         for block in blocks {
                             if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
-                                let tool_use_id = block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
-                                let is_error = block.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let tool_use_id = block
+                                    .get("tool_use_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let is_error = block
+                                    .get("is_error")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
                                 let result_text = tool_result_text(block);
                                 let content_str = if is_error {
                                     format!("Error: {result_text}")
@@ -2231,7 +2876,10 @@ fn anthropic_to_openai(body: &Value, config: &BridgeConfig) -> Value {
             // Handle tool_use blocks in assistant messages → OpenAI tool_calls format
             if role == "assistant" {
                 if let Some(Value::Array(blocks)) = content {
-                    if blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use")) {
+                    if blocks
+                        .iter()
+                        .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                    {
                         let text_parts: Vec<String> = blocks
                             .iter()
                             .filter_map(|b| {
@@ -2249,7 +2897,8 @@ fn anthropic_to_openai(body: &Value, config: &BridgeConfig) -> Value {
                             .map(|b| {
                                 let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
                                 let input = b.get("input").cloned().unwrap_or(json!({}));
-                                let arguments = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+                                let arguments = serde_json::to_string(&input)
+                                    .unwrap_or_else(|_| "{}".to_string());
                                 json!({
                                     "id": b.get("id").and_then(|v| v.as_str()).unwrap_or(""),
                                     "type": "function",
@@ -2382,7 +3031,11 @@ fn anthropic_to_openai(body: &Value, config: &BridgeConfig) -> Value {
     // use budget_tokens as a hint for max_completion_tokens.
     if thinking_enabled {
         chat_body["reasoning_effort"] = json!("high");
-        if let Some(budget) = body.get("thinking").and_then(|t| t.get("budget_tokens")).and_then(|v| v.as_u64()) {
+        if let Some(budget) = body
+            .get("thinking")
+            .and_then(|t| t.get("budget_tokens"))
+            .and_then(|v| v.as_u64())
+        {
             chat_body["max_completion_tokens"] = json!(budget);
         }
     }
@@ -2496,9 +3149,7 @@ fn openai_to_anthropic(chat_resp: &Value, model: &str) -> Value {
         .to_string();
 
     // Map finish_reason → stop_reason.
-    let finish_reason = choice
-        .get("finish_reason")
-        .and_then(|f| f.as_str());
+    let finish_reason = choice.get("finish_reason").and_then(|f| f.as_str());
     let (stop_reason, stop_sequence) = match finish_reason {
         Some("stop") => {
             // If upstream included a stop_sequence, pass it through.
@@ -2578,10 +3229,13 @@ fn openai_to_anthropic(chat_resp: &Value, model: &str) -> Value {
                 .and_then(|f| f.get("arguments"))
                 .and_then(|a| a.as_str())
                 .unwrap_or("{}");
-            let input: Value =
-                serde_json::from_str(arguments_str).unwrap_or(json!({}));
+            let input: Value = serde_json::from_str(arguments_str).unwrap_or(json!({}));
             // Preserve the original OpenAI call_xxx ID for round-trip fidelity.
-            let tool_use_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("toolu_fallback").to_string();
+            let tool_use_id = tc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("toolu_fallback")
+                .to_string();
             content.push(json!({
                 "type": "tool_use",
                 "id": tool_use_id,
@@ -2778,16 +3432,13 @@ fn openai_sse_to_anthropic_sse(sse_text: &str, model: &str) -> String {
         .unwrap_or(0);
 
     // Extract stop_sequence from the last chunk if present.
-    let stop_sequence_from_chunk = chunks
-        .iter()
-        .rev()
-        .find_map(|c| {
-            c.pointer("/choices/0/stop_sequence")
-                .or_else(|| c.get("stop_sequence"))
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-        });
+    let stop_sequence_from_chunk = chunks.iter().rev().find_map(|c| {
+        c.pointer("/choices/0/stop_sequence")
+            .or_else(|| c.get("stop_sequence"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    });
 
     let mut events = String::new();
 
@@ -2999,8 +3650,7 @@ fn openai_sse_to_anthropic_sse(sse_text: &str, model: &str) -> String {
             while chunk_end < args_bytes.len() && (args_bytes[chunk_end] & 0xC0) == 0x80 {
                 chunk_end += 1;
             }
-            let partial_json = std::str::from_utf8(&args_bytes[pos..chunk_end])
-                .unwrap_or("");
+            let partial_json = std::str::from_utf8(&args_bytes[pos..chunk_end]).unwrap_or("");
             if !partial_json.is_empty() {
                 events.push_str(&format!(
                     "event: content_block_delta\ndata: {}\n\n",
@@ -3031,13 +3681,20 @@ fn openai_sse_to_anthropic_sse(sse_text: &str, model: &str) -> String {
 
     // ── message_delta ──────────────────────────────────────────────
     let (stop_reason, stop_seq) = match last_finish_reason.as_deref() {
-        Some("stop") => ("end_turn", stop_sequence_from_chunk.map(Value::String).unwrap_or(Value::Null)),
+        Some("stop") => (
+            "end_turn",
+            stop_sequence_from_chunk
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        ),
         Some("length") => ("max_tokens", Value::Null),
         Some("tool_calls") => ("tool_use", Value::Null),
         Some("content_filter") => ("end_turn", Value::Null),
         Some("stop_sequence") => (
             "stop_sequence",
-            stop_sequence_from_chunk.map(Value::String).unwrap_or(Value::Null),
+            stop_sequence_from_chunk
+                .map(Value::String)
+                .unwrap_or(Value::Null),
         ),
         _ => ("end_turn", Value::Null),
     };
@@ -3102,7 +3759,11 @@ async fn anthropic_messages_handler(
     let wants_stream = is_truthy(body.get("stream"));
 
     // Validate that messages array exists and is non-empty.
-    if !body.get("messages").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty()) {
+    if !body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty())
+    {
         return anthropic_error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -3138,10 +3799,12 @@ async fn anthropic_messages_handler(
             );
         }
 
-        let is_anthropic = config
-            .accounts
-            .iter()
-            .any(|a| a.id == config.active_account_id && a.provider == AccountProvider::Anthropic);
+        let is_anthropic = config.accounts.iter().any(|a| {
+            a.id == config.active_account_id
+                && (a.provider == AccountProvider::Anthropic
+                    || (a.provider == AccountProvider::Auto
+                        && a.detected_protocol == Some(AccountProvider::Anthropic)))
+        });
         if is_anthropic {
             (body.clone(), true)
         } else {
@@ -3160,8 +3823,14 @@ async fn anthropic_messages_handler(
     } else {
         "/v1/chat/completions"
     };
-    let (status, _ct, resp_body) =
-        forward_request(&state, "/v1/messages", upstream_path, "POST", Some(&chat_body)).await;
+    let (status, _ct, resp_body) = forward_request(
+        &state,
+        "/v1/messages",
+        upstream_path,
+        "POST",
+        Some(&chat_body),
+    )
+    .await;
 
     // ── Error path (all upstream failures) ─────────────────────────
     if status >= 400 {
@@ -3220,10 +3889,7 @@ async fn anthropic_messages_handler(
                     axum::http::header::CONTENT_TYPE,
                     "text/event-stream".to_string(),
                 ),
-                (
-                    axum::http::header::CONNECTION,
-                    "keep-alive".to_string(),
-                ),
+                (axum::http::header::CONNECTION, "keep-alive".to_string()),
             ],
             anthropic_sse,
         )
@@ -3262,7 +3928,8 @@ async fn responses_handler(
                 "bridge_config_error",
             );
         }
-        let mut body = map_responses_request_to_chat(&request_body, &config, &*SESSIONS.read().await);
+        let mut body =
+            map_responses_request_to_chat(&request_body, &config, &*SESSIONS.read().await);
         apply_model_defaults(&mut body, &config);
         body
     };
@@ -3369,7 +4036,12 @@ fn build_upstream_response(status: u16, content_type: &str, body: &Value) -> Res
     } else {
         let body_str = body.to_string();
         let text = body.as_str().unwrap_or(&body_str);
-        (sc, [(axum::http::header::CONTENT_TYPE, content_type)], text.to_string()).into_response()
+        (
+            sc,
+            [(axum::http::header::CONTENT_TYPE, content_type)],
+            text.to_string(),
+        )
+            .into_response()
     }
 }
 
@@ -3382,7 +4054,10 @@ fn build_upstream_response(status: u16, content_type: &str, body: &Value) -> Res
 /// and each tool call/output pair gets its own `output_index` (the JS reused
 /// `index + 1` and `index + 2`, so consecutive tool calls collided).
 fn build_sse_response(response_body: &Value, tool_items: &[StreamToolItem]) -> Response {
-    let id = response_body.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let id = response_body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let object = response_body
         .get("object")
         .and_then(|v| v.as_str())
@@ -3589,7 +4264,10 @@ fn build_sse_response(response_body: &Value, tool_items: &[StreamToolItem]) -> R
     (
         StatusCode::OK,
         [
-            (axum::http::header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/event-stream; charset=utf-8",
+            ),
             (axum::http::header::CACHE_CONTROL, "no-cache, no-transform"),
             (axum::http::header::CONNECTION, "keep-alive"),
         ],
@@ -3608,20 +4286,36 @@ fn sse_event(event_type: &str, seq: &mut u64, mut data: Value) -> String {
 
 // ─── Server lifecycle ───────────────────────────────────────────────────────
 
-/// Signals the supervisor that the current listener should be torn down and a
-/// fresh one bound from the latest config. Safe to call when no server is up.
-pub async fn request_rebind() {
-    if let Some(tx) = SHUTDOWN_TX.lock().take() {
-        let _ = tx.send(());
+/// Restart the fixed listener and wait until the supervisor has successfully
+/// rebound `127.0.0.1:48231`. Commands must not report success merely because
+/// they sent a shutdown signal.
+pub async fn request_rebind() -> Result<(), String> {
+    if SERVER_STOPPING.load(Ordering::Acquire) {
+        return Err("Sparkly API is shutting down.".to_string());
     }
-}
+    let previous_generation = SERVER_GENERATION.load(Ordering::Acquire);
+    let shutdown = SHUTDOWN_TX
+        .lock()
+        .take()
+        .ok_or_else(|| "The local API listener is not currently running.".to_string())?;
+    let _ = shutdown.send(());
 
-/// Helper to check if a port is already in use by attempting a TCP connection to both
-/// IPv4 loopback (127.0.0.1) and IPv6 loopback (::1).
-async fn is_port_in_use(port: u16) -> bool {
-    let ipv4_in_use = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await.is_ok();
-    let ipv6_in_use = tokio::net::TcpStream::connect(format!("[::1]:{port}")).await.is_ok();
-    ipv4_in_use || ipv6_in_use
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if SERVER_STOPPING.load(Ordering::Acquire) {
+            return Err("Sparkly API is shutting down.".to_string());
+        }
+        if SERVER_GENERATION.load(Ordering::Acquire) > previous_generation {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(
+                "Timed out while restarting http://localhost:48231. Check whether another process owns port 48231."
+                    .to_string(),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// Bind the listener once and serve until a rebind is requested.
@@ -3629,10 +4323,7 @@ async fn is_port_in_use(port: u16) -> bool {
 /// Returns `Ok(())` on a graceful shutdown (rebind requested) so the supervisor
 /// knows to loop; returns `Err` only when binding or serving genuinely failed.
 async fn serve_once(state: Arc<AppState>) -> anyhow::Result<()> {
-    let (enable_cors, port) = {
-        let config = state.config.read().await;
-        (config.enable_cors, config.local_port)
-    };
+    let enable_cors = state.config.read().await.enable_cors;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     *SHUTDOWN_TX.lock() = Some(shutdown_tx);
@@ -3659,30 +4350,15 @@ async fn serve_once(state: Arc<AppState>) -> anyhow::Result<()> {
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .with_state(state.clone());
 
-    // Try the configured port; fall back to the next deterministic port (48232
-    // by default) instead of a random OS-assigned one. In dev the Vite server
-    // owns the primary port, so the bridge takes port+1 and Vite proxies /v1,
-    // /health, /stats, /logs to it — keeping one client base URL (48231).
-    let port_occupied = is_port_in_use(port).await;
+    let listener = TcpListener::bind(("127.0.0.1", DEFAULT_LOCAL_PORT))
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "Cannot start Sparkly API at http://localhost:{DEFAULT_LOCAL_PORT}: {error}. Close the other process using port {DEFAULT_LOCAL_PORT} and restart Sparkly API."
+            )
+        })?;
 
-    let listener = if port_occupied {
-        let fallback = port.saturating_add(1);
-        tracing::warn!("Port {port} is detected in use on loopback; binding port {fallback} instead");
-        TcpListener::bind(format!("127.0.0.1:{fallback}")).await?
-    } else {
-        match TcpListener::bind(format!("127.0.0.1:{port}")).await {
-            Ok(l) => l,
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                let fallback = port.saturating_add(1);
-                tracing::warn!("Port {port} is in use; binding port {fallback} instead");
-                TcpListener::bind(format!("127.0.0.1:{fallback}")).await?
-            }
-            Err(e) => return Err(e.into()),
-        }
-    };
-
-    let addr = listener.local_addr()?;
-    let local_base_url = format!("http://localhost:{}", addr.port());
+    let local_base_url = format!("http://localhost:{DEFAULT_LOCAL_PORT}");
 
     {
         let mut stats = state.stats.write().await;
@@ -3690,6 +4366,7 @@ async fn serve_once(state: Arc<AppState>) -> anyhow::Result<()> {
         stats.server_running = true;
     }
 
+    SERVER_GENERATION.fetch_add(1, Ordering::Release);
     tracing::info!("Bridge server listening on {local_base_url}");
 
     let result = axum::serve(listener, app)
@@ -3706,21 +4383,113 @@ async fn serve_once(state: Arc<AppState>) -> anyhow::Result<()> {
     result.map_err(|e| anyhow::anyhow!("Bridge server error: {e}"))
 }
 
-/// Spawn the supervising task that keeps the bridge listening for the whole
-/// process lifetime.
+/// Stop the listener supervisor during application exit.
 ///
-/// `serve_once` returns whenever a rebind is requested (config changed, port
-/// changed, explicit restart); the loop then re-binds from the current config.
-/// Without this loop a single restart would leave the port dead for the rest of
-/// the session.
+/// Unlike a normal rebind, this terminal flag prevents graceful shutdown from
+/// racing into a fresh bind while Tauri is tearing down.
+///
+///
+///
+///
+///
+pub fn shutdown_supervisor() {
+    SERVER_STOPPING.store(true, Ordering::Release);
+    if let Some(shutdown) = SHUTDOWN_TX.lock().take() {
+        let _ = shutdown.send(());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_models_from_response, route_is_missing, upstream_url_candidates};
+    use serde_json::json;
+
+    #[test]
+    fn route_candidates_cover_versioned_and_router_shapes_without_duplicates() {
+        assert_eq!(
+            upstream_url_candidates("http://localhost:20128/v1", "/v1/chat/completions"),
+            vec![
+                "http://localhost:20128/v1/chat/completions",
+                "http://localhost:20128/api/v1/chat/completions",
+            ]
+        );
+        assert_eq!(
+            upstream_url_candidates("http://localhost:20128", "/v1/responses"),
+            vec![
+                "http://localhost:20128/v1/responses",
+                "http://localhost:20128/api/v1/responses",
+            ]
+        );
+    }
+
+    #[test]
+    fn route_detection_never_replays_real_model_or_authentication_errors() {
+        assert!(!route_is_missing(
+            404,
+            &json!({"error": {"code": "model_not_found", "message": "unknown model"}})
+        ));
+        assert!(!route_is_missing(
+            404,
+            &json!({"error": {"code": "authentication_error", "message": "missing key"}})
+        ));
+        assert!(route_is_missing(
+            404,
+            &json!({"error": {"message": "Cannot POST /v1/responses"}})
+        ));
+        assert!(route_is_missing(405, &json!({})));
+    }
+
+    #[test]
+    fn model_catalog_extraction_supports_openai_and_router_payloads() {
+        assert_eq!(
+            extract_models_from_response(&json!({
+                "models": [
+                    {"alias": "qwen3.5-plus", "fullModel": "qwen/qwen3.5-plus"},
+                    {"alias": "qwen3.5-plus"},
+                    {"model": "claude-sonnet-4-6"}
+                ]
+            })),
+            vec!["qwen/qwen3.5-plus", "qwen3.5-plus", "claude-sonnet-4-6"]
+        );
+        assert_eq!(
+            extract_models_from_response(&json!({"data": [{"id": "gpt-5.4"}]})),
+            vec!["gpt-5.4"]
+        );
+        assert_eq!(
+            extract_models_from_response(&json!([{"id": "together/model"}])),
+            vec!["together/model"]
+        );
+        assert_eq!(
+            extract_models_from_response(
+                &json!({"models": [{"name": "command-r"}, {"model": "llama3.2"}]})
+            ),
+            vec!["command-r", "llama3.2"]
+        );
+    }
+}
+
+/// Spawn the supervising task that keeps the bridge listening for the process
+/// lifetime, including explicit rebinds to the same fixed endpoint.
 pub fn spawn_supervisor(state: Arc<AppState>) {
+    SERVER_STOPPING.store(false, Ordering::Release);
     tauri::async_runtime::spawn(async move {
         loop {
+            if SERVER_STOPPING.load(Ordering::Acquire) {
+                break;
+            }
             if let Err(error) = serve_once(state.clone()).await {
                 tracing::error!("Bridge listener failed: {error}");
-                // Bind failures are usually transient (port still releasing).
-                // Back off briefly so a hard failure can't spin the CPU.
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                {
+                    let mut stats = state.stats.write().await;
+                    stats.local_base_url = format!("http://localhost:{DEFAULT_LOCAL_PORT}");
+                    stats.server_running = false;
+                }
+                if SERVER_STOPPING.load(Ordering::Acquire) {
+                    break;
+                }
+                // A fixed endpoint must never silently migrate. Retry slowly so
+                // a temporarily releasing socket can recover without spinning.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
         }
     });

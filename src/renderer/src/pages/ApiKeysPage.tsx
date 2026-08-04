@@ -187,7 +187,7 @@ function ApiKeysPageComponent({
                 disabled={saving || !activeAccount}
               >
                 <Icon icon="solar:refresh-bold" className={`btn-icon ${saving ? "animate-spin" : ""}`} />
-                Scan models
+                {saving ? "Scanning provider..." : "Scan models"}
               </button>
             </div>
           </div>

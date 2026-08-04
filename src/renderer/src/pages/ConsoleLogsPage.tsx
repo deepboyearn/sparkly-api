@@ -17,7 +17,7 @@ const LEVEL_COLORS: Record<LogLevel, string> = {
 const LEVEL_ICONS: Record<LogLevel, string> = {
   success: "solar:check-circle-bold-duotone",
   error: "solar:close-circle-bold-duotone",
-  warning: "solar:alarm-bell-bold-duotone",
+  warning: "solar:bell-bing-bold-duotone",
   info: "solar:info-circle-bold-duotone",
 };
 

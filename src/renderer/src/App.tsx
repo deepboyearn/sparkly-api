@@ -4,16 +4,18 @@ import { Icon } from "@iconify/react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { ChartOptions } from "chart.js";
 import { Line } from "react-chartjs-2";
-import "./chartSetup";
+
 import { V0_BASE_URL, V0_MODELS } from "../../shared/types";
 import type { AccountProvider, AccountUsageTag, BridgeConfig, BridgeState, PlaygroundModelsResult, PlaygroundTestResult } from "../../shared/types";
-import { emptyState, ensureBridgeMethod, getDayPoints, getHourlyPoints, getRequestPoints, getUsageRecords, groupKeyStats, groupModelStats, normalizeBridgeState, normalizeOpenAiBaseUrl } from "./appState";
+import { emptyState, ensureBridgeMethod, getDayPoints, getHourlyPoints, getRequestPoints, getUsageRecords, groupKeyStats, groupModelStats, normalizeBridgeState } from "./appState";
 import { logUserAction } from "./consoleLogStore";
 import { Header } from "./components/Header";
 import { Sidebar } from "./components/Sidebar";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import type { SectionKey } from "./components/Sidebar";
 import { Onboarding } from "./components/Onboarding";
+
+const OVERVIEW_RESET_MS = 5 * 60 * 60 * 1000;
 const AccountsPage = React.lazy(() => import("./pages/AccountsPage"));
 const ApiKeysPage = React.lazy(() => import("./pages/ApiKeysPage"));
 const PlaygroundPage = React.lazy(() => import("./pages/PlaygroundPage"));
@@ -22,21 +24,13 @@ const MITMPage = React.lazy(() => import("./pages/MITMPage"));
 const ConsoleLogsPage = React.lazy(() => import("./pages/ConsoleLogsPage"));
 
 const accountProviderOptions: Array<{ value: AccountProvider; label: string; description: string }> = [
-  {
-    value: "openai-compatible",
-    label: "Custom / OpenAI Compatible",
-    description: "Any gateway with OpenAI style /v1 endpoints",
-  },
-  {
-    value: "v0",
-    label: "v0 Platform API",
-    description: "Use v0 chat generation through api.v0.dev",
-  },
-  {
-    value: "anthropic",
-    label: "Anthropic",
-    description: "Use Claude models through the native Anthropic Messages API",
-  },
+  { value: "auto", label: "Auto detect", description: "Probe read-only catalogs, then persist the resolved protocol" },
+  { value: "openai-compatible", label: "OpenAI compatible", description: "OpenAI Chat, Responses, and compatible gateways" },
+  { value: "anthropic", label: "Anthropic", description: "Native Anthropic Models and Messages APIs" },
+  { value: "gemini", label: "Google Gemini", description: "Gemini models and generateContent" },
+  { value: "ollama", label: "Ollama", description: "Local Ollama tags and chat APIs" },
+  { value: "cohere", label: "Cohere", description: "Cohere models and v2 Chat" },
+  { value: "v0", label: "v0 Platform API", description: "Use v0 chat generation through api.v0.dev" },
 ];
 
 export default function App() {
@@ -46,6 +40,12 @@ export default function App() {
   const [saving, setSaving] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [actionNotice, setActionNotice] = useState<{ kind: "progress" | "success" | "error"; message: string } | null>(null);
+  useEffect(() => {
+    if (!actionNotice) return;
+    const timer = window.setTimeout(() => setActionNotice(null), 5_000);
+    return () => window.clearTimeout(timer);
+  }, [actionNotice]);
   const [activeSection, setActiveSection] = useState<SectionKey>("overview");
   const [requestTab, setRequestTab] = useState<"By Hour" | "By Day">("By Hour");
   const [tokenTab, setTokenTab] = useState<"By Hour" | "By Day">("By Hour");
@@ -60,7 +60,7 @@ export default function App() {
   const [editingKeyId, setEditingKeyId] = useState<string | null>(null);
   const [editingKeyName, setEditingKeyName] = useState("");
   const [accountName, setAccountName] = useState("");
-  const [accountProvider, setAccountProvider] = useState<AccountProvider>("openai-compatible");
+  const [accountProvider, setAccountProvider] = useState<AccountProvider>("auto");
   const [accountBaseUrl, setAccountBaseUrl] = useState("https://api.bluesminds.com");
   const [accountApiKey, setAccountApiKey] = useState("");
   const [editingAccountId, setEditingAccountId] = useState<string | null>(null);
@@ -79,16 +79,16 @@ export default function App() {
   const [playgroundModelsResult, setPlaygroundModelsResult] = useState<PlaygroundModelsResult | null>(null);
   const [playgroundModelsLoading, setPlaygroundModelsLoading] = useState(false);
   const [playgroundLoading, setPlaygroundLoading] = useState(false);
-  // Overview page: persistent token counter with 5-hour auto-reset
-  const OVERVIEW_RESET_MS = 5 * 60 * 60 * 1000;
-  const [overviewTokens, setOverviewTokens] = useState(0);
-  const [overviewWindowStart, setOverviewWindowStart] = useState<number>(Date.now());
+  // Overview page: persist only the five-hour observation-window boundary.
+  const [overviewWindowStart, setOverviewWindowStart] = useState(
+    () => Date.now() - OVERVIEW_RESET_MS,
+  );
 
   const onToggleCollapse = useCallback(() => setIsSidebarCollapsed(c => !c), []);
-  const onNavigate = useCallback((s: SectionKey) => setActiveSection(s), []);
+  const onNavigate = useCallback((section: SectionKey) => setActiveSection(section), []);
 
-  // Exclude model probe requests — defined early so effects below can use it
-  const realLogs = useMemo(() => state.logs.filter(l => l.requestType !== 'model_probe'), [state.logs]);
+  // Exclude model probe requests so the dashboard reports client traffic separately.
+  const realLogs = useMemo(() => state.logs.filter(log => log.requestType !== 'model_probe'), [state.logs]);
 
   const usageFilteredLogs = useMemo(() => {
     if (timeFilter === 'all') return realLogs;
@@ -100,68 +100,22 @@ export default function App() {
   }, [realLogs, timeFilter]);
 
   useEffect(() => {
-    const resetOverviewTokens = () => {
-      const fresh = { tokens: 0, lastReset: Date.now(), processedIds: [] };
-      localStorage.setItem('overview_token_usage', JSON.stringify(fresh));
-      setOverviewTokens(0);
-      setOverviewWindowStart(fresh.lastReset);
+    const storageKey = 'overview_window_start';
+    const refreshWindow = () => {
+      const stored = Number(localStorage.getItem(storageKey));
+      const now = Date.now();
+      const windowStart = Number.isFinite(stored) && stored > 0 && now - stored <= OVERVIEW_RESET_MS
+        ? stored
+        : now;
+      if (windowStart !== stored) localStorage.setItem(storageKey, String(windowStart));
+      setOverviewWindowStart(windowStart);
     };
-    const loadOverviewTokens = () => {
-      const raw = localStorage.getItem('overview_token_usage');
-      if (!raw) { resetOverviewTokens(); return; }
-      try {
-        const parsed = JSON.parse(raw);
-        if (Date.now() - (parsed.lastReset || 0) > OVERVIEW_RESET_MS) {
-          resetOverviewTokens();
-        } else {
-          setOverviewTokens(parsed.tokens || 0);
-          setOverviewWindowStart(parsed.lastReset || Date.now());
-        }
-      } catch { resetOverviewTokens(); }
-    };
-    loadOverviewTokens();
-    const timer = setInterval(loadOverviewTokens, 60 * 1000);
+
+    localStorage.removeItem('overview_token_usage');
+    refreshWindow();
+    const timer = setInterval(refreshWindow, 60 * 1000);
     return () => clearInterval(timer);
   }, []);
-
-  // Sync realLogs tokens into the overview persistent counter
-  useEffect(() => {
-    if (!realLogs || realLogs.length === 0) return;
-    const raw = localStorage.getItem('overview_token_usage');
-    let currentTokens = 0;
-    let currentLastReset = Date.now();
-    let processedIds: string[] = [];
-    if (raw) {
-      try {
-        const parsed = JSON.parse(raw);
-        if (Date.now() - (parsed.lastReset || 0) > OVERVIEW_RESET_MS) {
-          const fresh = { tokens: 0, lastReset: Date.now(), processedIds: [] };
-          localStorage.setItem('overview_token_usage', JSON.stringify(fresh));
-          setOverviewTokens(0);
-          setOverviewWindowStart(fresh.lastReset);
-          return;
-        }
-        currentTokens = parsed.tokens || 0;
-        currentLastReset = parsed.lastReset || Date.now();
-        processedIds = parsed.processedIds || [];
-      } catch { return; }
-    }
-    let newTokens = currentTokens;
-    let updated = false;
-    realLogs.forEach(log => {
-      if (!processedIds.includes(log.id)) {
-        processedIds.push(log.id);
-        newTokens += Math.max(60, (log.durationMs || 0) * 3);
-        updated = true;
-      }
-    });
-    if (updated) {
-      if (processedIds.length > 1000) processedIds.splice(0, processedIds.length - 1000);
-      localStorage.setItem('overview_token_usage', JSON.stringify({ tokens: newTokens, lastReset: currentLastReset, processedIds }));
-      setOverviewTokens(newTokens);
-      setOverviewWindowStart(currentLastReset);
-    }
-  }, [realLogs]);
 
   const overviewFilteredLogs = useMemo(() => {
     return realLogs.filter(log => new Date(log.timestamp).getTime() >= overviewWindowStart);
@@ -189,8 +143,8 @@ export default function App() {
   const isUsage = activeSection === "usage";
   const isAccounts = activeSection === "accounts";
   const isPlayground = activeSection === "playground";
-  const isMITM = activeSection === "mitm";
-  const isConsoleLogs = activeSection === "consoleLogs";
+
+
 
   // Overview analytics: Only show last 5 hours
   const requestPoints = useMemo(() => (
@@ -326,9 +280,7 @@ export default function App() {
       },
     },
   }), [overviewHasTraffic, overviewMaxPoint]);
-  const clientBaseUrl = import.meta.env.DEV
-    ? `${window.location.origin}/v1`
-    : `${state.stats.localBaseUrl}/v1`;
+  const clientBaseUrl = "http://localhost:48231/v1";
   // Auto-reset logs older than 30 days
   useEffect(() => {
     const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
@@ -558,12 +510,6 @@ export default function App() {
   const keyStats = useMemo(() => (
     isUsage ? groupKeyStats(usageFilteredLogs, state.clientKeys) : []
   ), [isUsage, state.clientKeys, usageFilteredLogs]);
-  const totalTokenEstimate = useMemo(() => (
-    isUsage ? usageFilteredLogs.reduce((total, entry) => total + Math.max(60, entry.durationMs * 3), 0) : 0
-  ), [isUsage, usageFilteredLogs]);
-  const totalCostEstimate = useMemo(() => (
-    isUsage ? usageFilteredLogs.reduce((total, entry) => total + Math.max(0.001, entry.durationMs / 100000), 0) : 0
-  ), [isUsage, usageFilteredLogs]);
   const rpm = useMemo(() => (
     isUsage ? usageFilteredLogs.filter((entry) => Date.now() - new Date(entry.timestamp).getTime() <= 60_000).length : 0
   ), [isUsage, usageFilteredLogs]);
@@ -575,28 +521,30 @@ export default function App() {
     const normalized = normalizeBridgeState(nextState);
     setState(normalized);
     setForm(normalized.config);
-    setPlaygroundAvailableModels(normalized.config.models);
     return normalized;
+  }
+
+  function syncPlaygroundToAccount(nextState: BridgeState, accountId?: string) {
+    const account = nextState.config.accounts.find((candidate) => candidate.id === (accountId ?? nextState.config.activeAccountId))
+      ?? nextState.config.accounts[0];
+    const nextModels = account?.models ?? nextState.config.models;
+    const nextModel = account?.selectedModel || nextModels[0] || "";
+    setPlaygroundAvailableModels(nextModels);
+    setPlaygroundBaseUrl(account?.baseUrl ?? nextState.config.upstreamBaseUrl);
+    setPlaygroundApiKey(account?.apiKey ?? nextState.config.apiKey);
+    setPlaygroundModel(nextModel);
+    setPlaygroundModelQuery(nextModel);
   }
 
   async function refresh() {
     if (!window.bridgeApi) {
-      console.warn("Electron bridgeApi not found. If you are running in a browser, some features will be disabled.");
+      console.warn("The native Tauri API is unavailable. Sparkly API must run inside its desktop application.");
       setLoading(false);
       return;
     }
     try {
       const nextState = applyLoadedBridgeState(await window.bridgeApi.getState());
-      // Only set playground from active account if one exists
-      const activeAccount = nextState.config.accounts.find(a => a.id === nextState.config.activeAccountId) || nextState.config.accounts[0];
-      if (activeAccount) {
-        setPlaygroundBaseUrl(activeAccount.baseUrl);
-        setPlaygroundApiKey(activeAccount.apiKey);
-      } else {
-        setPlaygroundBaseUrl("");
-        setPlaygroundApiKey("");
-      }
-      setPlaygroundModel(nextState.config.selectedModel);
+      syncPlaygroundToAccount(nextState);
 
       if (loading) {
         setActiveSection("overview");
@@ -629,10 +577,15 @@ export default function App() {
     }
 
     const intervalId = window.setInterval(() => {
-      window.bridgeApi?.getState()
-        ?.then((nextState) => {
+      window.bridgeApi?.getRuntimeSnapshot()
+        ?.then((snapshot) => {
           startTransition(() => {
-            setState((prev) => normalizeBridgeState(nextState, prev));
+            setState((prev) => normalizeBridgeState({
+              config: prev.config,
+              clientKeys: prev.clientKeys,
+              stats: snapshot.stats,
+              logs: snapshot.logs,
+            }, prev));
           });
         })
         ?.catch(() => undefined);
@@ -644,10 +597,14 @@ export default function App() {
   async function onSave(optionalForm?: BridgeConfig) {
     setSaving(true);
     setError(null);
+    setActionNotice({ kind: "progress", message: "Saving configuration..." });
     try {
       await persistConfig(optionalForm || form);
+      setActionNotice({ kind: "success", message: "Configuration saved." });
     } catch (saveError) {
-      setError(saveError instanceof Error ? saveError.message : "Failed to save configuration");
+      const message = saveError instanceof Error ? saveError.message : "Failed to save configuration";
+      setError(message);
+      setActionNotice({ kind: "error", message });
     } finally {
       setSaving(false);
     }
@@ -656,12 +613,15 @@ export default function App() {
   async function onRestart() {
     setSaving(true);
     setError(null);
+    setActionNotice({ kind: "progress", message: "Restarting the local bridge on localhost:48231..." });
     try {
-      if (!window.bridgeApi) return;
-      applyLoadedBridgeState(await window.bridgeApi.restartServer());
+      applyLoadedBridgeState(await ensureBridgeMethod("restartServer")());
       logUserAction("Server restarted");
+      setActionNotice({ kind: "success", message: "Local bridge restarted on localhost:48231." });
     } catch (restartError) {
-      setError(restartError instanceof Error ? restartError.message : "Failed to restart local server");
+      const message = restartError instanceof Error ? restartError.message : "Failed to restart local server";
+      setError(message);
+      setActionNotice({ kind: "error", message });
     } finally {
       setSaving(false);
     }
@@ -670,15 +630,17 @@ export default function App() {
   async function onCreateKey() {
     setSaving(true);
     setError(null);
+    setActionNotice({ kind: "progress", message: "Creating client key..." });
     try {
-      if (!window.bridgeApi) return;
-      const nextState = normalizeBridgeState(await window.bridgeApi.createClientKey({ name: newKeyName }));
-      setState(nextState);
+      const nextState = applyLoadedBridgeState(await ensureBridgeMethod("createClientKey")({ name: newKeyName }));
       setNewKeyName("");
       setIsCreateKeyOpen(false);
       logUserAction(`Client key created: ${newKeyName}`);
+      setActionNotice({ kind: "success", message: `Client key ${nextState.clientKeys[0]?.name ?? "created"} is ready.` });
     } catch (createError) {
-      setError(createError instanceof Error ? createError.message : "Failed to create client key");
+      const message = createError instanceof Error ? createError.message : "Failed to create client key";
+      setError(message);
+      setActionNotice({ kind: "error", message });
     } finally {
       setSaving(false);
     }
@@ -688,18 +650,20 @@ export default function App() {
     if (!editingKeyId) return;
     setSaving(true);
     setError(null);
+    setActionNotice({ kind: "progress", message: "Updating client key..." });
     try {
-      if (!window.bridgeApi) return;
-      const nextState = normalizeBridgeState(await window.bridgeApi.updateClientKey({
+      applyLoadedBridgeState(await ensureBridgeMethod("updateClientKey")({
         id: editingKeyId,
         name: editingKeyName,
       }));
-      setState(nextState);
       setIsEditKeyOpen(false);
       setEditingKeyId(null);
       setEditingKeyName("");
+      setActionNotice({ kind: "success", message: "Client key updated." });
     } catch (updateError) {
-      setError(updateError instanceof Error ? updateError.message : "Failed to update client key");
+      const message = updateError instanceof Error ? updateError.message : "Failed to update client key";
+      setError(message);
+      setActionNotice({ kind: "error", message });
     } finally {
       setSaving(false);
     }
@@ -708,17 +672,19 @@ export default function App() {
   async function onDeleteKey(id: string) {
     setSaving(true);
     setError(null);
+    setActionNotice({ kind: "progress", message: "Deleting client key..." });
     try {
-      if (!window.bridgeApi) return;
-      const nextState = normalizeBridgeState(await window.bridgeApi.deleteClientKey({ id }));
-      setState(nextState);
+      applyLoadedBridgeState(await ensureBridgeMethod("deleteClientKey")({ id }));
       if (editingKeyId === id) {
         setIsEditKeyOpen(false);
         setEditingKeyId(null);
         setEditingKeyName("");
       }
+      setActionNotice({ kind: "success", message: "Client key deleted." });
     } catch (deleteError) {
-      setError(deleteError instanceof Error ? deleteError.message : "Failed to delete client key");
+      const message = deleteError instanceof Error ? deleteError.message : "Failed to delete client key";
+      setError(message);
+      setActionNotice({ kind: "error", message });
     } finally {
       setSaving(false);
     }
@@ -733,6 +699,7 @@ export default function App() {
   async function onSaveAccount() {
     setSaving(true);
     setError(null);
+    setActionNotice({ kind: "progress", message: editingAccountId ? "Updating provider account..." : "Adding provider account..." });
     try {
       const result = editingAccountId
         ? await ensureBridgeMethod("updateAccount")({
@@ -756,13 +723,16 @@ export default function App() {
       setIsAccountModalOpen(false);
       setEditingAccountId(null);
       setAccountName("");
-      setAccountProvider("openai-compatible");
+      setAccountProvider("auto");
       setAccountBaseUrl("https://api.bluesminds.com");
       setAccountApiKey("");
       setAccountUsageTags(["coding"]);
       logUserAction(editingAccountId ? `Account updated: ${accountName}` : `Account added: ${accountName}`);
+      setActionNotice({ kind: "success", message: editingAccountId ? `Provider account ${accountName} updated.` : `Provider account ${accountName} added.` });
     } catch (accountError) {
-      setError(accountError instanceof Error ? accountError.message : "Failed to save account");
+      const message = accountError instanceof Error ? accountError.message : "Failed to save account";
+      setError(message);
+      setActionNotice({ kind: "error", message });
     } finally {
       setSaving(false);
     }
@@ -771,11 +741,15 @@ export default function App() {
   async function onDeleteAccount(id: string) {
     setSaving(true);
     setError(null);
+    setActionNotice({ kind: "progress", message: "Deleting provider account..." });
     try {
       applyLoadedBridgeState(await ensureBridgeMethod("deleteAccount")({ id }));
       logUserAction("Account deleted");
+      setActionNotice({ kind: "success", message: "Provider account deleted." });
     } catch (accountError) {
-      setError(accountError instanceof Error ? accountError.message : "Failed to delete account");
+      const message = accountError instanceof Error ? accountError.message : "Failed to delete account";
+      setError(message);
+      setActionNotice({ kind: "error", message });
     } finally {
       setSaving(false);
     }
@@ -784,10 +758,16 @@ export default function App() {
   async function onSelectAccount(id: string) {
     setSaving(true);
     setError(null);
+    setActionNotice({ kind: "progress", message: "Switching active provider account..." });
     try {
-      applyLoadedBridgeState(await ensureBridgeMethod("selectAccount")({ id }));
+      const nextState = applyLoadedBridgeState(await ensureBridgeMethod("selectAccount")({ id }));
+      syncPlaygroundToAccount(nextState, id);
+      const activeAccount = nextState.config.accounts.find((account) => account.id === nextState.config.activeAccountId);
+      setActionNotice({ kind: "success", message: `${activeAccount?.name ?? "Provider account"} is now active with ${(activeAccount?.models.length ?? 0).toLocaleString()} models.` });
     } catch (accountError) {
-      setError(accountError instanceof Error ? accountError.message : "Failed to select account");
+      const message = accountError instanceof Error ? accountError.message : "Failed to select account";
+      setError(message);
+      setActionNotice({ kind: "error", message });
     } finally {
       setSaving(false);
     }
@@ -796,7 +776,7 @@ export default function App() {
   function openCreateAccountModal() {
     setEditingAccountId(null);
     setAccountName("");
-    setAccountProvider("openai-compatible");
+    setAccountProvider("auto");
     setAccountBaseUrl("https://api.bluesminds.com");
     setAccountApiKey("");
     setAccountUsageTags(["coding"]);
@@ -806,7 +786,7 @@ export default function App() {
   function openEditAccountModal(account: BridgeState["config"]["accounts"][number]) {
     setEditingAccountId(account.id);
     setAccountName(account.name);
-    setAccountProvider(account.provider ?? "openai-compatible");
+    setAccountProvider(account.provider ?? "auto");
     setAccountBaseUrl(account.baseUrl);
     setAccountApiKey(account.apiKey);
     setAccountUsageTags(account.usageTags);
@@ -827,83 +807,105 @@ export default function App() {
       return;
     }
 
-    if (provider === "anthropic") {
-      setAccountName((current) => current.trim() ? current : "Anthropic");
-      setAccountBaseUrl("https://api.anthropic.com");
+    const defaults: Partial<Record<AccountProvider, { name: string; baseUrl: string }>> = {
+      anthropic: { name: "Anthropic", baseUrl: "https://api.anthropic.com" },
+      gemini: { name: "Gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta" },
+      ollama: { name: "Ollama", baseUrl: "http://localhost:11434" },
+      cohere: { name: "Cohere", baseUrl: "https://api.cohere.com" },
+    };
+    const selectedDefault = defaults[provider];
+    if (selectedDefault) {
+      setAccountName((current) => current.trim() ? current : selectedDefault.name);
+      setAccountBaseUrl(selectedDefault.baseUrl);
       setAccountUsageTags(["coding"]);
       return;
     }
 
     setAccountBaseUrl((current) =>
-      current === V0_BASE_URL || current === "https://api.anthropic.com" ? "" : current
+      [V0_BASE_URL, "https://api.anthropic.com", "https://generativelanguage.googleapis.com/v1beta", "http://localhost:11434", "https://api.cohere.com"].includes(current)
+        ? ""
+        : current
     );
   }
 
   async function onRefreshActiveAccountModels() {
     setSaving(true);
     setError(null);
+    setActionNotice({ kind: "progress", message: "Scanning all compatible model catalog endpoints..." });
     try {
-      applyLoadedBridgeState(await ensureBridgeMethod("refreshActiveAccountModels")());
+      const nextState = applyLoadedBridgeState(await ensureBridgeMethod("refreshActiveAccountModels")());
+      const activeAccount = nextState.config.accounts.find((account) => account.id === nextState.config.activeAccountId);
+      const refreshedModels = activeAccount?.models ?? nextState.config.models;
+      setApiKeyModelQuery("");
+      setPlaygroundAvailableModels(refreshedModels);
+      setPlaygroundModel((currentModel) => {
+        const nextModel = currentModel && refreshedModels.includes(currentModel)
+          ? currentModel
+          : activeAccount?.selectedModel || refreshedModels[0] || "";
+        setPlaygroundModelQuery(nextModel);
+        return nextModel;
+      });
+      setActionNotice({ kind: "success", message: `Loaded ${(activeAccount?.models.length ?? nextState.config.models.length).toLocaleString()} models from ${activeAccount?.name ?? "the active provider"}.` });
     } catch (accountError) {
-      setError(accountError instanceof Error ? accountError.message : "Failed to refresh active account models");
+      const message = accountError instanceof Error ? accountError.message : "Failed to refresh active account models";
+      setError(message);
+      setActionNotice({ kind: "error", message });
     } finally {
       setSaving(false);
     }
   }
 
-  async function onRunPlayground() {
+  async function onRunPlayground(input: import("../../shared/types").PlaygroundTestInput) {
     setPlaygroundLoading(true);
     setError(null);
+    setActionNotice({ kind: "progress", message: `Running Playground request with ${input.model}...` });
     try {
-      const result = await ensureBridgeMethod("playgroundTest")({
-        baseUrl: normalizeOpenAiBaseUrl(playgroundBaseUrl),
-        apiKey: playgroundApiKey,
-        model: playgroundModel,
-        message: playgroundMessage,
-        systemPrompt: playgroundSystemPrompt,
-      });
+      const result = await ensureBridgeMethod("playgroundTest")(input);
       setPlaygroundResult(result);
+      setActionNotice({
+        kind: result.ok ? "success" : "error",
+        message: result.ok ? `Playground request completed with ${result.model || input.model}.` : result.error || `Playground request failed with HTTP ${result.status}.`,
+      });
     } catch (playgroundError) {
-      setError(playgroundError instanceof Error ? playgroundError.message : "Playground request failed");
+      const message = playgroundError instanceof Error ? playgroundError.message : "Playground request failed";
+      setError(message);
+      setActionNotice({ kind: "error", message });
     } finally {
       setPlaygroundLoading(false);
     }
   }
 
-  async function onLoadPlaygroundModels() {
+  async function onLoadPlaygroundModels(protocol: Exclude<AccountProvider, "auto" | "v0">) {
     setPlaygroundModelsLoading(true);
     setError(null);
+    setActionNotice({ kind: "progress", message: "Loading models for this Playground endpoint..." });
     try {
       const result = await ensureBridgeMethod("playgroundLoadModels")({
-        baseUrl: normalizeOpenAiBaseUrl(playgroundBaseUrl),
+        baseUrl: playgroundBaseUrl.trim().replace(/\/+$/, ""),
         apiKey: playgroundApiKey,
+        protocol,
       });
       setPlaygroundModelsResult(result);
       if (result.ok) {
         setPlaygroundAvailableModels(result.models);
-        localStorage.setItem("playground_cached_models", JSON.stringify(result.models));
-        if (!playgroundModel && result.models[0]) {
-          setPlaygroundModel(result.models[0]);
-          setPlaygroundModelQuery(result.models[0]);
-        }
+        setPlaygroundModel((currentModel) => {
+          if (currentModel && result.models.includes(currentModel)) return currentModel;
+          const nextModel = currentModel || result.models[0] || "";
+          if (nextModel !== currentModel) setPlaygroundModelQuery(nextModel);
+          return nextModel;
+        });
+        setActionNotice({ kind: "success", message: `Loaded ${result.models.length.toLocaleString()} transient Playground models. Save or scan the account to persist its catalog.` });
+      } else {
+        setActionNotice({ kind: "error", message: result.error || `Model discovery failed with HTTP ${result.status}.` });
       }
     } catch (modelsError) {
-      setError(modelsError instanceof Error ? modelsError.message : "Failed to load models");
+      const message = modelsError instanceof Error ? modelsError.message : "Failed to load models";
+      setError(message);
+      setActionNotice({ kind: "error", message });
     } finally {
       setPlaygroundModelsLoading(false);
     }
   }
-
-  useEffect(() => {
-    const cached = localStorage.getItem("playground_cached_models");
-    if (cached) {
-      try {
-        setPlaygroundAvailableModels(JSON.parse(cached));
-      } catch (e) {
-        console.error("Failed to parse cached models", e);
-      }
-    }
-  }, []);
 
   // Auto-focus modal overlays when opened
   useEffect(() => {
@@ -919,23 +921,15 @@ export default function App() {
   async function onResetUsage() {
     if (!confirm("Are you sure you want to reset all usage data? This cannot be undone.")) return;
     setSaving(true);
-    try {
-      if (!window.bridgeApi) return;
-      applyLoadedBridgeState(await window.bridgeApi.resetUsage({ confirm: true }));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to reset usage data");
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function onOpenElectron() {
-    setSaving(true);
     setError(null);
+    setActionNotice({ kind: "progress", message: "Resetting usage data..." });
     try {
-      await ensureBridgeMethod("openElectron")();
+      applyLoadedBridgeState(await ensureBridgeMethod("resetUsage")({ confirm: true }));
+      setActionNotice({ kind: "success", message: "Usage data reset." });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to open desktop window");
+      const message = err instanceof Error ? err.message : "Failed to reset usage data";
+      setError(message);
+      setActionNotice({ kind: "error", message });
     } finally {
       setSaving(false);
     }
@@ -973,12 +967,18 @@ export default function App() {
             playgroundLoading={playgroundLoading}
             onRestart={onRestart}
             onReset={activeSection === "usage" ? onResetUsage : undefined}
-            onOpenElectron={activeSection === "overview" ? onOpenElectron : undefined}
-            onPrimaryAction={isUsage ? refresh : isAccounts ? openCreateAccountModal : isPlayground ? onRunPlayground : onSave}
+            onPrimaryAction={isUsage ? refresh : isAccounts ? openCreateAccountModal : isPlayground ? () => setActionNotice({ kind: "progress", message: "Configure the Playground workbench, then use Execute request." }) : onSave}
           />
 
           <main className="" style={{ flex: 1, overflowY: 'auto', padding: '10px 20px' }}>
-            {error ? <Alert status="danger" title={error} className="mb-4 border border-red-500/20 bg-red-500/10 text-white" /> : null}
+            <div className="interaction-status-region" role="status" aria-live="polite" aria-atomic="true">
+              {actionNotice ? (
+                <Alert status={actionNotice.kind === "error" ? "danger" : actionNotice.kind === "success" ? "success" : "info"} title={actionNotice.message} className="interaction-status-alert" />
+              ) : null}
+            </div>
+            {error && error !== actionNotice?.message ? (
+              <Alert status="danger" title={error} className="mb-4 border border-red-500/20 bg-red-500/10 text-white" />
+            ) : null}
 
             <ErrorBoundary>
             <Suspense fallback={<div style={{ padding: 40, color: '#888' }}>Loading...</div>}>
@@ -1031,8 +1031,8 @@ export default function App() {
                                 <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 512 512"><path fill="currentColor" d="M256 117c-65.2 0-124.2 11.6-166.13 29.7c-20.95 9.1-37.57 19.8-48.57 31.1S25 200.4 25 212s5.3 22.9 16.3 34.2s27.62 22 48.57 31.1C131.8 295.4 190.8 307 256 307s124.2-11.6 166.1-29.7c21-9.1 37.6-19.8 48.6-31.1S487 223.6 487 212s-5.3-22.9-16.3-34.2s-27.6-22-48.6-31.1C380.2 128.6 321.2 117 256 117M25 255.1v50.2c0 6.3 5.3 17.6 16.3 28.9s27.62 22 48.57 31.1C131.8 383.4 190.8 395 256 395s124.2-11.6 166.1-29.7c21-9.1 37.6-19.8 48.6-31.1s16.3-22.6 16.3-28.9v-50.2c-1.1 1.3-2.2 2.5-3.4 3.7c-13.3 13.6-31.8 25.3-54.3 35c-45 19.5-106 31.2-173.3 31.2s-128.3-11.7-173.28-31.2c-22.49-9.7-41.01-21.4-54.3-35c-1.19-1.2-2.32-2.5-3.42-3.7" strokeWidth="13" stroke="currentColor" /></svg>
                               </div>
                             </div>
-                            <strong>{overviewTokens}</strong>
-                            <p>Cached: 0 Reasoning: {Math.round(overviewTokens * 0.094)}</p>
+                            <strong>0</strong>
+                            <p>Provider-reported usage is not available yet.</p>
 
                           </Card.Content>
                         </Card>
@@ -1042,13 +1042,13 @@ export default function App() {
                         <Card className="metric-card">
                           <Card.Content className="metric-card-content">
                             <div className="metric-head">
-                              <span className="metric-title">Rate Limit</span>
+                              <span className="metric-title">Current traffic</span>
                               <div className="metric-icon-circle green">
                                 <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"><path fill="currentColor" d="M17 3.34a10 10 0 1 1-14.995 8.984L2 12l.005-.324A10 10 0 0 1 17 3.34M12 6a1 1 0 0 0-.993.883L11 7v5l.009.131a1 1 0 0 0 .197.477l.087.1l3 3l.094.082a1 1 0 0 0 1.226 0l.094-.083l.083-.094a1 1 0 0 0 0-1.226l-.083-.094L13 11.585V7l-.007-.117A1 1 0 0 0 12 6" strokeWidth="0.5" stroke="currentColor" /></svg>
                               </div>
                             </div>
-                            <strong>10 RPM</strong>
-                            <p>{overviewCurrentRpm.toFixed(1)} RPM current</p>
+                            <strong>{overviewCurrentRpm.toFixed(1)} RPM</strong>
+                            <p>No artificial local limit is being reported.</p>
 
                           </Card.Content>
                         </Card>
@@ -1145,13 +1145,13 @@ export default function App() {
                         <div className="settings-content-wrap split-layout" style={{ gap: '24px' }}>
                           <div className="settings-column" style={{ flex: 1 }}>
                             <div className="section-heading" style={{ marginBottom: '12px' }}>
-                              <h3 style={{ fontSize: '14px', opacity: 0.8 }}>Local Port settings</h3>
+                              <h3 style={{ fontSize: '14px', opacity: 0.8 }}>Local API endpoint</h3>
                             </div>
                             <div className="settings-sub-card">
-                              <label className="inline-setting-row no-bg" style={{ margin: 0, border: 'none', background: 'transparent' }}>
-                                <span>Local port change</span>
-                                <input type="number" value={form.localPort} onChange={(e) => setForm({ ...form, localPort: Number(e.target.value) })} />
-                              </label>
+                              <div className="inline-setting-row no-bg" style={{ margin: 0, border: 'none', background: 'transparent' }}>
+                                <span>Permanent client URL</span>
+                                <code>http://localhost:48231</code>
+                              </div>
                             </div>
                           </div>
 
@@ -1208,9 +1208,7 @@ export default function App() {
                       setUsageMode={setUsageMode}
                       state={state}
                       realLogs={realLogs}
-                      totalTokenEstimate={totalTokenEstimate}
                       rpm={rpm}
-                      totalCostEstimate={totalCostEstimate}
                       usageRequestChartData={usageRequestChartData}
                       usageRequestChartOptions={usageRequestChartOptions}
                       usageTokenChartData={usageTokenChartData}
@@ -1236,7 +1234,6 @@ export default function App() {
                   >
                     <AccountsPage
                       state={state}
-                      form={form}
                       saving={saving}
                       onRefreshActiveAccountModels={onRefreshActiveAccountModels}
                       openEditAccountModal={openEditAccountModal}
@@ -1284,7 +1281,7 @@ export default function App() {
                     exit={{ opacity: 0, y: -15 }}
                     transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
                   >
-                    <MITMPage state={state} />
+                    <MITMPage accounts={state.config.accounts} activeAccountId={state.config.activeAccountId} onSelectAccount={onSelectAccount} />
                   </motion.div>
                 ) : activeSection === "consoleLogs" ? (
                   <motion.div

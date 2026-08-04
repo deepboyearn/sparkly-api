@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { logIpcCall, logSystem } from './consoleLogStore';
-import type { BridgeState, PlaygroundModelsResult, PlaygroundTestResult } from '../../shared/types';
+import type { BridgeState, PlaygroundModelsResult, PlaygroundTestResult, RuntimeSnapshot } from '../../shared/types';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function timedInvoke<T = unknown>(method: string, args?: Record<string, unknown>, silent = false): Promise<T> {
@@ -19,6 +19,16 @@ function timedInvoke<T = unknown>(method: string, args?: Record<string, unknown>
   return result;
 }
 
+export const SPARKLY_RUNTIME_IDENTITY = 'sparkly-api:com.sparklyapi.sparklyapi:v1';
+
+export async function verifySparklyRuntime() {
+  try {
+    return await invoke<string>('sparkly_runtime_identity') === SPARKLY_RUNTIME_IDENTITY;
+  } catch {
+    return false;
+  }
+}
+
 export function installTauriBridgeApi() {
   if (window.bridgeApi) return;
 
@@ -26,6 +36,7 @@ export function installTauriBridgeApi() {
 
   window.bridgeApi = {
     getState: () => timedInvoke<BridgeState>('get_state', undefined, true),
+    getRuntimeSnapshot: () => timedInvoke<RuntimeSnapshot>('get_runtime_snapshot', undefined, true),
     saveConfig: (config) => timedInvoke<BridgeState>('save_config', { config }),
     restartServer: () => timedInvoke<BridgeState>('restart_server'),
     createClientKey: (input) => timedInvoke<BridgeState>('create_client_key', { input }),
@@ -39,12 +50,10 @@ export function installTauriBridgeApi() {
     resetUsage: (input) => timedInvoke<BridgeState>('reset_usage', { input }),
     playgroundLoadModels: (input) => timedInvoke<PlaygroundModelsResult>('playground_load_models', { input }),
     playgroundTest: (input) => timedInvoke<PlaygroundTestResult>('playground_test', { input }),
-    openElectron: async () => {},
     openExternal: async (url: string) => { window.open(url, '_blank', 'noopener,noreferrer'); },
-    openDevTools: async () => {},
     trustMitmCert: () => timedInvoke<boolean>('trust_mitm_cert'),
     untrustMitmCert: () => timedInvoke<boolean>('untrust_mitm_cert'),
-    getMitmCertStatus: () => timedInvoke<{ exists: boolean; trusted: boolean }>('get_mitm_cert_status'),
+    getMitmCertStatus: () => timedInvoke<{ exists: boolean; trusted: boolean; running: boolean }>('get_mitm_cert_status'),
     startMitmServer: () => timedInvoke<boolean>('start_mitm_server_cmd'),
     stopMitmServer: () => timedInvoke<boolean>('stop_mitm_server_cmd'),
     updateMitmModelMappings: (mappings: Record<string, string>) => timedInvoke<void>('update_mitm_model_mappings', { mappings }),
