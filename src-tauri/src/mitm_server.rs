@@ -201,19 +201,29 @@ pub async fn start_mitm_server(
                         let upstream = upstream_url.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
+                            let mut tcp_stream = tcp_stream;
+                            let peer_label = peer_addr.to_string();
+                            let request_id = format!("mitm-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+
                             match tokio::time::timeout(
-                                std::time::Duration::from_secs(10),
-                                acceptor.accept(tcp_stream),
+                                std::time::Duration::from_secs(5),
+                                accept_connect_tunnel(&mut tcp_stream, &peer_label, &request_id),
                             ).await {
-                                Ok(Ok(tls_stream)) => {
-                                    handle_connection(tls_stream, &mappings, &upstream).await;
-                                }
+                                Ok(Ok(is_connect)) => tracing::info!("[MITM][{request_id}] TCP connection accepted from {peer_label} (connect={is_connect})"),
                                 Ok(Err(error)) => {
-                                    tracing::debug!("TLS accept error from {peer_addr}: {error}");
+                                    tracing::warn!("[MITM][{request_id}] CONNECT handshake failed from {peer_label}: {error}");
+                                    return;
                                 }
                                 Err(_) => {
-                                    tracing::debug!("TLS handshake timed out for {peer_addr}");
+                                    tracing::warn!("[MITM][{request_id}] CONNECT handshake timed out from {peer_label}");
+                                    return;
                                 }
+                            }
+
+                            match tokio::time::timeout(std::time::Duration::from_secs(10), acceptor.accept(tcp_stream)).await {
+                                Ok(Ok(tls_stream)) => handle_connection(tls_stream, &mappings, &upstream, &request_id).await,
+                                Ok(Err(error)) => tracing::warn!("[MITM][{request_id}] TLS accept error from {peer_label}: {error}"),
+                                Err(_) => tracing::warn!("[MITM][{request_id}] TLS handshake timed out for {peer_label}"),
                             }
                         });
                     }
@@ -230,6 +240,38 @@ pub async fn start_mitm_server(
     Ok(())
 }
 
+async fn accept_connect_tunnel(
+    stream: &mut tokio::net::TcpStream,
+    peer: &str,
+    request_id: &str,
+) -> Result<bool> {
+    let mut prefix = [0_u8; 7];
+    let read = stream.peek(&mut prefix).await?;
+    if read < prefix.len() || &prefix != b"CONNECT" {
+        return Ok(false);
+    }
+
+    let mut header = Vec::with_capacity(256);
+    loop {
+        let byte = stream.read_u8().await?;
+        header.push(byte);
+        if header.len() >= 4 && header[header.len() - 4..] == *b"\r\n\r\n" {
+            break;
+        }
+        if header.len() > MAX_MITM_HEADER_BYTES {
+            anyhow::bail!("CONNECT header too large");
+        }
+    }
+
+    let text = String::from_utf8_lossy(&header);
+    let authority = text.lines().next().unwrap_or("CONNECT unknown:443");
+    tracing::info!("[MITM][{request_id}] CONNECT tunnel requested by {peer}: {authority}");
+    stream
+        .write_all(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: Sparkly-MITM\r\n\r\n")
+        .await?;
+    Ok(true)
+}
+
 fn is_streaming_body(body: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()
@@ -241,6 +283,7 @@ async fn handle_connection<S>(
     mut stream: S,
     model_mappings: &tokio::sync::RwLock<HashMap<String, String>>,
     upstream_url: &str,
+    request_id: &str,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -328,43 +371,75 @@ async fn handle_connection<S>(
     }
 
     // Rewrite model name based on mappings
+    let original_model: Option<String> = if !body.is_empty() {
+        serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from))
+    } else {
+        None
+    };
+    tracing::info!(
+        "[MITM][{request_id}] Incoming request: {method} {path} | body={}B | source_model={:?}",
+        body.len(),
+        original_model
+    );
+
     let body = if !body.is_empty() {
         if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body) {
-            if let Some(model) = parsed
-                .get("model")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-            {
+            if let Some(ref model) = original_model {
                 let mappings = model_mappings.read().await;
-                if let Some(mapped) = mappings.get(&model) {
+                tracing::info!(
+                    "[MITM] Incoming request: {method} {path} | source model: '{model}' | {} mappings loaded",
+                    mappings.len()
+                );
+                if let Some(mapped) = mappings.get(model) {
                     let mapped = mapped.clone();
                     drop(mappings);
-                    parsed["model"] = serde_json::Value::String(mapped.clone());
-                    tracing::debug!("Rewrote model: {model} → {mapped}");
+                    tracing::info!("[MITM] ✅ Model rewrite: '{model}' → '{mapped}'");
+                    parsed["model"] = serde_json::Value::String(mapped);
+                } else {
+                    tracing::warn!(
+                        "[MITM] ⚠️  No mapping found for model '{model}'. Available mappings: {:?}. Request will pass through with original model name.",
+                        mappings.keys().collect::<Vec<_>>()
+                    );
+                    drop(mappings);
                 }
+            } else {
+                tracing::info!(
+                    "[MITM] Incoming request: {method} {path} | no 'model' field in body"
+                );
             }
             serde_json::to_vec(&parsed).unwrap_or(body)
         } else {
+            tracing::info!("[MITM] Incoming request: {method} {path} | body is not JSON");
             body
         }
     } else {
+        tracing::info!("[MITM] Incoming request: {method} {path} | empty body");
         body
     };
 
-    let upstream_url = format!("{upstream_url}{path}");
+    let upstream_full_url = format!("{upstream_url}/v1/chat/completions");
+    tracing::info!("[MITM][{request_id}] Forwarding mapped request → POST {upstream_full_url}");
 
     let mut req_builder = match method {
-        "POST" => MITM_HTTP_CLIENT.post(&upstream_url),
-        "PUT" => MITM_HTTP_CLIENT.put(&upstream_url),
-        "PATCH" => MITM_HTTP_CLIENT.patch(&upstream_url),
-        "DELETE" => MITM_HTTP_CLIENT.delete(&upstream_url),
-        "HEAD" => MITM_HTTP_CLIENT.head(&upstream_url),
-        _ => MITM_HTTP_CLIENT.get(&upstream_url),
+        "POST" => MITM_HTTP_CLIENT.post(&upstream_full_url),
+        "PUT" => MITM_HTTP_CLIENT.put(&upstream_full_url),
+        "PATCH" => MITM_HTTP_CLIENT.patch(&upstream_full_url),
+        "DELETE" => MITM_HTTP_CLIENT.delete(&upstream_full_url),
+        "HEAD" => MITM_HTTP_CLIENT.head(&upstream_full_url),
+        _ => MITM_HTTP_CLIENT.get(&upstream_full_url),
     };
 
     for (k, v) in &headers {
         req_builder = req_builder.header(k.as_str(), v.as_str());
     }
+    // The bridge is a local protected API. These headers identify traffic that
+    // arrived through the local MITM and allow it to authenticate internally.
+    req_builder = req_builder
+        .header("x-sparkly-mitm", "1")
+        .header("x-sparkly-source", "antigravity")
+        .header("x-sparkly-request-id", request_id);
 
     if !body.is_empty() {
         req_builder = req_builder.body(body);
@@ -373,6 +448,7 @@ async fn handle_connection<S>(
     let mut resp = match req_builder.send().await {
         Ok(r) => r,
         Err(e) => {
+            tracing::error!("[MITM][{request_id}] Upstream request FAILED: POST {upstream_full_url} | error: {e}");
             let err_body = format!(
                 "{{\"error\":{{\"message\":\"{}\",\"type\":\"upstream_error\"}}}}",
                 e
@@ -386,6 +462,15 @@ async fn handle_connection<S>(
     };
 
     let status = resp.status().as_u16();
+    if status >= 400 {
+        tracing::warn!(
+            "[MITM][{request_id}] Upstream returned HTTP {status} for POST {upstream_full_url}"
+        );
+    } else {
+        tracing::info!(
+            "[MITM][{request_id}] Upstream response: HTTP {status} for POST {upstream_full_url}"
+        );
+    }
 
     let mut resp_headers = Vec::new();
     for (k, v) in resp.headers() {

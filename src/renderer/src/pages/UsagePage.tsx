@@ -62,8 +62,7 @@ const UsageModeSlidingTabs = ({ activeMode, onChange }: { activeMode: "statistic
         style={{
           transform: activeMode === "statistics" ? "translateX(0%)" : "translateX(100%)",
           width: 'calc(50% - 4px)',
-          background: 'linear-gradient(135deg, #f4b400 0%, #ff8c00 100%)',
-          boxShadow: '0 4px 15px rgba(244, 180, 0, 0.2)'
+          background: 'linear-gradient(135deg, #f4b400 0%, #ff8c00 100%)'
         }}
       />
       <button

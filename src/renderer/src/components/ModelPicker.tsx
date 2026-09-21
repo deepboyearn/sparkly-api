@@ -11,6 +11,7 @@ export function ModelPicker({
   query,
   onQueryChange,
   onSelect,
+  onClear,
   footerLeft,
   footerRight,
   popover = false,
@@ -21,6 +22,7 @@ export function ModelPicker({
   query: string;
   onQueryChange: (value: string) => void;
   onSelect: (value: string) => void;
+  onClear?: () => void;
   footerLeft?: React.ReactNode;
   footerRight?: React.ReactNode;
   popover?: boolean;
@@ -75,18 +77,51 @@ export function ModelPicker({
   return (
     <div ref={containerRef} className={`full-width model-picker-field ${popover ? "model-picker-popover" : ""}`}>
       {label ? <span className="model-picker-label">{label}</span> : null}
-      <Input
-        value={query}
-        onChange={(event) => {
-          onQueryChange(event.target.value);
-          if (!isOpen) setIsOpen(true);
-        }}
-        placeholder="Search short or full model ID..."
-        className="model-picker-search"
-        onFocus={() => {
-          if (!isOpen) setIsOpen(true);
-        }}
-      />
+      <div style={{ position: "relative", width: "100%" }}>
+        <Input
+          value={query}
+          onChange={(event) => {
+            onQueryChange(event.target.value);
+            if (!isOpen) setIsOpen(true);
+          }}
+          placeholder="Search short or full model ID..."
+          className="model-picker-search"
+          style={{ paddingRight: query ? "36px" : "14px" }}
+          onFocus={() => {
+            if (!isOpen) setIsOpen(true);
+          }}
+        />
+        {query ? (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onQueryChange("");
+              if (onClear) onClear();
+            }}
+            style={{
+              position: "absolute",
+              right: "12px",
+              top: "50%",
+              transform: "translateY(-50%)",
+              background: "transparent",
+              border: "none",
+              color: "#a1a1aa",
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: "4px",
+              borderRadius: "50%",
+              transition: "color 0.2s ease",
+              zIndex: 2,
+            }}
+            title="Clear selection"
+          >
+            <Icon icon="solar:close-circle-bold" style={{ fontSize: "16px" }} />
+          </button>
+        ) : null}
+      </div>
       {(!popover || isOpen) ? (
         <div className="model-picker-summary" role="status">
           <span>{models.length.toLocaleString()} provider models</span>

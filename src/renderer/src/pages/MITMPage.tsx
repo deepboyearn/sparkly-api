@@ -4,20 +4,12 @@ import type { UpstreamAccount } from "../../../shared/types";
 import logo from "../../../logo/logp.png";
 import { AccountPicker } from "../components/AccountPicker";
 import { ModelPicker } from "../components/ModelPicker";
+import { logSystem, logUserAction, logHttp } from "../consoleLogStore";
 
-const AG_MODELS = [
-  "Gemini 3.6 Flash (High)",
-  "Gemini 3.6 Flash (Medium)",
-  "Gemini 3.6 Flash (Low)",
-  "Gemini 3.5 Flash (Medium) / Default",
-  "Gemini 3.5 Flash (High)",
-  "Gemini 3.5 Flash (Low)",
-  "Gemini 3.1 Pro (Low)",
-  "Gemini 3.1 Pro (High)",
+const AG_MODELS: string[] = [
   "Claude Sonnet 4.6 (Thinking)",
   "Claude Opus 4.6 (Thinking)",
-  "GPT-OSS 120B (Medium)",
-  "Gemini 3 Flash (Command)",
+  "Gemini 3.6 Flash (High)",
 ];
 
 type MitmApi = Record<string, (...args: unknown[]) => Promise<unknown>>;
@@ -60,6 +52,8 @@ export default function MITMPage({ accounts, activeAccountId, onSelectAccount }:
   useEffect(() => {
     let cancelled = false;
     const initialize = async () => {
+      logSystem("[MITM] Initializing — loading cert status and saved model mappings...");
+      const t0 = performance.now();
       try {
         const api = getMitmApi();
         if (!api) throw new Error("Native MITM API is unavailable");
@@ -71,15 +65,42 @@ export default function MITMPage({ accounts, activeAccountId, onSelectAccount }:
         setIsCertGenerated(status.exists);
         setIsCertTrusted(status.trusted);
         setIsRunning(status.running);
-        setSavedMappings(mappings);
-        setModelMappings(mappings);
-        setMappingQueries(mappings);
+
+        // Only retain mappings if they were intentionally mapped for this account
+        const initialAccount = accounts.find((a) => a.id === selectedAccountId) ?? accounts[0];
+        const availableModels = initialAccount?.models ?? [];
+        const filteredMappings: Record<string, string> = {};
+        for (const [source, target] of Object.entries(mappings || {})) {
+          if (target && availableModels.includes(target)) {
+            filteredMappings[source] = target;
+          } else {
+            filteredMappings[source] = "";
+          }
+        }
+
+        setSavedMappings(filteredMappings);
+        setModelMappings(filteredMappings);
+        setMappingQueries(filteredMappings);
         setStatusKind("info");
         setStatusMessage(status.running ? "Interception is active on localhost:443." : "Interception is ready to configure.");
+
+        logHttp(
+          "GET", "mitm://init", 200, Math.round(performance.now() - t0),
+          null,
+          {
+            certExists: status.exists,
+            certTrusted: status.trusted,
+            listenerRunning: status.running,
+            savedMappings: filteredMappings,
+            availableModels: availableModels.length,
+          }
+        );
       } catch (error) {
         if (!cancelled) {
+          const msg = String(error);
           setStatusKind("error");
-          setStatusMessage(`Failed to load interception status: ${String(error)}`);
+          setStatusMessage(`Failed to load interception status: ${msg}`);
+          logHttp("GET", "mitm://init", 500, Math.round(performance.now() - t0), null, null, msg);
         }
       }
     };
@@ -104,9 +125,12 @@ export default function MITMPage({ accounts, activeAccountId, onSelectAccount }:
   const routeReady = Boolean(selectedAccount && accountModels.length > 0);
 
   const toggleServer = async () => {
+    const action = isRunning ? "stop" : "start";
+    logUserAction(`[MITM] User clicked '${action} listener' — target: 127.0.0.1:443`);
     setServerLoading(true);
     setStatusKind("info");
     setStatusMessage(isRunning ? "Stopping the loopback listener..." : "Starting the loopback listener...");
+    const t0 = performance.now();
     try {
       const api = getMitmApi();
       if (!api) throw new Error("Native MITM API is unavailable");
@@ -115,24 +139,30 @@ export default function MITMPage({ accounts, activeAccountId, onSelectAccount }:
         setIsRunning(false);
         setStatusKind("success");
         setStatusMessage("Interception stopped. Hosts-file changes remain under your control.");
+        logHttp("POST", "mitm://stop_mitm_server", 200, Math.round(performance.now() - t0), { action: "stop" }, { listenerRunning: false });
       } else {
         await api.startMitmServer();
         setIsRunning(true);
         setStatusKind("success");
         setStatusMessage("Interception is active on localhost:443.");
+        logHttp("POST", "mitm://start_mitm_server — 127.0.0.1:443", 200, Math.round(performance.now() - t0), { action: "start" }, { listenerRunning: true });
       }
     } catch (error) {
+      const msg = String(error);
       setStatusKind("error");
-      setStatusMessage(`Listener error: ${String(error)}`);
+      setStatusMessage(`Listener error: ${msg}`);
+      logHttp("POST", `mitm://${action}_mitm_server`, 500, Math.round(performance.now() - t0), { action }, null, msg);
     } finally {
       setServerLoading(false);
     }
   };
 
   const trustCertificate = async () => {
+    logUserAction("[MITM] User initiated trust-certificate — installing local CA");
     setCertLoading(true);
     setStatusKind("info");
     setStatusMessage("Installing and trusting the local certificate...");
+    const t0 = performance.now();
     try {
       const api = getMitmApi();
       if (!api) throw new Error("Native MITM API is unavailable");
@@ -141,9 +171,12 @@ export default function MITMPage({ accounts, activeAccountId, onSelectAccount }:
       setIsCertGenerated(true);
       setStatusKind("success");
       setStatusMessage("Local interception certificate is trusted.");
+      logHttp("POST", "mitm://trust_mitm_cert", 200, Math.round(performance.now() - t0), null, { trusted: true });
     } catch (error) {
+      const msg = String(error);
       setStatusKind("error");
-      setStatusMessage(`Certificate trust failed: ${String(error)}`);
+      setStatusMessage(`Certificate trust failed: ${msg}`);
+      logHttp("POST", "mitm://trust_mitm_cert", 500, Math.round(performance.now() - t0), null, null, msg);
     } finally {
       setCertLoading(false);
     }
@@ -151,27 +184,45 @@ export default function MITMPage({ accounts, activeAccountId, onSelectAccount }:
 
   const switchRoutingAccount = async (accountId: string) => {
     const account = accounts.find((candidate) => candidate.id === accountId);
+    logUserAction(`[MITM] Routing account switched → ${account?.name ?? accountId}`, { accountId, models: account?.models?.length ?? 0 });
     setSelectedAccountId(accountId);
     setRouteLoading(true);
     setStatusKind("info");
     setStatusMessage(account ? `Switching the active route to ${account.name}...` : "Switching routing account...");
+    const t0 = performance.now();
     try {
       await onSelectAccount(accountId);
-      setMappingQueries(modelMappings);
+      const newModels = account?.models ?? [];
+      const updated: Record<string, string> = {};
+      for (const [source, target] of Object.entries(modelMappings)) {
+        updated[source] = target && newModels.includes(target) ? target : "";
+      }
+      setModelMappings(updated);
+      setMappingQueries(updated);
       setStatusKind("success");
       setStatusMessage(account ? `${account.name} is now the active MITM route.` : "Routing account changed.");
+      logHttp("POST", `mitm://select_account — account: ${account?.name ?? accountId}`, 200, Math.round(performance.now() - t0), { accountId }, { availableModels: newModels.length, updatedMappings: updated });
     } catch (error) {
+      const msg = String(error);
       setSelectedAccountId(activeAccountId);
       setStatusKind("error");
-      setStatusMessage(`Could not switch routing account: ${String(error)}`);
+      setStatusMessage(`Could not switch routing account: ${msg}`);
+      logHttp("POST", `mitm://select_account`, 500, Math.round(performance.now() - t0), { accountId }, null, msg);
     } finally {
       setRouteLoading(false);
     }
   };
 
   const selectMapping = (sourceModel: string, targetModel: string) => {
+    logUserAction(`[MITM] Model mapped: "${sourceModel}" → "${targetModel}"`, { sourceModel, targetModel });
     setModelMappings((current) => ({ ...current, [sourceModel]: targetModel }));
     setMappingQueries((current) => ({ ...current, [sourceModel]: targetModel }));
+  };
+
+  const clearMapping = (sourceModel: string) => {
+    logUserAction(`[MITM] Mapping cleared for: "${sourceModel}"`, { sourceModel });
+    setModelMappings((current) => ({ ...current, [sourceModel]: "" }));
+    setMappingQueries((current) => ({ ...current, [sourceModel]: "" }));
   };
 
   const resetMappingChanges = () => {
@@ -183,13 +234,17 @@ export default function MITMPage({ accounts, activeAccountId, onSelectAccount }:
 
   const saveMappings = async () => {
     if (!selectedAccount || accountModels.length === 0) {
+      const reason = "No scanned account catalog available — scan the account first";
       setStatusKind("error");
       setStatusMessage("Scan a provider account catalog before saving mappings.");
+      logHttp("POST", "mitm://update_mitm_model_mappings", 400, 0, { validMappings }, null, reason);
       return;
     }
+    logUserAction(`[MITM] Saving ${mappedCount} mapping(s) for account: ${selectedAccount.name}`, { account: selectedAccount.name, mappings: validMappings, staleRemoved: staleCount });
     setMappingsLoading(true);
     setStatusKind("info");
     setStatusMessage("Saving validated model mappings...");
+    const t0 = performance.now();
     try {
       const api = getMitmApi();
       if (!api) throw new Error("Native MITM API is unavailable");
@@ -199,9 +254,12 @@ export default function MITMPage({ accounts, activeAccountId, onSelectAccount }:
       setMappingQueries(validMappings);
       setStatusKind("success");
       setStatusMessage(`Saved ${mappedCount} mappings for ${selectedAccount.name}${staleCount ? ` and removed ${staleCount} stale target${staleCount === 1 ? "" : "s"}` : ""}.`);
+      logHttp("POST", `mitm://update_mitm_model_mappings — account: ${selectedAccount.name}`, 200, Math.round(performance.now() - t0), { mappings: validMappings }, { savedCount: mappedCount, staleRemoved: staleCount });
     } catch (error) {
+      const msg = String(error);
       setStatusKind("error");
-      setStatusMessage(`Failed to save mappings: ${String(error)}`);
+      setStatusMessage(`Failed to save mappings: ${msg}`);
+      logHttp("POST", `mitm://update_mitm_model_mappings — account: ${selectedAccount.name}`, 500, Math.round(performance.now() - t0), { mappings: validMappings }, null, msg);
     } finally {
       setMappingsLoading(false);
     }
@@ -340,12 +398,17 @@ export default function MITMPage({ accounts, activeAccountId, onSelectAccount }:
                 <div className="mitm-target-model-sparkly">
                   <ModelPicker
                     popover
-                    label="Provider target model"
                     value={validTarget ? targetModel : ""}
                     models={accountModels}
-                    query={mappingQueries[sourceModel] ?? targetModel}
-                    onQueryChange={(query) => setMappingQueries((current) => ({ ...current, [sourceModel]: query }))}
+                    query={mappingQueries[sourceModel] ?? (validTarget ? targetModel : "")}
+                    onQueryChange={(query) => {
+                      setMappingQueries((current) => ({ ...current, [sourceModel]: query }));
+                      if (!query) {
+                        setModelMappings((current) => ({ ...current, [sourceModel]: "" }));
+                      }
+                    }}
                     onSelect={(model) => selectMapping(sourceModel, model)}
+                    onClear={() => clearMapping(sourceModel)}
                   />
                 </div>
                 <span className={`premium-badge ${staleTarget ? "warning" : validTarget ? "success" : ""}`}>

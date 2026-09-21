@@ -2572,6 +2572,25 @@ async fn check_auth(
     state: &AppState,
     headers: &axum::http::HeaderMap,
 ) -> Result<(), (StatusCode, String, String)> {
+    // MITM requests are already accepted on the local administrator-controlled
+    // listener. Require the exact marker plus a non-empty correlation ID so an
+    // Antigravity cloud Authorization token is never mistaken for a Sparkly key.
+    let is_internal_mitm = headers
+        .get("x-sparkly-mitm")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == "1")
+        && headers
+            .get("x-sparkly-request-id")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("mitm-"));
+    if is_internal_mitm {
+        tracing::debug!(
+            "[MITM] Internal bridge authentication accepted for request {:?}",
+            headers.get("x-sparkly-request-id")
+        );
+        return Ok(());
+    }
+
     let api_key = if let Some(auth_header) = headers.get(axum::http::header::AUTHORIZATION) {
         if let Ok(auth_str) = auth_header.to_str() {
             if let Some(token) = auth_str.strip_prefix("Bearer ") {
